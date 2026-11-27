@@ -1,0 +1,24 @@
+[package]
+name = "kotoha-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Clean/Hexagonal core pipeline, session manager, audio preprocessor, IPC server, and CLI monitor for Kotoha"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "kotoha-ipc-monitor"
+path = "src/bin/kotoha_ipc_monitor.rs"
+
+[dependencies]
+async-trait.workspace = true
+interprocess.workspace = true
+kotoha-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
