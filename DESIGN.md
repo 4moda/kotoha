@@ -808,20 +808,26 @@ kotoha/
 
 ## 6. テスト戦略・3OS CI/CD パイプライン (Testing & CI/CD Strategy)
 
-### 6.1 3 層テスト戦略
+### 6.1 3 層テスト戦略 & 単体テスト配置規約 (1 Source File : 1 Test File)
+
+- **単体テスト配置規約（1 Source File : 1 Test File）**:
+  - テストファイル肥大化を防ぎ対象モジュールとの対応関係を明確にするため、リポジトリ全体で **「テスト可能な 1 ソースファイル（モジュール）につき 1 テストファイル」** を原則とする（型定義のみ・エントリポイント・re-export 専用 `mod.rs`/`lib.rs` は除く）。
+  - **Rust (`crates/*/tests/`)**: 各ソースモジュール `<module>.rs` に対応する統合テストファイル `crates/*/tests/<module>_test.rs`（共有モック・フィクスチャは `crates/*/tests/common/mod.rs`）を配置する（`cargo test` / `cargo nextest` が並列実行しやすい単位で分離）。
+  - **C++ (`plugins/tests/`)**: 各実装モジュール `<module>.{hpp,cpp}` に対応する CTest ターゲット `plugins/tests/test_<module>.cpp` を配置する。
+  - **UI (`app/ui/src/`)**: 各ソースファイル `<path>/<Module>.{ts,tsx}` 同一ディレクトリにコロケーションで `app/ui/src/<path>/<Module>.test.{ts,tsx}` を配置する（例: `src/data/modelCatalog.test.ts`, `src/components/SubtitleOverlay.test.tsx`, `src/components/TranslationSettings.test.tsx`, `src/App.test.tsx`）。
 
 1. **Tier 1: コンポーネント単体テスト（言語別高速検証）**
-   - **C++ (`CTest`)**:
+   - **C++ (`CTest`, `plugins/tests/test_<module>.cpp`)**:
      - `protocol` の全 7 メッセージ往復、境界値（`payload_len == 65536`, `65537` 拒否、`NaN`/`Inf` 無害化、`channels` 境界）、リトルエンディアン検証。
      - `ring_buffer` の SPSC 並行プロデューサ/コンシューマ検証、満杯時ドロップ数および `seq` ギャップの一致検証。
-   - **Rust (`cargo test --workspace`)**:
-     - `kotoha-protocol` の往復・不正フレーム（magic 不一致、version 不一致、64KB 超過、切り詰め、`flags` 予約ビット、NaN PCM、UTF-8 不正）検証。
-     - `kotoha-core` のエンドポイント解決（`KOTOHA_IPC_ENDPOINT` 上書き・OS デフォルト）、モノラルダウンミックス、16 kHz リサンプリング、TOML 用語辞書読込・優先マージ、最長一致＆単語境界プレースホルダ保護/復元、Mock STT / Mock Translator によるパイプライン結合テスト。
-   - **UI (`Vitest`)**:
-     - 字幕カード 3 段階状態遷移、話者カラー割当、翻訳エンジン設定スキーマバリデーション。
+   - **Rust (`cargo test --workspace`, `crates/*/tests/<module>_test.rs`)**:
+     - `kotoha-protocol` の往復・不正フレーム（magic 不一致、version 不一致、64KB 超過、切り詰め、`flags` 予約ビット、NaN PCM、UTF-8 不正）検証、およびエンドポイント解決（`KOTOHA_IPC_ENDPOINT` 上書き・OS デフォルト）検証。
+     - `kotoha-core` のモノラルダウンミックス、16 kHz リサンプリング、TOML 用語辞書読込・優先マージ、最長一致＆単語境界プレースホルダ保護/復元、Mock STT / Mock Translator によるパイプライン結合テスト。
+   - **UI (`Vitest`, `app/ui/src/<path>/<Module>.test.{ts,tsx}`)**:
+     - カタログ・FNV-1a 話者カラー・設定スキーマバリデーション（`modelCatalog.test.ts`）、字幕カード 3 段階状態遷移・行数制限・ロック状態（`SubtitleOverlay.test.tsx`）、プロバイダ/モデルプロファイル/ライセンス注意表示切替（`TranslationSettings.test.tsx`）、アプリ全体結合（`App.test.tsx`）。
 2. **Tier 2: バイナリ ABI & 疎通結合テスト**
-   - **C++ Mumble プラグイン ABI テスト**: ビルドした共有ライブラリ（`.so`/`.dylib`/`.dll`）をテストランナーから動的ロード（`dlopen` / `LoadLibrary`）し、Mumble Plugin API v1.0.x 必須エクスポート関数群の解決、擬似コールバック（`isSpeech == true/false`、`mumble_onUserTalkingStateChanged`）の呼び出しと戻り値 `false`、メモリ破壊ゼロを検証。
-   - **UI ブラウザ E2E (`Playwright`)**: モックイベントを注入した状態で字幕オーバーレイ描画・設定画面切替をヘッドレスブラウザで検証。
+   - **C++ Mumble プラグイン ABI テスト (`plugins/tests/test_mumble_plugin_abi.cpp`)**: ビルドした共有ライブラリ（`.so`/`.dylib`/`.dll`）をテストランナーから動的ロード（`dlopen` / `LoadLibrary`）し、Mumble Plugin API v1.0.x 必須エクスポート関数群の解決、擬似コールバック（`isSpeech == true/false`、`mumble_onUserTalkingStateChanged`）の呼び出しと戻り値 `false`、メモリ破壊ゼロを検証。
+   - **UI ブラウザ E2E (`Playwright`, `app/ui/e2e/`)**: モックイベントを注入した状態で字幕オーバーレイ描画・設定画面切替をヘッドレスブラウザで検証。
 3. **Tier 3: クロス言語・実 OS IPC & 実音声パイプライン E2E テスト (`crates/kotoha-e2e`)**
    - 一時 `KOTOHA_IPC_ENDPOINT`（Unix ドメインソケットまたは固有 Named Pipe）を設定した上で `cargo nextest run --workspace`（または `cargo test -p kotoha-e2e`）により以下を自動検証する：
      1. **`ipc_single_source` / `ipc_multi_source`**: Rust 側 `kotoha-ipc-monitor` と C++ 側 `kotoha_mock_client` を実 OS IPC で接続し、`Hello` → `UserInfo` → `TalkingState` → 複数チャンネル/高レート合成 PCM `AudioFrame` → `Heartbeat` → `UserRemoved` → `SourceReset` の 1 バイト欠損もない受信と `SpeakerKey { source, user_id }` 分離を全 3 OS 上で検証。
