@@ -120,6 +120,66 @@ jobs:
             app/ui/test-results/
           retention-days: 7
 
+  tauri-check:
+    name: Tauri v2 Desktop Shell (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux Tauri system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/ui/package-lock.json
+
+      - name: Build UI bundle for Tauri frontendDist
+        working-directory: app/ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Tauri Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            app/src-tauri/target/
+          key: ${{ runner.os }}-cargo-tauri-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tauri-
+
+      - name: Check formatting (kotoha-app)
+        run: cargo fmt --manifest-path app/src-tauri/Cargo.toml -- --check
+
+      - name: Run Clippy (kotoha-app)
+        run: cargo clippy --manifest-path app/src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Run unit tests (kotoha-app)
+        run: cargo test --manifest-path app/src-tauri/Cargo.toml
+
   matrix-build-test-e2e:
     name: Build, Unit Tests & Cross-Language E2E (${{ matrix.os }})
     strategy:

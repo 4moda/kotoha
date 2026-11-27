@@ -6,8 +6,10 @@ members = [
     "crates/kotoha-stt-sherpa",
     "crates/kotoha-translate-http",
     "crates/kotoha-translate-local",
+    "crates/kotoha-setup",
     "crates/kotoha-e2e",
 ]
+exclude = ["app/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

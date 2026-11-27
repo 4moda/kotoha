@@ -3,6 +3,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { createDefaultProviderConfig } from '../data/modelCatalog';
 import type {
+  GlossarySettingsState,
   OverlayDisplayOptions,
   TranslationProviderConfig,
 } from '../types/kotoha';
@@ -16,6 +17,32 @@ const defaultOverlayOptions: OverlayDisplayOptions = {
   background_opacity: 0.78,
 };
 
+const defaultGlossarySettings: GlossarySettingsState = {
+  profiles: [
+    {
+      id: 'sample',
+      name: 'My Profile',
+      src_lang: 'en',
+      tgt_lang: 'ja',
+      term_count: 4,
+      enabled: true,
+      file_path: 'glossaries/sample.toml',
+    },
+    {
+      id: 'fps-callouts',
+      name: 'FPS Callouts',
+      src_lang: 'en',
+      tgt_lang: 'ja',
+      term_count: 12,
+      enabled: false,
+      file_path: 'glossaries/fps-callouts.toml',
+    },
+  ],
+  enabled_profiles: ['My Profile'],
+  hotwords_score: 1.5,
+  glossary_dir: 'glossaries',
+};
+
 function StatefulTranslationSettings({
   initialProvider = createDefaultProviderConfig('local_model'),
 }: {
@@ -26,6 +53,8 @@ function StatefulTranslationSettings({
   const [provider, setProvider] = useState<TranslationProviderConfig>(initialProvider);
   const [overlayOptions, setOverlayOptions] =
     useState<OverlayDisplayOptions>(defaultOverlayOptions);
+  const [glossarySettings, setGlossarySettings] =
+    useState<GlossarySettingsState>(defaultGlossarySettings);
 
   return (
     <TranslationSettings
@@ -33,12 +62,24 @@ function StatefulTranslationSettings({
       tgtLang={tgtLang}
       provider={provider}
       overlayOptions={overlayOptions}
+      glossarySettings={glossarySettings}
       onChangeLanguages={(nextSrc, nextTgt) => {
         setSrcLang(nextSrc);
         setTgtLang(nextTgt);
       }}
       onChangeProvider={setProvider}
       onChangeOverlayOptions={setOverlayOptions}
+      onChangeGlossarySettings={(next) =>
+        setGlossarySettings((prev) => ({
+          ...prev,
+          enabled_profiles: next.enabled_profiles,
+          hotwords_score: next.hotwords_score,
+          profiles: prev.profiles.map((p) => ({
+            ...p,
+            enabled: next.enabled_profiles.includes(p.name),
+          })),
+        }))
+      }
     />
   );
 }
@@ -84,9 +125,11 @@ describe('TranslationSettings', () => {
         tgtLang="ja"
         provider={createDefaultProviderConfig('local_model')}
         overlayOptions={defaultOverlayOptions}
+        glossarySettings={defaultGlossarySettings}
         onChangeLanguages={vi.fn()}
         onChangeProvider={onChangeProvider}
         onChangeOverlayOptions={vi.fn()}
+        onChangeGlossarySettings={vi.fn()}
       />,
     );
 
@@ -115,9 +158,11 @@ describe('TranslationSettings', () => {
           threads: null,
         }}
         overlayOptions={defaultOverlayOptions}
+        glossarySettings={defaultGlossarySettings}
         onChangeLanguages={vi.fn()}
         onChangeProvider={onChangeProvider}
         onChangeOverlayOptions={vi.fn()}
+        onChangeGlossarySettings={vi.fn()}
       />,
     );
 
@@ -148,9 +193,11 @@ describe('TranslationSettings', () => {
         tgtLang="ja"
         provider={createDefaultProviderConfig('local_model')}
         overlayOptions={defaultOverlayOptions}
+        glossarySettings={defaultGlossarySettings}
         onChangeLanguages={onChangeLanguages}
         onChangeProvider={vi.fn()}
         onChangeOverlayOptions={onChangeOverlayOptions}
+        onChangeGlossarySettings={vi.fn()}
       />,
     );
 
@@ -176,6 +223,58 @@ describe('TranslationSettings', () => {
     expect(onChangeOverlayOptions).toHaveBeenLastCalledWith({
       ...defaultOverlayOptions,
       locked: false,
+    });
+  });
+
+  it('renders TOML glossary profiles, toggles enabled profiles, and adjusts hotwords_score', () => {
+    const onChangeGlossarySettings = vi.fn();
+
+    render(
+      <TranslationSettings
+        srcLang="en"
+        tgtLang="ja"
+        provider={createDefaultProviderConfig('local_model')}
+        overlayOptions={defaultOverlayOptions}
+        glossarySettings={defaultGlossarySettings}
+        onChangeLanguages={vi.fn()}
+        onChangeProvider={vi.fn()}
+        onChangeOverlayOptions={vi.fn()}
+        onChangeGlossarySettings={onChangeGlossarySettings}
+      />,
+    );
+
+    expect(screen.getByTestId('glossary-hotwords-section')).toBeInTheDocument();
+    expect(screen.getByTestId('glossary-profile-sample')).toHaveTextContent('My Profile');
+    expect(screen.getByTestId('glossary-profile-sample')).toHaveTextContent('en -> ja');
+    expect(screen.getByTestId('glossary-profile-sample')).toHaveTextContent('4 terms');
+
+    const sampleToggle = screen.getByTestId('glossary-toggle-sample') as HTMLInputElement;
+    const fpsToggle = screen.getByTestId('glossary-toggle-fps-callouts') as HTMLInputElement;
+    expect(sampleToggle.checked).toBe(true);
+    expect(fpsToggle.checked).toBe(false);
+
+    // Enable second glossary profile
+    fireEvent.click(fpsToggle);
+    expect(onChangeGlossarySettings).toHaveBeenLastCalledWith({
+      enabled_profiles: ['My Profile', 'FPS Callouts'],
+      hotwords_score: 1.5,
+    });
+
+    // Disable first glossary profile
+    fireEvent.click(sampleToggle);
+    expect(onChangeGlossarySettings).toHaveBeenLastCalledWith({
+      enabled_profiles: [],
+      hotwords_score: 1.5,
+    });
+
+    // Update hotwords_score slider
+    const slider = screen.getByTestId('hotwords-score-slider') as HTMLInputElement;
+    expect(slider.min).toBe('0.5');
+    expect(slider.max).toBe('3');
+    fireEvent.change(slider, { target: { value: '2.4' } });
+    expect(onChangeGlossarySettings).toHaveBeenLastCalledWith({
+      enabled_profiles: ['My Profile'],
+      hotwords_score: 2.4,
     });
   });
 });
