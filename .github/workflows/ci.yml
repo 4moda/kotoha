@@ -156,8 +156,9 @@ jobs:
           npm run build
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97.0"
           components: rustfmt, clippy
 
       - name: Cache Tauri Cargo dependencies
