@@ -74,18 +74,19 @@
 |          v (implements / drives)               | (implements Ports)                 |
 |  [Application Layer (Use Cases & Orchestration)]                                  |
 |   - SourceSessionManager (conn_id 所有権チェック, SourceReset/EOF 解放)           |
-|   - PipelineService (音声前処理 -> 話者別 SttStream -> Pre-filter ->              |
+|   - PipelineService (音声前処理 -> 話者別 SttStream[Hotwords] -> Pre-filter ->    |
 |                      Context/Glossary -> Semaphore並列翻訳 -> SubtitleSink)       |
 |   - TranslatorManager (実行時プロバイダ & ModelProfile ホットスワップ)            |
+|   - GlossaryManager (glossaries/*.toml 読込・優先マージ -> STT & Translator 共有) |
 |          |                                                                        |
 |          v (depends ONLY on)                                                      |
 |  [Domain Layer (Innermost Core: Zero I/O)]                                        |
 |   - Entities/VOs: SpeakerKey, LanguageCode, AudioChunk, UtteranceId,              |
 |     TranscriptEvent, TranslationRequest/Result, TranslateContext, SubtitleEntry,  |
-|     ModelProfile, ComputeDevice (Auto|Cpu|Cuda|Metal), TranslationProviderConfig  |
+|     GlossaryProfile, ModelProfile, ComputeDevice, TranslationProviderConfig       |
 |   - Ports (Traits): SttEngine, SttStream, Translator, AudioInputSource,           |
-|                     SubtitleSink, SettingsRepository                              |
-|   - Pure Logic: Pre-filter rules, 話者カラーハッシュ, Context Window              |
+|                     SubtitleSink, SettingsRepository, GlossaryRepository          |
+|   - Pure Logic: Pre-filter, 話者カラー, Context Window, 用語プレースホルダ保護/復元 |
 |          ^                                                                        |
 |          | (implements SubtitleSink / calls Use Cases)                            |
 |  [Presentation Layer (Outermost)]                                                 |
@@ -210,7 +211,7 @@ Offset   Size  Field        Type     Constraint
 - **チャンク分割と 8ch アライメント**:
   - 1 チャンクあたりの最大フロート数 `max_floats` は `channels` の整数倍になるよう切り捨てる：
     `max_floats = ((65536 - 16) / (4 * channels)) * channels`
-    （例: `1ch/2ch/4ch` → `16380` floats、`3ch` → `16380` floats、`5ch` → `16380` floats、`6ch` → `16374` floats、`7ch` → `16377` floats、`8ch` → `16376` floats）。
+    （例: `1ch..=7ch` → すべて `16380` floats [`16380` は 1〜7 で割り切れる]、`8ch` → `16376` floats）。
   - 1 つの音声コールバックで渡されたサンプル数が `max_floats` を超える場合、**Producer（またはリングバッファへの投入境界）で `max_floats` 単位に分割**して個別のスロットへ投入する。各チャンクがリングバッファ投入時に独自の単調増加 `seq` を受け取るため、ワイヤ上での `seq` と 1:1 に整合する。
 - **`seq` の意味論・遅延初期化・回帰ガード**:
   - `seq` は送信側プラグインインスタンス全体で 0 から単調増加（`u32` wrapping add）するカウンタであり、**`SourceReset` を跨いでもリセットせず単調増加を維持する**（サーバーから切断・再接続してもカウント継続）。
@@ -355,18 +356,19 @@ Rust コアは **Clean / Hexagonal (Onion) Architecture** に基づき、依存�
 
 | レイヤー | パス / クレート | 依存許可範囲 | 主な責務・構成要素 |
 | :--- | :--- | :--- | :--- |
-| **Domain (最内層)** | `kotoha-core/src/domain/` | 純粋 Rust (`serde`, `thiserror` 等のみ。`tokio`/`reqwest`/`interprocess`/`tauri` 禁止) | **Entities / Value Objects**: `SpeakerKey`, `LanguageCode`, `AudioChunk`, `UtteranceId`, `TranscriptEvent`, `TranslationRequest`, `TranslationResult`, `TranslateContext`, `SubtitleEntry`, `ModelProfile`, `ComputeDevice`, `TranslationProviderConfig`<br>**Ports (Traits)**: `SttEngine`, `SttStream`, `Translator`, `AudioInputSource`, `SubtitleSink`, `SettingsRepository`<br>**Pure Logic**: Pre-filter 判定、話者カラーハッシュ、Context Window 管理 |
-| **Application** | `kotoha-core/src/application/` | `domain` のみ | `PipelineService`（前処理・話者別 STT ストリーム制御・Pre-filter・文脈注入・Semaphore 並列翻訳・`utterance_id` 順序保証・`SubtitleSink` 通知）<br>`SourceSessionManager`（`conn_id` 所有権管理と切断クリーンアップ）<br>`TranslatorManager`（設定変更時の翻訳プロバイダ／モデルプロファイル実行時ホットスワップ） |
-| **Infrastructure** | `kotoha-core/src/infrastructure/`<br>`kotoha-protocol`<br>`kotoha-stt-sherpa` (P2)<br>`kotoha-translate-local` (P2)<br>`kotoha-translate-http` (P2) | `domain`, `application`, 外部 I/O クレート | `IpcServerAdapter`（`tokio` + `interprocess` + `kotoha-protocol`、`AudioInputSource` 実装）<br>`AudioPreprocessor`（任意 ch → モノラル平均ダウンミックス、8k..192kHz → 16 kHz `f32` リサンプラ）<br>`MockSttAdapter` / `MockTranslatorAdapter`（Phase 1 検証用）<br>Phase 2 外部アダプタ群（`sherpa-onnx`, `ct2rs` + モデルダウンローダ, HTTP API 群）<br>`JsonSettingsRepository` / OS キーチェーン連携 |
+| **Domain (最内層)** | `kotoha-core/src/domain/` | 純粋 Rust (`serde`, `thiserror` 等のみ。`tokio`/`reqwest`/`interprocess`/`tauri` 禁止) | **Entities / Value Objects**: `SpeakerKey`, `LanguageCode`, `AudioChunk`, `UtteranceId`, `TranscriptEvent`, `TranslationRequest`, `TranslationResult`, `TranslateContext`, `SubtitleEntry`, `GlossaryProfile`, `HotwordsConfig`, `ModelProfile`, `ComputeDevice`, `TranslationProviderConfig`<br>**Ports (Traits)**: `SttEngine`, `SttStream`, `Translator`, `AudioInputSource`, `SubtitleSink`, `SettingsRepository`, `GlossaryRepository`<br>**Pure Logic**: Pre-filter 判定、話者カラーハッシュ、Context Window 管理、用語辞書最長一致プレースホルダ保護/復元 |
+| **Application** | `kotoha-core/src/application/` | `domain` のみ | `PipelineService`（前処理・話者別 STT ストリーム制御・Pre-filter・文脈/用語辞書注入・Semaphore 並列翻訳・`utterance_id` 順序保証・`SubtitleSink` 通知）<br>`SourceSessionManager`（`conn_id` 所有権管理と切断クリーンアップ）<br>`TranslatorManager`（設定変更時の翻訳プロバイダ／モデルプロファイル実行時ホットスワップ）<br>`GlossaryManager`（複数 TOML 用語辞書の読込・優先マージ・STT Hotwords / 翻訳辞書同期） |
+| **Infrastructure** | `kotoha-core/src/infrastructure/`<br>`kotoha-protocol`<br>`kotoha-stt-sherpa` (P2)<br>`kotoha-translate-local` (P2)<br>`kotoha-translate-http` (P2) | `domain`, `application`, 外部 I/O クレート | `IpcServerAdapter`（`tokio` + `interprocess` + `kotoha-protocol`、`AudioInputSource` 実装）<br>`AudioPreprocessor`（任意 ch → モノラル平均ダウンミックス、8k..192kHz → 16 kHz `f32` リサンプラ）<br>`MockSttAdapter` / `MockTranslatorAdapter`（Phase 1 検証用）<br>`TomlGlossaryRepository`（`glossaries/*.toml` 読込）<br>Phase 2 外部アダプタ群（`sherpa-onnx`, `ct2rs` + モデルダウンローダ, HTTP API 群）<br>`JsonSettingsRepository` / OS キーチェーン連携 |
 | **Presentation (最外層)** | `kotoha-core/src/bin/kotoha_ipc_monitor.rs` (P1)<br>`app/src-tauri` (P3) + `app/ui` | 全内側レイヤー（DI 組み立て担当） | `kotoha-ipc-monitor` CLI（受信統計・RMS・ドロップ数・パイプライン出力）<br>Tauri v2 Commands / Event Bridge (`SubtitleSink` 実装) / System Tray / Overlay UI |
 
 #### Workspace クレート構成
 - `crates/kotoha-protocol`:
   - 軽量依存（`thiserror` 等最小限）で、IPC v1 バイナリコーデック・フレーム検証・エンドポイント解決を提供。
 - `crates/kotoha-core`:
-  - `domain/` + `application/` + `infrastructure/`（Phase 1 の `IpcServerAdapter`, `AudioPreprocessor`, Mock アダプタ, `kotoha-ipc-monitor` バイナリ）を収容。
+  - `domain/` + `application/` + `infrastructure/`（Phase 1 の `IpcServerAdapter`, `AudioPreprocessor`, `TomlGlossaryRepository` 基盤, Mock アダプタ, `kotoha-ipc-monitor` バイナリ）を収容。
 - `crates/kotoha-stt-sherpa`（Phase 2）:
   - `sherpa-onnx`（CPU 軽量ストリーミングモデル、例: Zipformer / Paraformer 等）を用いた `SttEngine` / `SttStream` アダプタ。
+  - **Hotwords (Context Biasing)** による用語ブースト（Transducer では `decoding_method = "modified_beam_search"` 使用、`hotwords_score` 設定対応）。
   - 話者（`SpeakerKey`）ごとに独立したストリームを保持し、無音タイムアウト・`UserRemoved`・`SourceReset` で確実に解放する。
 - `crates/kotoha-translate-local`（Phase 2）:
   - `ct2rs` (CTranslate2) ベースの `Translator` アダプタ、ハードウェア判定・モデルカタログ管理・SHA-256 検証付きダウンローダ。
@@ -417,6 +419,26 @@ pub struct SubtitleEntry {
     pub timestamp_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GlossaryProfile {
+    pub name: String,
+    pub src_lang: LanguageCode,
+    pub tgt_lang: LanguageCode,
+    pub terms: std::collections::BTreeMap<String, String>, // raw term -> fixed target translation
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HotwordsConfig {
+    pub enabled: bool,
+    pub hotwords_score: f32, // sherpa-onnx context biasing score (default e.g. 1.5)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SttSessionOptions {
+    pub hotwords: Vec<String>, // active merged glossary [terms] keys
+    pub hotwords_score: f32,
+}
+
 pub trait SttStream: Send {
     fn accept_audio(&mut self, samples_16k_mono: &[f32], timestamp_ms: u64) -> Result<Vec<TranscriptEvent>, SttError>;
     fn flush(&mut self, timestamp_ms: u64) -> Result<Vec<TranscriptEvent>, SttError>;
@@ -424,7 +446,12 @@ pub trait SttStream: Send {
 
 pub trait SttEngine: Send + Sync {
     fn name(&self) -> &'static str;
-    fn create_stream(&self, speaker_key: SpeakerKey, src_lang: &LanguageCode) -> Result<Box<dyn SttStream>, SttError>;
+    fn create_stream(
+        &self,
+        speaker_key: SpeakerKey,
+        src_lang: &LanguageCode,
+        options: &SttSessionOptions,
+    ) -> Result<Box<dyn SttStream>, SttError>;
 }
 
 #[async_trait::async_trait]
@@ -449,20 +476,76 @@ pub trait SettingsRepository: Send + Sync {
     async fn load(&self) -> Result<AppSettings, SettingsError>;
     async fn save(&self, settings: &AppSettings) -> Result<(), SettingsError>;
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GlossaryProfileMeta {
+    pub id: String,
+    pub name: String,
+    pub src_lang: LanguageCode,
+    pub tgt_lang: LanguageCode,
+    pub term_count: usize,
+}
+
+#[async_trait::async_trait]
+pub trait GlossaryRepository: Send + Sync {
+    async fn list_profiles(&self) -> Result<Vec<GlossaryProfileMeta>, GlossaryError>;
+    async fn load_profile(&self, id: &str) -> Result<GlossaryProfile, GlossaryError>;
+    async fn save_profile(&self, id: &str, profile: &GlossaryProfile) -> Result<(), GlossaryError>;
+}
 ```
 
-#### Application オーケストレーション (`PipelineService` & `TranslatorManager`)
+#### Application オーケストレーション (`PipelineService` & `TranslatorManager` & `GlossaryManager`)
 1. **Pre-filter（Domain 純粋ルール）**:
    - Partial 認識中は翻訳を発火せず（デフォルトは `is_final == true` 時のみ翻訳して計算コストと API 課金を節約）、`SubtitleSink` へ即座に `Partial STT` を送信する。
    - `is_final == true` のテキストから空白トリム後の空文字、極端な短発話・記号のみ、および設定されたフィラー語（例: `"uh"`, `"um"`, `"ah"`, `"hmm"` 単体）を除外し、不要な翻訳リクエストを抑制する。
 2. **Context Manager（`TranslateContext`）**:
    - チャンネル/セッション単位で直近 **5〜10 発話**（設定可能、デフォルト 8 発話）の「話者名 + 原文 + 訳文」をリング履歴として保持。
-   - ユーザー定義の**カスタム用語辞書（Glossary）**（例: ゲーム固有名詞・略語の対訳マップ）を保持し、LLM プロンプトまたは前処理に注入する。
+   - `GlossaryManager` が優先順位順にマージした汎用カスタム用語辞書（`glossary`）を `TranslateContext` 経由で翻訳層へ注入する。
 3. **並列翻訳・順序保証 (`PipelineService`)**:
    - 翻訳処理は `tokio::sync::Semaphore` で同時実行数上限（例: 4）を制御しつつ非同期並列実行する。
    - UI への翻訳結果反映は `utterance_id` をキーとして紐付けるため、翻訳完了順が前後しても対応する字幕カードが正確に更新され、表示順序の破綻を防ぐ。
-4. **実行時ホットスワップ (`TranslatorManager`)**:
+4. **実行時ホットスワップ (`TranslatorManager` / `GlossaryManager`)**:
    - `TranslatorManager` は現在の `Arc<dyn Translator>` を `tokio::sync::RwLock`（または `arc_swap`）で保持し、ユーザーが設定画面でプロバイダや `ModelProfile` を切り替えても、進行中の IPC 接続や話者 STT ストリームを切断せずに即座に後続発話から新エンジンへ切り替えられる。
+   - 用語辞書プロファイルや `hotwords_score` が更新された場合は、`GlossaryManager` がマージ済み `[terms]` を再計算し、以後の翻訳リクエストおよび STT ストリームへ即時反映する。
+
+#### 汎用カスタム用語辞書 (Generic TOML Glossary) — STT Hotwords & 翻訳の単一ソース設計
+
+1. **設計方針（ドメイン非依存 & Non-Goals）**:
+   - **ドメイン非依存 (Domain-Agnostic)**: Kotoha コア自体は特定のゲーム・作品・業界に固有の用語知識を一切ハードコードしない。汎用的な TOML 用語辞書ファイルを外部から読み込む仕組みのみを提供する。
+   - **Single Source of Truth**: 単一の `[terms]` キー・バリューマップが、**STT Hotwords（認識時コンテキストバイアス）** と **翻訳時の固定訳語マッピング** の双方を同時に駆動する。
+   - **Explicit Non-Goals（意図的に採用しない機能）**:
+     - **STT 後段の文字起こし補正 LLM を挿入しない**: 音声認識の直後に誤認識修正専用の LLM パスを追加するとレイテンシと計算/API コストが増大するため行わない。
+     - **手動の後段誤認識置換テーブル (`[stt_corrections]` 等) を設けない**: 初期設計では STT の文字列後置換ルールを持たず、認識精度向上は STT Hotwords による認識段階でのブーストに一本化する。
+     - **読み仮名・発音記号の必須化をしない**: 辞書キーには生の綴りをそのまま記述する（ただし略語・英字読み等で認識を助けたい場合に、ユーザー自身が任意で `"M W D" = "MWD"` のようにスペース区切り表記をキーとして記述することは許容する）。
+
+2. **TOML 用語辞書仕様 (`glossaries/*.toml`)**:
+   - アプリ設定ディレクトリ配下の `glossaries/*.toml` 等に複数のプロファイルファイルを配置でき、ユーザーは複数のプロファイルを選択・有効化し、**優先順位順（先頭から順にベース適用し、後続プロファイルが同一キーを上書きする「後勝ち」方式、または UI リスト下位→上位の順で上書き）にマージ**して使用できる（`src_lang` / `tgt_lang` が現在の翻訳ペアと一致するプロファイルを自動選択またはフィルタ可能）。
+   - スキーマ例:
+
+     ```toml
+     name = "My Profile"
+     src_lang = "en"
+     tgt_lang = "ja"
+
+     [terms]
+     "Ferox" = "Ferox"
+     "Logi" = "ロジ"
+     "Anchor" = "アンカー"
+     "M W D" = "MWD"
+     ```
+
+3. **レイヤー別統合仕様（STT 層 & 翻訳層）**:
+   - **STT 層（`sherpa-onnx` Hotwords / Context Biasing）**:
+     - 有効化・マージ済み `[terms]` の**すべてのキー**を `SttSessionOptions.hotwords` として `sherpa-onnx` の Hotwords に投入する。
+     - Transducer モデル（例: Zipformer）で Hotwords 機能を有効にするため、`decoding_method = "modified_beam_search"` を指定する。
+     - 一般単語（例: `"Anchor"` 等）への過剰バイアス・誤爆（false-positive over-triggering）を抑制調整できるよう、設定項目として **`hotwords_score`**（デフォルトブーストスコア）を公開する。
+   - **翻訳層（`Translator` Trait / `TranslateContext`）**:
+     - 有効化・マージ済みの用語辞書（`glossary` マップ）を `TranslateContext` に格納して `Translator::translate` へ渡す。
+     - **Local NMT (`ct2rs` + FuguMT / OPUS-MT / NLLB-200) および専用翻訳 API (DeepL / Google Cloud / GAS)**:
+       - 翻訳呼び出し前に、原文中の登録キーを**最長一致優先（longest-match-first）かつ単語境界（word-boundary）を考慮**して検索し、一時プレースホルダ（例: `__TERM_0__`, `__TERM_1__`）へ置換・保護する。
+       - 翻訳完了後、訳文中の各プレースホルダを対応する固定訳語（`[terms]` の値）へ復元する（翻訳モデルや外部 API がプレースホルダの空白・大文字小文字をわずかに変化させた場合の正規表現フォールバック復元も検討する）。
+     - **LLM API (OpenAI 互換 / Gemini / Ollama / LM Studio)**:
+       - アクティブな用語辞書テーブル（`原文キー -> 固定訳語`）をシステムプロンプトへ注入し、前後の会話履歴（5〜10 発話）とともに自然な文法の中で指定訳語を適用させる。
 
 #### 翻訳エンジン Port・環境別モデルカタログ・プロバイダ設定スキーマ
 
@@ -625,8 +708,8 @@ Kotoha は「ローカル NMT」を単一の固定モデルとして扱わず、
        3. IPC `Heartbeat` 自動検知による「接続確認（グリーンチェック）」。
      - 設定画面:
        - `src_lang` / `tgt_lang` 選択。
-       - 翻訳プロバイダ切替（Local NMT [環境別 `ModelProfile` & `ComputeDevice` 選択] / OpenAI 互換 LLM [クラウド・Ollama・LM Studio] / DeepL / Google Cloud Translation / ユーザー独自 GAS Webhook）＋ API キーの安全保存（OS 資格情報ストア連携、設定ファイル平文記載禁止）。
-       - カスタム用語辞書・コンテキスト履歴数（5〜10）・フォントサイズ・透過率・表示行数・フェードアウト秒数。
+       - 翻訳プロバイダ切替（Local NMT [CPU/GPU 環境別 `ModelProfile` & `ComputeDevice` 選択] / OpenAI 互換 LLM [クラウド・Ollama・LM Studio] / DeepL / Google Cloud Translation / ユーザー独自 GAS Webhook）＋ API キーの安全保存（OS 資格情報ストア連携、設定ファイル平文記載禁止）。
+       - 汎用 TOML 用語辞書（`glossaries/*.toml` のインポート・有効化・優先順位並び替え・編集）、STT **`hotwords_score`** スライダー調整、コンテキスト履歴数（5〜10）、フォントサイズ・透過率・表示行数・フェードアウト秒数。
 
 #### OS 別制約と実運用上の回避策（必須設計事項）
 
@@ -690,8 +773,8 @@ kotoha/
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── domain/              # 最内層: Entities/VOs, Ports (Traits), Pure Logic
-│   │       ├── application/         # Use Cases: PipelineService, SourceSessionManager, TranslatorManager
-│   │       ├── infrastructure/      # Adapters: IpcServerAdapter, AudioPreprocessor, MockAdapters
+│   │       ├── application/         # Use Cases: PipelineService, SourceSessionManager, TranslatorManager, GlossaryManager
+│   │       ├── infrastructure/      # Adapters: IpcServerAdapter, AudioPreprocessor, TomlGlossaryRepository, MockAdapters
 │   │       └── bin/
 │   │           └── kotoha_ipc_monitor.rs
 │   ├── kotoha-stt-sherpa/           # (Phase 2) sherpa-onnx ストリーミング STT アダプタ
@@ -730,7 +813,7 @@ kotoha/
      - `ring_buffer` の SPSC 並行プロデューサ/コンシューマ検証、満杯時ドロップ数および `seq` ギャップの一致検証。
    - **Rust (`cargo test --workspace`)**:
      - `kotoha-protocol` の往復・不正フレーム（magic 不一致、version 不一致、64KB 超過、切り詰め、`flags` 予約ビット、NaN PCM、UTF-8 不正）検証。
-     - `kotoha-core` のエンドポイント解決（`KOTOHA_IPC_ENDPOINT` 上書き・OS デフォルト）、モノラルダウンミックス、16 kHz リサンプリング、Mock STT / Mock Translator によるパイプライン結合テスト。
+     - `kotoha-core` のエンドポイント解決（`KOTOHA_IPC_ENDPOINT` 上書き・OS デフォルト）、モノラルダウンミックス、16 kHz リサンプリング、TOML 用語辞書読込・優先マージ、最長一致＆単語境界プレースホルダ保護/復元、Mock STT / Mock Translator によるパイプライン結合テスト。
    - **UI (`Vitest`)**:
      - 字幕カード 3 段階状態遷移、話者カラー割当、翻訳エンジン設定スキーマバリデーション。
 2. **Tier 2: バイナリ ABI & 疎通結合テスト**
@@ -767,7 +850,7 @@ kotoha/
 
 | Phase | 名称 | 主な成果物・マイルストーン | 関連 Issue |
 | :--- | :--- | :--- | :--- |
-| **Phase 1** | **Core IPC, Mumble Plugin, Repo & CI Foundation** | `DESIGN.md`・基盤設定ファイル、`kotoha-protocol`、`plugins/common`、`plugins/mumble` & `kotoha_mock_client`、`kotoha-core`（Clean/Hexagonal `domain`/`application`/`infrastructure`、Mock アダプタ、`kotoha-ipc-monitor`）、React+TS+Vite UI 骨格、クロス言語 E2E、3OS CI/Release | #1 〜 #7 |
-| **Phase 2** | **Local STT & Pluggable Translation Engines** | `kotoha-stt-sherpa`（`sherpa-onnx` 話者別ストリーミング STT）、Pre-filter & Context Manager、`kotoha-translate-local`（`ct2rs` + CPU/GPU `ModelProfile` カタログ）& `kotoha-translate-http`（OpenAI 互換 LLM / DeepL / Google Cloud / GAS Webhook） | #8, #9 |
-| **Phase 3** | **Tauri v2 Overlay UI, Tray & Auto-Setup Wizard** | Tauri v2 統合、透過クリックスルー字幕オーバーレイ、システムトレイ、初回セットアップウィザード（プラグイン自動配置・モデル DL/SHA-256 検証・Heartbeat 検知）、設定画面、3OS バンドルリリース | #10 |
+| **Phase 1** | **Core IPC, Mumble Plugin, Repo & CI Foundation** | `DESIGN.md`・基盤設定ファイル、`kotoha-protocol`、`plugins/common`、`plugins/mumble` & `kotoha_mock_client`、`kotoha-core`（Clean/Hexagonal `domain`/`application`/`infrastructure`、`TomlGlossaryRepository` 基盤、Mock アダプタ、`kotoha-ipc-monitor`）、React+TS+Vite UI 骨格、クロス言語 E2E、3OS CI/Release | #1 〜 #7 |
+| **Phase 2** | **Local STT & Pluggable Translation Engines** | `kotoha-stt-sherpa`（`sherpa-onnx` 話者別ストリーミング STT + `modified_beam_search` Hotwords / `hotwords_score`）、Pre-filter・Context/Glossary Manager（NMT/API 向け最長一致プレースホルダ保護 & LLM プロンプト注入）、`kotoha-translate-local`（`ct2rs` + CPU/GPU `ModelProfile` カタログ）& `kotoha-translate-http`（OpenAI 互換 LLM / DeepL / Google Cloud / GAS Webhook） | #8, #9 |
+| **Phase 3** | **Tauri v2 Overlay UI, Tray & Auto-Setup Wizard** | Tauri v2 統合、透過クリックスルー字幕オーバーレイ、システムトレイ、初回セットアップウィザード（プラグイン自動配置・モデル DL/SHA-256 検証・Heartbeat 検知）、設定画面（`glossaries/*.toml` プロファイル管理 & `hotwords_score` 調整含む）、3OS バンドルリリース | #10 |
 | **Phase 4** | **Multi-Source, Multilingual & Release Hardening** | `src_lang`/`tgt_lang` 多言語切替 UI & カタログ、`plugins/ts3`（TeamSpeak 3 プラグイン）＆ OS ループバック入力ソース、コード署名 & Tauri Updater | #11 |

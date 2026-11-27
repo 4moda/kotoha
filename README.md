@@ -15,6 +15,7 @@
   1. **Local NMT (`ct2rs` / CTranslate2)** — CPU 軽量（FuguMT / OPUS-MT）から GPU 多言語（NLLB-200）までハードウェア・言語ペアに応じた `ModelProfile` 単位で選択可能（完全無料・オフライン・低遅延）
   2. **OpenAI 互換 LLM API** — OpenAI / Gemini / ローカル Ollama・LM Studio（GPU / Apple Silicon 対応、会話履歴 5〜10 件＋用語辞書）
   3. **専用翻訳 API / ユーザー管理プロキシ** — DeepL（Free / Pro）、Google Cloud Translation API（公式 v2 / v3）、ユーザー独自 GAS (`LanguageApp.translate()`) Webhook（非公式スクレイピングは非搭載）
+- **汎用カスタム用語辞書 (`glossaries/*.toml`)**: 単一の TOML 用語マップを **STT Hotwords (Context Biasing)** と **翻訳固定訳語（プレースホルダ保護 / プロンプト注入）** で共通利用可能（ドメイン非依存）。
 
 ---
 
