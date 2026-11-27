@@ -163,6 +163,25 @@ pub struct PreprocessedAudio {
     pub is_local_user: bool,
 }
 
+/// Why an IPC connection was closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisconnectReason {
+    /// The peer closed the connection cleanly.
+    Eof,
+    /// An I/O error occurred while reading.
+    IoError(String),
+    /// The peer violated the IPC protocol (decode error, duplicate/missing `Hello`).
+    Protocol(String),
+    /// No valid `Hello` arrived within the hello timeout.
+    HelloTimeout,
+    /// No frame (including `Heartbeat`) arrived within the idle timeout.
+    IdleTimeout,
+    /// A newer connection with the same source took ownership.
+    Superseded,
+    /// The server is shutting down (or the event consumer is gone).
+    Shutdown,
+}
+
 /// Domain input event emitted by an [`crate::domain::ports::AudioInputSource`] or IPC server.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AudioInputEvent {
@@ -181,6 +200,8 @@ pub enum AudioInputEvent {
         conn_id: u64,
         /// Source application name (if `Hello` had completed).
         source: String,
+        /// Why the connection was closed.
+        reason: DisconnectReason,
     },
     /// Client requested resetting all active speakers/streams for this source.
     SourceReset {
@@ -521,7 +542,7 @@ impl SttHotwordsConfig {
     /// Creates an [`SttHotwordsConfig`] choosing `ModifiedBeamSearch` if `hotwords` is non-empty,
     /// or `GreedySearch` otherwise, with [`DEFAULT_HOTWORDS_SCORE`].
     #[must_use]
-    pub fn from_hotwords(hotwords: Vec<String>) -> Self {
+    pub const fn from_hotwords(hotwords: Vec<String>) -> Self {
         let decoding_method = if hotwords.is_empty() {
             SttDecodingMethod::GreedySearch
         } else {

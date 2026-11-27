@@ -31,4 +31,6 @@ if(WIN32)
             WIN32_LEAN_AND_MEAN
             NOMINMAX
     )
+    # OpenProcessToken / GetTokenInformation / EqualSid (named pipe server identity check).
+    target_link_libraries(kotoha_common PRIVATE advapi32)
 endif()

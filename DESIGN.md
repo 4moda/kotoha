@@ -56,6 +56,7 @@
      ========================|======================== OS Native IPC
        Windows: \\.\pipe\kotoha_v1 (Named Pipe)
        Linux/macOS: $XDG_RUNTIME_DIR/kotoha_v1.sock (UDS, mode 0600)
+                    or ${TMPDIR:-/tmp}/kotoha-<euid>/kotoha_v1.sock (dir 0700)
        Override: KOTOHA_IPC_ENDPOINT
      ========================|========================
                              v
@@ -104,24 +105,31 @@
 
 ### 3.1 エンドポイント解決規則
 
-C++ クライアント・Rust サーバー双方が同一の優先順位でエンドポイントを決定する。
+C++ クライアント（`resolve_ipc_endpoint` / `resolve_posix_ipc_endpoint`）・Rust サーバー（`kotoha_protocol::resolve_endpoint_details`）双方が同一の優先順位でエンドポイントを決定する。両実装の一致は共有フィクスチャ `tests/fixtures/endpoint_resolution_cases.tsv` を Rust・C++ 双方のテストで検証することで担保する。
 
 | 優先度 | 条件 / OS | エンドポイント形式 | 備考 |
 | :--- | :--- | :--- | :--- |
 | 1 | 環境変数 `KOTOHA_IPC_ENDPOINT` が非空文字列として設定されている | `KOTOHA_IPC_ENDPOINT` の値そのまま | 単体・E2E テストでの一時エンドポイント分離に使用 |
 | 2 (Windows) | `KOTOHA_IPC_ENDPOINT` 未設定または空 | `\\.\pipe\kotoha_v1` | Windows Named Pipe（Byte-stream モード） |
 | 2 (Linux / macOS) | `KOTOHA_IPC_ENDPOINT` 未設定または空かつ `$XDG_RUNTIME_DIR` が非空 | `$XDG_RUNTIME_DIR/kotoha_v1.sock` | 末尾のスラッシュは正規化して連結 |
-| 3 (Linux / macOS) | `$XDG_RUNTIME_DIR` 未設定または空 | `/tmp/kotoha_v1.sock` | フォールバック先 |
+| 3 (Linux / macOS) | `$XDG_RUNTIME_DIR` 未設定または空 | `${TMPDIR}/kotoha-<euid>/kotoha_v1.sock` | ユーザー専用ディレクトリ（下記）。`$TMPDIR` が未設定・空・相対パス・`/` のみ、または結果が **90 バイト超**の場合は `/tmp/kotoha-<euid>/kotoha_v1.sock` を使う。`<euid>` は実効 UID の 10 進表記。`$TMPDIR` 末尾のスラッシュは正規化する |
+
+- `/tmp/kotoha_v1.sock` のような **誰でも書き込める共有ディレクトリ直下へのフォールバックは行わない**（別ユーザーが先に同じパスで listen すると、プラグインが全参加者の音声と表示名をそのサーバーへ送ってしまうため）。macOS の GUI 起動アプリには通常 `XDG_RUNTIME_DIR` が無いが、`$TMPDIR`（`/var/folders/.../T/`）はユーザーごとのディレクトリなので優先度 3 の第一候補になる。
+- **ユーザー専用ディレクトリ（優先度 3）の扱い**: サーバーは bind 前に当該ディレクトリが無ければ **mode `0700`** で作成する（親ディレクトリは作成しない）。既存の場合を含め、`lstat` 結果が (a) 実ディレクトリである（シンボリックリンク不可）、(b) 所有者が実効 UID、(c) group/other のパーミッションビットが無い（`mode & 0o077 == 0`）、のすべてを満たさなければ**使用を拒否してエラー終了**する（パーミッションの自動修正もしない）。`KOTOHA_IPC_ENDPOINT` と `$XDG_RUNTIME_DIR` の場合はこの検査を行わない（`$XDG_RUNTIME_DIR` は仕様上 `0700` かつ本人所有）。
 
 #### Unix Domain Socket (Linux / macOS) 固有要件
 - **パーミッション**: サーバーは `bind` 完了直後（または `umask` 制御により作成時）にソケットファイルのパーミッションを **`0600`**（所有者のみ読み書き可）に設定し、他ユーザーからの盗聴・注入を防止する。
-- **古いソケットファイル処理**: サーバー起動時、対象パスに既存のソケットファイルが存在する場合は、まず接続を試行し、`ECONNREFUSED` 等で生存サーバー不在を確認したうえで `unlink` してから `bind` する（二重起動時はエラー終了または警告）。サーバー正常終了時はソケットファイルを削除する。
+- **古いソケットファイル処理**: サーバー起動時、対象パスに何かが存在する場合は `lstat` で種別と所有者を確認する。**ソケットであり、かつ所有者が実効 UID である場合に限り**、接続を試行して `ECONNREFUSED` 等で生存サーバー不在を確認したうえで `unlink` してから `bind` する（生存サーバーがあればエラー終了）。通常ファイル・ディレクトリ・シンボリックリンク（リンク先を問わない）・他ユーザー所有のソケットの場合は**一切削除せず**、理由を示す `CoreError::Ipc` でエラー終了する。
+- **終了時のソケット削除**: サーバー正常終了時は、パスが bind 時に作成したソケットそのもの（同一 device/inode・ソケット種別・実効 UID 所有）である場合に限り削除する。実行中に別のファイルへ置き換えられていた場合は削除しない（`interprocess` の name reclamation は無効化し、削除はこの検査付き処理のみで行う）。
+- **クライアントによるサーバー検証（なりすまし防止）**: ソケットの `0600` は「他ユーザーがサーバーへ接続すること」は防ぐが「他ユーザーがサーバーになりすますこと」は防げない。そのため C++ クライアントは `connect` 成功直後、`Hello` を含む一切のデータを送る前に、ピアの実効 UID が自プロセスの `geteuid()` と一致することを検証する（Linux: `getsockopt(SO_PEERCRED)`、macOS/BSD: `getpeereid()`、どちらも使えない環境では常に失敗扱い）。不一致・取得失敗時はソケットを閉じて接続失敗として扱い、通常の再接続間隔（§3.2）で再試行する。検証はワーカースレッドで行い、オーディオスレッドの不変条件には影響しない。
 - **POSIX `SIGPIPE` 防止 & パス長制限**:
   - C++ クライアントはソケット切断時の `SIGPIPE` による Mumble ホストプロセス強制終了を防ぐため、Linux では `send(..., MSG_NOSIGNAL)`、macOS ではソケット生成直後に `setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, ...)` を必須設定する。
   - macOS の `sockaddr_un.sun_path` は最大 **104 バイト**（NUL 終端含む、Linux は 108 バイト）の制約がある。テストや CI で `KOTOHA_IPC_ENDPOINT` に一時パスを指定する際は、常に **90 バイト以下**の短いパス（例: `/tmp/kotoha-test-<pid>.sock`）を使用する。
 - **Named Pipe (Windows) 固有要件**:
   - **Rust (`interprocess`) 命名規約**: Rust `interprocess` クレート（v2 `local_socket::Name` / `GenericNamespaced` + `ToNsName`）で名前付きパイプを生成・接続する場合、`ToNsName` はプレフィックス無しのパイプ名（例: `"kotoha_v1"`）から内部的に `\\.\pipe\kotoha_v1` を構築する。一方、`KOTOHA_IPC_ENDPOINT` には Windows 標準形式 `\\.\pipe\<name>` と裸の `<name>` の双方が渡され得るため、Rust 側の Windows エンドポイント解決関数は先頭の `\\.\pipe\`（大文字小文字非区別）を正規化して `ToNsName` に渡す（C++ 側は `\\.\pipe\<name>` をそのまま `CreateFileW` へ渡し、裸名が渡された場合のみ `\\.\pipe\` を補完する）。
   - **アクセス制御・セキュリティ記述子**: パイプは `PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT` 互換のバイトストリームモードで作成し、現行ユーザー SID にアクセスを限定する DACL（Local System / 現行ユーザーのみ許可し、他ユーザー・ネットワークアクセスを拒否するセキュリティ記述子）を適用する。
+  - **先行作成（squatting）防止**: サーバーは最初のパイプインスタンスを `FILE_FLAG_FIRST_PIPE_INSTANCE` 付きで作成し、同名パイプが既に存在する場合は起動に失敗する（`interprocess` v2 の `PipeListener` は最初のインスタンス作成時にこのフラグを常に付与する）。
+  - **クライアントによるサーバー検証**: C++ クライアントは `CreateFileW` 成功直後、データ送信前に `GetNamedPipeServerProcessId` でサーバープロセス ID を取得し、`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` → `OpenProcessToken(TOKEN_QUERY)` → `GetTokenInformation(TokenUser)` で得たユーザー SID が自プロセスのトークンユーザー SID と `EqualSid` で一致することを確認する。いずれかの API が失敗した場合や不一致の場合はハンドルを閉じて接続失敗として扱う（fail closed）。
   - **C++ 非同期 I/O とシャットダウン非ブロッキング**: C++ クライアントは `CreateFileW` 時に `FILE_FLAG_OVERLAPPED` を指定し、`WriteFile` も `OVERLAPPED` + イベント待機で行うことで、`mumble_shutdown()` 時に `CancelIoEx(handle, nullptr)` により進行中のパイプ I/O を即座にキャンセルしてブロックせずに終了できるようにする。また、接続時に `ERROR_PIPE_BUSY` が返った場合は短い待機（例: `WaitNamedPipeW(endpoint, 50)`）の後に再試行する。
 
 ### 3.2 トポロジと接続ライフサイクル
@@ -131,9 +139,10 @@ C++ クライアント・Rust サーバー双方が同一の優先順位でエ�
   - **C++ Plugin = Client (Connect)**: ホスト起動・プラグイン有効化時に非同期ワーカースレッドが接続を試行する。
 - **接続所有権と同一 `source` 再接続レース防止 (`conn_id`)**:
   - `IpcServer` は Accept したすべての接続に単調増加の一意な **`conn_id: u64`** を割り当てる。
-  - `Hello` 受信により接続の `source` 名が確定した際、`active_sources: HashMap<String, u64>` に当該 `source -> conn_id` を登録する。既に同一 `source` の別 `conn_id` がアクティブであった場合は即座に新しい `conn_id` で上書き（または旧接続をキャンセル・置き換え）する。
-  - `SourceReset` 受信時または EOF / I/O エラー検知時のクリーンアップは、**必ず `active_sources.get(&source) == Some(&conn_id)` を検証した上でのみ**実行する。これにより、再接続直後に旧ソケットの遅延 EOF が新接続の話者状態や STT ストリームを誤破棄するレースコンディションを完全に排除する。
-- **自動再接続**: 接続失敗または切断検知時、C++ クライアントは **1000 ms (1 秒) 間隔** でリトライする（シャットダウン要求時は 50 ms 以内など速やかにループ離脱できるよう条件変数 `wait_for` で待機する）。
+  - `Hello` 受信により接続の `source` 名が確定した際、`active_sources: HashMap<String, u64>` に当該 `source -> conn_id` を登録する。既に同一 `source` の別 `conn_id` がアクティブであった場合は即座に新しい `conn_id` で上書きし、**旧接続のタスクを能動的にキャンセルして切断する**（実装: IPC アダプタが `source -> (conn_id, cancel)` の表を保持し、新しい `Hello` 完了時に旧接続へキャンセルを通知する。旧接続は `SourceDisconnected { reason: Superseded }` を送出するが、所有権チェックにより `SourceSessionManager` では無視される）。
+  - `SourceReset` 受信時または EOF / I/O エラー検知時のクリーンアップは、**必ず `active_sources.get(&source) == Some(&conn_id)` を検証した上でのみ**実行する。これにより、再接続直後に旧ソケットの遅延 EOF が新接続の話者状態や STT ストリームを誤破棄するレースを防ぐ。さらに、サーバーは「所有権表の更新・旧接続のキャンセル・`SourceConnected` のチャネル投入」を同一ロック内で行い（チャネル容量を先に確保してから）、ほぼ同時の `Hello` でもチャネル上のイベント順と所有権の順序が一致するようにしている。
+  - **注意（同名 `source` の多重起動）**: 同じ `source` 名を使う 2 つのプラグインインスタンスが同時に接続すると、再接続のたびに互いを置き換え合い（flapping）、安定して接続できない。`source` 名はホストアプリごとに一意とすること。
+- **自動再接続**: 接続失敗または切断検知時、C++ クライアントは **1000 ms (1 秒) 間隔** でリトライする（シャットダウン要求時は 50 ms 以内など速やかにループ離脱できるよう条件変数 `wait_for` で待機する）。サーバー身元検証（§3.1: ピア UID / パイプサーバー SID）の不一致も接続失敗として扱い、同じ間隔で再試行する。
 - **セッション初期化 (`Hello`) 厳密ルール**:
   - クライアントは接続確立直後、他のどのメッセージよりも先に **`Hello` (`0x00`)** を 1 回送信しなければならない。
   - **第 1 フレームが `Hello` 以外**、**`Hello` のデコード検証失敗**、または **セッション途中での重複 `Hello` 受信** はすべて `ProtocolError` とみなし、サーバーは即座に接続を切断する。
@@ -141,7 +150,11 @@ C++ クライアント・Rust サーバー双方が同一の優先順位でエ�
   - ヘッダ検証エラー（`InvalidMagic`, `UnsupportedVersion`, `PayloadTooLarge`, `UnknownMessageType`）およびペイロード検証エラー（`InvalidPayloadLength`, `InvalidUtf8`, `InvalidFlags`, `InvalidPcmSample`, `InvalidTalkingState` 等）が発生した場合、フレーミング境界が喪失またはピアが破損しているため、デコーダはエラーを返し、サーバーは**必ず該当ピア接続を即座に切断**する（リカバー継続しない）。
 - **Keepalive (`Heartbeat`)**:
   - クライアントは送信する他メッセージがない場合を含め、原則 **1000 ms (1 秒) ごと** に `Heartbeat` (`0x04`) を送信する。
-  - サーバーは任意の間隔（推奨タイムアウト: 5 秒など、テスト設定で調整可）で生存監視や UI の接続ステータス表示（「接続中 / 未接続」）に利用する。
+  - サーバーは生存監視と UI の接続ステータス表示（「接続中 / 未接続」）に `Heartbeat` を利用する。実装済みのタイムアウト（`IpcServerConfig`、`IpcServerAdapter::with_config` で調整可）:
+  - **`hello_timeout`（既定 2 秒）**: 接続受理から有効な `Hello` が届くまでの上限。超過した接続は切断する（`HelloTimeout`、`Hello` 未完了のため `SourceDisconnected` は発行しない）。
+  - **`idle_timeout`（既定 5 秒）**: `Hello` 後、**任意の種別のフレーム**（`Heartbeat` 含む）が届かない時間の上限。超過した接続は切断し `SourceDisconnected { reason: IdleTimeout }` を発行する。
+  - **`max_connections`（既定 16）**: 同時接続数の上限。超過分の新規接続は即座に破棄する。
+  - 切断理由は `AudioInputEvent::SourceDisconnected.reason`（`DisconnectReason`: `Eof` / `IoError` / `Protocol` / `HelloTimeout` / `IdleTimeout` / `Superseded` / `Shutdown`）で通知され、`kotoha-ipc-monitor` が表示する。
 - **切断クリーンアップ (`SourceReset` / EOF)**:
   - クライアントはプラグイン停止時やボイスチャットサーバー切断時（`mumble_onServerDisconnected`）に `SourceReset` (`0x06`) を送信する。
   - サーバーは `SourceReset` 受信時または TCP/IPC EOF・I/O エラー検知時に（`conn_id` 所有権チェックのもとで）、該当接続の `source` に紐づくすべてのアクティブ話者・STT ストリームを安全に破棄・フラッシュする。

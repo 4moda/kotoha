@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 #endif
@@ -84,7 +85,136 @@ namespace {
 }
 #endif
 
+constexpr std::string_view kSocketFileName = "kotoha_v1.sock";
+constexpr std::string_view kTmpBase = "/tmp";
+constexpr std::string_view kPrivateDirPrefix = "kotoha-";
+
+[[nodiscard]] std::string trim_trailing_slashes(std::string value) {
+    while (!value.empty() && value.back() == '/') {
+        value.pop_back();
+    }
+    return value;
+}
+
+[[nodiscard]] std::string resolve_private_ipc_dir(const std::string& tmpdir, uint32_t euid) {
+    std::string leaf(kPrivateDirPrefix);
+    leaf.append(std::to_string(euid));
+    std::string fallback(kTmpBase);
+    fallback.append("/").append(leaf);
+
+    if (tmpdir.empty() || tmpdir.front() != '/') {
+        return fallback;
+    }
+    std::string dir = trim_trailing_slashes(tmpdir);
+    if (dir.empty()) {
+        return fallback;
+    }
+    dir.append("/").append(leaf);
+    // + 1 for the separator before the socket file name.
+    if (dir.size() + 1U + kSocketFileName.size() > kMaxPosixEndpointLen) {
+        return fallback;
+    }
+    return dir;
+}
+
+#if defined(_WIN32)
+/// Returns the TOKEN_USER information of `process`, or an empty buffer on failure.
+[[nodiscard]] std::vector<uint8_t> query_process_token_user(HANDLE process) noexcept {
+    try {
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(process, TOKEN_QUERY, &token)) {
+            return {};
+        }
+        DWORD needed = 0;
+        GetTokenInformation(token, TokenUser, nullptr, 0, &needed);
+        if (needed == 0) {
+            CloseHandle(token);
+            return {};
+        }
+        std::vector<uint8_t> buffer(static_cast<size_t>(needed));
+        if (!GetTokenInformation(token, TokenUser, buffer.data(), needed, &needed)) {
+            CloseHandle(token);
+            return {};
+        }
+        CloseHandle(token);
+        return buffer;
+    } catch (...) {
+        return {};
+    }
+}
+#endif
+
 }  // namespace
+
+std::string resolve_posix_ipc_endpoint(const PosixEndpointEnv& env) {
+    if (!env.endpoint_override.empty()) {
+        return env.endpoint_override;
+    }
+    if (!env.xdg_runtime_dir.empty()) {
+        std::string dir = trim_trailing_slashes(env.xdg_runtime_dir);
+        dir.append("/").append(kSocketFileName);
+        return dir;
+    }
+    std::string endpoint = resolve_private_ipc_dir(env.tmpdir, env.euid);
+    endpoint.append("/").append(kSocketFileName);
+    return endpoint;
+}
+
+#if !defined(_WIN32)
+bool unix_peer_has_uid(int fd, uint32_t expected_uid) noexcept {
+    if (fd < 0) {
+        return false;
+    }
+#if defined(SO_PEERCRED)
+    ucred cred{};
+    socklen_t len = sizeof(cred);
+    if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0 || len != sizeof(cred)) {
+        return false;
+    }
+    return static_cast<uint32_t>(cred.uid) == expected_uid;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || \
+    defined(__DragonFly__)
+    uid_t peer_euid = 0;
+    gid_t peer_egid = 0;
+    if (::getpeereid(fd, &peer_euid, &peer_egid) != 0) {
+        return false;
+    }
+    return static_cast<uint32_t>(peer_euid) == expected_uid;
+#else
+    // Unknown platform: fail closed rather than talk to an unverified server.
+    (void)expected_uid;
+    return false;
+#endif
+}
+#else
+bool named_pipe_server_is_current_user(void* pipe) noexcept {
+    const HANDLE handle = static_cast<HANDLE>(pipe);
+    if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    ULONG server_pid = 0;
+    if (!GetNamedPipeServerProcessId(handle, &server_pid) || server_pid == 0) {
+        return false;
+    }
+    const HANDLE server_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, server_pid);
+    if (server_process == nullptr) {
+        return false;
+    }
+    std::vector<uint8_t> server_user = query_process_token_user(server_process);
+    CloseHandle(server_process);
+    std::vector<uint8_t> self_user = query_process_token_user(GetCurrentProcess());
+    if (server_user.size() < sizeof(TOKEN_USER) || self_user.size() < sizeof(TOKEN_USER)) {
+        return false;
+    }
+    const auto* server_token = reinterpret_cast<const TOKEN_USER*>(server_user.data());
+    const auto* self_token = reinterpret_cast<const TOKEN_USER*>(self_user.data());
+    if (server_token->User.Sid == nullptr || self_token->User.Sid == nullptr ||
+        !IsValidSid(server_token->User.Sid) || !IsValidSid(self_token->User.Sid)) {
+        return false;
+    }
+    return EqualSid(server_token->User.Sid, self_token->User.Sid) != FALSE;
+}
+#endif
 
 std::string resolve_ipc_endpoint(std::string_view explicit_override) {
     std::string raw_override(explicit_override);
@@ -102,19 +232,11 @@ std::string resolve_ipc_endpoint(std::string_view explicit_override) {
         return raw_override;
     }
 
-    std::string xdg_runtime = read_env_var("XDG_RUNTIME_DIR");
-    if (!xdg_runtime.empty()) {
-        while (xdg_runtime.size() > 1U && xdg_runtime.back() == '/') {
-            xdg_runtime.pop_back();
-        }
-        if (xdg_runtime == "/") {
-            return "/kotoha_v1.sock";
-        }
-        xdg_runtime.append("/kotoha_v1.sock");
-        return xdg_runtime;
-    }
-
-    return "/tmp/kotoha_v1.sock";
+    PosixEndpointEnv env;
+    env.xdg_runtime_dir = read_env_var("XDG_RUNTIME_DIR");
+    env.tmpdir = read_env_var("TMPDIR");
+    env.euid = static_cast<uint32_t>(::geteuid());
+    return resolve_posix_ipc_endpoint(env);
 #endif
 }
 
@@ -174,6 +296,11 @@ public:
             HANDLE handle = CreateFileW(wide_endpoint.c_str(), GENERIC_WRITE | GENERIC_READ, 0,
                                         nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
             if (handle != INVALID_HANDLE_VALUE) {
+                // Refuse to talk to a pipe server running as another user (squatted pipe name).
+                if (!named_pipe_server_is_current_user(handle)) {
+                    CloseHandle(handle);
+                    return false;
+                }
                 pipe_.store(handle, std::memory_order_release);
                 return true;
             }
@@ -343,6 +470,13 @@ private:
                 ::close(fd);
                 return false;
             }
+        }
+
+        // Refuse to talk to a server running as another user (e.g. a squatted socket path).
+        // Treated as a failed connect; the worker retries on the normal reconnect interval.
+        if (!unix_peer_has_uid(fd, static_cast<uint32_t>(::geteuid()))) {
+            ::close(fd);
+            return false;
         }
 
         fd_.store(fd, std::memory_order_release);

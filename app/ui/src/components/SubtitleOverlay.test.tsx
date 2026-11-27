@@ -158,4 +158,29 @@ describe('SubtitleOverlay', () => {
     );
     expect(screen.getByRole('button', { name: 'Lock Click-Through' })).toBeInTheDocument();
   });
+
+  it('hides drag bar in frameless mode while locked and exposes data-tauri-drag-region when unlocked', () => {
+    const { rerender } = render(
+      <SubtitleOverlay
+        entries={sampleEntries}
+        options={{ ...baseOptions, locked: true }}
+        frameless={true}
+      />,
+    );
+
+    expect(screen.getByTestId('subtitle-overlay')).toHaveClass('is-frameless');
+    expect(screen.queryByTestId('overlay-drag-bar')).not.toBeInTheDocument();
+
+    rerender(
+      <SubtitleOverlay
+        entries={sampleEntries}
+        options={{ ...baseOptions, locked: false }}
+        frameless={true}
+      />,
+    );
+
+    const dragBar = screen.getByTestId('overlay-drag-bar');
+    expect(dragBar).toBeInTheDocument();
+    expect(dragBar).toHaveAttribute('data-tauri-drag-region');
+  });
 });

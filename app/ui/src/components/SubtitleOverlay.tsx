@@ -8,18 +8,23 @@ export interface SubtitleOverlayProps {
   entries: readonly SubtitleEntry[];
   options: OverlayDisplayOptions;
   onToggleLock?: () => void;
+  frameless?: boolean;
 }
 
 export function SubtitleOverlay({
   entries,
   options,
   onToggleLock,
+  frameless = false,
 }: SubtitleOverlayProps) {
   const visibleEntries = entries.slice(-Math.max(1, options.max_lines));
+  const showUnlockedDragHandle = !frameless || !options.locked;
 
   return (
     <section
-      className={`subtitle-overlay ${options.locked ? 'is-locked' : 'is-unlocked'}`}
+      className={`subtitle-overlay ${options.locked ? 'is-locked' : 'is-unlocked'} ${
+        frameless ? 'is-frameless' : ''
+      }`}
       aria-label="Live subtitle overlay"
       data-testid="subtitle-overlay"
       style={{
@@ -27,29 +32,38 @@ export function SubtitleOverlay({
         ['--subtitle-font-size' as string]: `${options.font_size_px}px`,
       }}
     >
-      <header className="overlay-bar">
-        <div className="overlay-status-group">
-          <span
-            className={`lock-badge ${options.locked ? 'locked' : 'unlocked'}`}
-            data-testid="overlay-lock-indicator"
+      {showUnlockedDragHandle && (
+        <header
+          className="overlay-bar"
+          data-testid="overlay-drag-bar"
+          {...(!options.locked ? { 'data-tauri-drag-region': '' } : {})}
+        >
+          <div
+            className="overlay-status-group"
+            {...(!options.locked ? { 'data-tauri-drag-region': '' } : {})}
           >
-            {options.locked ? 'Click-Through Locked' : 'Position Unlocked (Drag / Resize)'}
-          </span>
-          <span className="overlay-line-count" data-testid="overlay-line-count">
-            {visibleEntries.length}/{options.max_lines} lines
-          </span>
-        </div>
-        {onToggleLock && (
-          <button
-            type="button"
-            id="toggle-overlay-lock-btn"
-            className="btn btn-subtle btn-compact"
-            onClick={onToggleLock}
-          >
-            {options.locked ? 'Unlock Position' : 'Lock Click-Through'}
-          </button>
-        )}
-      </header>
+            <span
+              className={`lock-badge ${options.locked ? 'locked' : 'unlocked'}`}
+              data-testid="overlay-lock-indicator"
+            >
+              {options.locked ? 'Click-Through Locked' : 'Position Unlocked (Drag / Resize)'}
+            </span>
+            <span className="overlay-line-count" data-testid="overlay-line-count">
+              {visibleEntries.length}/{options.max_lines} lines
+            </span>
+          </div>
+          {onToggleLock && (
+            <button
+              type="button"
+              id="toggle-overlay-lock-btn"
+              className="btn btn-subtle btn-compact"
+              onClick={onToggleLock}
+            >
+              {options.locked ? 'Unlock Position' : 'Lock Click-Through'}
+            </button>
+          )}
+        </header>
+      )}
 
       {visibleEntries.length === 0 ? (
         <div className="overlay-empty" data-testid="overlay-empty-state">

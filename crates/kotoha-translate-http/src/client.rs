@@ -1,8 +1,6 @@
 //! Shared HTTP client helpers, URL/timeout/SSRF validation, bounded reads, and status mapping.
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use kotoha_core::domain::CoreError;
@@ -62,10 +60,10 @@ pub fn build_http_client(
             if max_hops == 0 {
                 redirect::Policy::none()
             } else {
-                let hops = Arc::new(AtomicUsize::new(0));
                 redirect::Policy::custom(move |attempt| {
-                    let count = hops.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count > max_hops || attempt.previous().len() > max_hops {
+                    // Per-request limit: `previous()` holds only the URLs already visited in
+                    // THIS request, so the budget resets for every new request on the client.
+                    if attempt.previous().len() > max_hops {
                         return attempt.error("too many redirects");
                     }
 

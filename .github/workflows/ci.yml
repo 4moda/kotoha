@@ -18,27 +18,21 @@ jobs:
   rust-lint:
     name: Rust Lint (fmt & clippy)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97.0"
           components: rustfmt, clippy
 
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
+      - name: Cache Rust dependencies and target
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-lint-
+          key: rust-lint
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -49,6 +43,7 @@ jobs:
   cpp-lint:
     name: C++ Lint (clang-format & clang-tidy)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -80,6 +75,7 @@ jobs:
   ui-ci:
     name: UI Lint, Typecheck, Unit & Playwright E2E
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: app/ui
@@ -125,8 +121,8 @@ jobs:
             app/ui/test-results/
           retention-days: 7
 
-  matrix-build-test-e2e:
-    name: Build, Unit Tests & Cross-Language E2E (${{ matrix.os }})
+  tauri-check:
+    name: Tauri v2 Desktop Shell (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -136,23 +132,80 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install Linux Tauri system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/ui/package-lock.json
+
+      - name: Build UI bundle for Tauri frontendDist
+        working-directory: app/ui
+        run: |
+          npm ci
+          npm run build
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
+          components: rustfmt, clippy
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-
-      - name: Cache Cargo dependencies
+      - name: Cache Tauri Cargo dependencies
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
+            app/src-tauri/target/
+          key: ${{ runner.os }}-cargo-tauri-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-e2e-
+            ${{ runner.os }}-cargo-tauri-
+
+      - name: Check formatting (kotoha-app)
+        run: cargo fmt --manifest-path app/src-tauri/Cargo.toml -- --check
+
+      - name: Run Clippy (kotoha-app)
+        run: cargo clippy --manifest-path app/src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Run unit tests (kotoha-app)
+        run: cargo test --manifest-path app/src-tauri/Cargo.toml
+
+  matrix-build-test-e2e:
+    name: Build, Unit Tests & Cross-Language E2E (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache Rust dependencies and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: matrix-e2e-${{ matrix.os }}
 
       - name: Configure C++ plugins (CMake)
         run: cmake -S plugins -B plugins/build -DCMAKE_BUILD_TYPE=Release -DKOTOHA_WARNINGS_AS_ERRORS=ON
@@ -167,38 +220,38 @@ jobs:
         run: cargo build --release --bin kotoha-ipc-monitor
 
       - name: Run Rust workspace unit & Cross-Language IPC E2E tests (nextest)
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --profile ci
+
+      - name: Run Rust workspace doctests
+        run: cargo test --workspace --doc
 
   real-audio-e2e:
     name: Real-Audio E2E (C++ IPC -> sherpa-onnx STT -> HTTP Translation)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       SHERPA_ONNX_VERSION: "v2.0.3"
       SHERPA_ARCHIVE_NAME: "sherpa-onnx-v2.0.3-linux-x64-static-lib"
+      SHERPA_ARCHIVE_SHA256: "f927e695d29b8c7ea3fda97eed215204b210fd57f9faf990a93377bac098ad57"
       ZIPFORMER_MODEL_NAME: "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17-mobile"
+      ZIPFORMER_MODEL_SHA256: "753a5362538539212442efbfb8dd5748db82e35e7deaec5330f49c56e81e40fd"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97.0"
           components: clippy
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
+      - name: Cache Rust dependencies and target
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-real-audio-e2e-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-real-audio-e2e-
+          key: real-audio-e2e
 
       - name: Build C++ kotoha_mock_client (Release)
         run: |
@@ -210,9 +263,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/kotoha-ci/sherpa-onnx-v2.0.3-linux-x64-static-lib
-          key: sherpa-onnx-${{ env.SHERPA_ONNX_VERSION }}-linux-x64-static-lib-v1
+          key: sherpa-onnx-${{ env.SHERPA_ONNX_VERSION }}-linux-x64-static-lib-f927e695d29b
 
-      - name: Download and extract sherpa-onnx v2.0.3 static libraries
+      - name: Download, verify SHA-256, and extract sherpa-onnx v2.0.3 static libraries
         if: steps.cache-sherpa-lib.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
@@ -221,6 +274,11 @@ jobs:
           tmp_archive="$(mktemp /tmp/sherpa-onnx-lib-XXXXXX.tar.bz2)"
           trap 'rm -f "${tmp_archive}"' EXIT
           curl -fLsS --retry 3 --retry-delay 5 "${archive_url}" -o "${tmp_archive}"
+          if ! echo "${SHERPA_ARCHIVE_SHA256}  ${tmp_archive}" | sha256sum -c -; then
+            echo "::error::SHA-256 checksum mismatch for ${SHERPA_ARCHIVE_NAME}.tar.bz2"
+            rm -f "${tmp_archive}"
+            exit 1
+          fi
           tar -xjf "${tmp_archive}" -C ~/.cache/kotoha-ci
 
       - name: Cache Zipformer English 20M streaming model
@@ -228,9 +286,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/kotoha-ci/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17-mobile
-          key: zipformer-en-20m-2023-02-17-mobile-v1
+          key: zipformer-en-20m-2023-02-17-mobile-753a53625385
 
-      - name: Download and extract Zipformer English 20M streaming model
+      - name: Download, verify SHA-256, and extract Zipformer English 20M streaming model
         if: steps.cache-zipformer-model.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
@@ -239,6 +297,11 @@ jobs:
           tmp_model="$(mktemp /tmp/zipformer-model-XXXXXX.tar.bz2)"
           trap 'rm -f "${tmp_model}"' EXIT
           curl -fLsS --retry 3 --retry-delay 5 "${model_url}" -o "${tmp_model}"
+          if ! echo "${ZIPFORMER_MODEL_SHA256}  ${tmp_model}" | sha256sum -c -; then
+            echo "::error::SHA-256 checksum mismatch for ${ZIPFORMER_MODEL_NAME}.tar.bz2"
+            rm -f "${tmp_model}"
+            exit 1
+          fi
           tar -xjf "${tmp_model}" -C ~/.cache/kotoha-ci
 
       - name: Clippy native sherpa-onnx STT & real-audio E2E crates
@@ -251,4 +314,4 @@ jobs:
         run: |
           export SHERPA_ONNX_LIB_DIR="${HOME}/.cache/kotoha-ci/${SHERPA_ARCHIVE_NAME}/lib"
           export KOTOHA_E2E_MODEL_DIR="${HOME}/.cache/kotoha-ci/${ZIPFORMER_MODEL_NAME}"
-          cargo nextest run -p kotoha-e2e --features real-audio-e2e --test real_audio_pipeline --no-capture
+          cargo nextest run -p kotoha-e2e --features real-audio-e2e --test real_audio_pipeline --profile ci --no-capture

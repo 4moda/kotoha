@@ -1,0 +1,18 @@
+# Shared POSIX endpoint resolution cases (DESIGN.md Section 3.1).
+# Checked by both crates/kotoha-protocol/tests/endpoint_test.rs and
+# plugins/tests/test_ipc_client.cpp so the Rust and C++ resolvers stay identical.
+# Tab-separated columns: KOTOHA_IPC_ENDPOINT, XDG_RUNTIME_DIR, TMPDIR, euid,
+# expected endpoint, expected private dir. '-' means unset (or empty).
+/tmp/kotoha-test-123.sock	/run/user/1000	/var/tmp	1000	/tmp/kotoha-test-123.sock	-
+-	/run/user/1000	/var/tmp	1000	/run/user/1000/kotoha_v1.sock	-
+-	/run/user/1000/	-	1000	/run/user/1000/kotoha_v1.sock	-
+-	///	-	1000	/kotoha_v1.sock	-
+-	-	-	1000	/tmp/kotoha-1000/kotoha_v1.sock	/tmp/kotoha-1000
+-	-	-	0	/tmp/kotoha-0/kotoha_v1.sock	/tmp/kotoha-0
+-	-	/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T/	501	/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T/kotoha-501/kotoha_v1.sock	/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T/kotoha-501
+-	-	/var/tmp	4294967295	/var/tmp/kotoha-4294967295/kotoha_v1.sock	/var/tmp/kotoha-4294967295
+-	-	/	1000	/tmp/kotoha-1000/kotoha_v1.sock	/tmp/kotoha-1000
+-	-	///	1000	/tmp/kotoha-1000/kotoha_v1.sock	/tmp/kotoha-1000
+-	-	relative/tmp	1000	/tmp/kotoha-1000/kotoha_v1.sock	/tmp/kotoha-1000
+-	-	/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/	1000	/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/kotoha-1000/kotoha_v1.sock	/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/kotoha-1000
+-	-	/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb	1000	/tmp/kotoha-1000/kotoha_v1.sock	/tmp/kotoha-1000

@@ -19,7 +19,7 @@ pub const DEFAULT_NUM_THREADS: i32 = 2;
 pub const DEFAULT_MAX_ACTIVE_PATHS: i32 = 4;
 
 /// Default idle duration after which inactive speaker STT streams are reaped (`60` seconds).
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Default endpointing rule 1 trailing silence threshold in seconds.
 pub const DEFAULT_RULE1_MIN_TRAILING_SILENCE: f32 = 2.4;

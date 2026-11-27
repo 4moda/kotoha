@@ -9,7 +9,11 @@ use kotoha_e2e::{
 #[tokio::test]
 async fn single_source_mumble_round_trip() {
     // Arrange
-    let bins = E2eBinaries::discover().expect("discover kotoha_mock_client and kotoha-ipc-monitor");
+    let Some(bins) = E2eBinaries::discover_or_skip_local()
+        .expect("discover kotoha_mock_client and kotoha-ipc-monitor")
+    else {
+        return;
+    };
     let endpoint = UniqueIpcEndpoint::new("s1").expect("create unique IPC endpoint");
     let mut monitor = MonitorSession::start(&bins.ipc_monitor, &endpoint, Some(32))
         .await

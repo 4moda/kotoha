@@ -41,7 +41,7 @@ impl AudioPreprocessor {
         }
 
         let ch = usize::from(channels);
-        if samples.len() % ch != 0 {
+        if !samples.len().is_multiple_of(ch) {
             return Err(CoreError::InvalidAudio(format!(
                 "sample count {} is not divisible by channels {ch}",
                 samples.len()
