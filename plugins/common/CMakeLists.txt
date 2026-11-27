@@ -14,6 +14,7 @@ target_include_directories(
 )
 
 target_compile_features(kotoha_common PUBLIC cxx_std_20)
+set_target_properties(kotoha_common PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_link_libraries(
     kotoha_common

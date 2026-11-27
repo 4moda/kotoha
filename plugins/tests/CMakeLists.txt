@@ -17,3 +17,37 @@ if(WIN32)
     )
 endif()
 add_test(NAME kotoha_test_ipc_client COMMAND test_ipc_client)
+
+add_executable(kotoha_mock_client kotoha_mock_client.cpp)
+target_link_libraries(kotoha_mock_client PRIVATE kotoha::common kotoha_strict_warnings)
+
+if(TARGET kotoha_mumble)
+    add_executable(test_mumble_plugin_abi test_mumble_plugin_abi.cpp)
+    target_include_directories(
+        test_mumble_plugin_abi
+        SYSTEM PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/../mumble/third_party/mumble"
+    )
+    target_compile_definitions(
+        test_mumble_plugin_abi
+        PRIVATE
+            KOTOHA_MUMBLE_PLUGIN_PATH="$<TARGET_FILE:kotoha_mumble>"
+    )
+    if(WIN32)
+        target_compile_definitions(
+            test_mumble_plugin_abi
+            PRIVATE
+                WIN32_LEAN_AND_MEAN
+                NOMINMAX
+        )
+    endif()
+    target_link_libraries(
+        test_mumble_plugin_abi
+        PRIVATE
+            kotoha::common
+            kotoha_strict_warnings
+            $<$<BOOL:${UNIX}>:${CMAKE_DL_LIBS}>
+    )
+    add_dependencies(test_mumble_plugin_abi kotoha_mumble)
+    add_test(NAME kotoha_test_mumble_plugin_abi COMMAND test_mumble_plugin_abi)
+endif()
