@@ -8,6 +8,12 @@ add_test(NAME kotoha_test_ring_buffer COMMAND test_ring_buffer)
 
 add_executable(test_ipc_client test_ipc_client.cpp)
 target_link_libraries(test_ipc_client PRIVATE kotoha::common kotoha_strict_warnings)
+# Shared Rust/C++ endpoint resolution cases (DESIGN.md Section 3.1).
+target_compile_definitions(
+    test_ipc_client
+    PRIVATE
+        KOTOHA_ENDPOINT_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fixtures/endpoint_resolution_cases.tsv"
+)
 if(WIN32)
     target_compile_definitions(
         test_ipc_client

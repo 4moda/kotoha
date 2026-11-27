@@ -95,16 +95,10 @@ async fn ipc_server_rejects_non_hello_first_frame_and_malformed_bytes() {
 }
 
 #[tokio::test]
-async fn ipc_server_handles_shutdown_signal_and_stale_symlink() {
+async fn ipc_server_handles_shutdown_signal() {
+    // Symlinks (dangling or not) at the endpoint are refused instead of removed (issue #23);
+    // see the `endpoint_security` module below.
     let endpoint = test_endpoint("shutdown");
-
-    #[cfg(unix)]
-    {
-        // Create a dangling symlink at the socket path to verify symlink_metadata removes it cleanly
-        let _ = std::fs::remove_file(&endpoint);
-        std::os::unix::fs::symlink("/tmp/kotoha_nonexistent_target", &endpoint)
-            .expect("create dangling symlink");
-    }
 
     let server = IpcServerAdapter::new(endpoint.clone());
     let (event_tx, _event_rx) = mpsc::channel::<AudioInputEvent>(8);
@@ -113,9 +107,7 @@ async fn ipc_server_handles_shutdown_signal_and_stale_symlink() {
 
     let server_task =
         tokio::spawn(async move { server.run(event_tx, shutdown_rx, Some(ready_tx)).await });
-    ready_rx
-        .await
-        .expect("server bound cleanly over dangling symlink");
+    ready_rx.await.expect("server bound");
 
     // Connect client and leave it idle, then trigger shutdown (verifying wait_for terminates
     // handle_connection promptly without hanging)
@@ -452,5 +444,386 @@ mod liveness {
             other => panic!("unexpected event {other:?}"),
         }
         h.stop().await;
+    }
+}
+
+/// Security tests for Unix IPC endpoint handling (issue #23): the server must never delete
+/// anything at the endpoint path except a stale socket it owns, and must refuse insecure
+/// per-user private directories.
+#[cfg(unix)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod endpoint_security {
+    use std::os::unix::fs::{DirBuilderExt as _, FileTypeExt as _, PermissionsExt as _};
+    use std::os::unix::net::UnixListener as StdUnixListener;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    use kotoha_core::domain::{AudioInputEvent, CoreError};
+    use kotoha_core::infrastructure::IpcServerAdapter;
+    use tokio::sync::{mpsc, oneshot, watch};
+
+    /// Uid used for "owned by someone else" checks when the tests run as root.
+    const OTHER_UID: u32 = 65_534;
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// Short, unique scratch directory under `/tmp` (keeps socket paths well below `sun_path` limits).
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = PathBuf::from(format!("/tmp/kt-sec-{}-{tag}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .expect("create scratch dir");
+            Self(dir)
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn running_as_root() -> bool {
+        kotoha_protocol::current_euid() == 0
+    }
+
+    /// A running server; dropping it without `stop` just leaks the task (tests always stop).
+    struct Running {
+        shutdown_tx: watch::Sender<bool>,
+        task: tokio::task::JoinHandle<Result<(), CoreError>>,
+        _event_rx: mpsc::Receiver<AudioInputEvent>,
+    }
+
+    impl Running {
+        async fn stop(self) {
+            let _ = self.shutdown_tx.send(true);
+            let res = tokio::time::timeout(Duration::from_secs(5), self.task)
+                .await
+                .expect("server stops in time")
+                .expect("server task joined");
+            res.expect("server exits cleanly");
+        }
+    }
+
+    /// Starts `server`. Returns `Ok(Running)` once it is ready, or the error `run` failed with.
+    async fn start(server: IpcServerAdapter) -> Result<Running, CoreError> {
+        let (event_tx, event_rx) = mpsc::channel::<AudioInputEvent>(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let mut task =
+            tokio::spawn(async move { server.run(event_tx, shutdown_rx, Some(ready_tx)).await });
+
+        // `run` drops `ready_tx` without sending when binding fails, so a closed channel means the
+        // task has finished (or is about to) with the bind error.
+        if ready_rx.await.is_ok() {
+            return Ok(Running {
+                shutdown_tx,
+                task,
+                _event_rx: event_rx,
+            });
+        }
+        let res = tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .expect("server task finishes after a failed bind")
+            .expect("server task joined");
+        match res {
+            Ok(()) => panic!("server exited before becoming ready without an error"),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn expect_ipc_error(res: Result<Running, CoreError>, needle: &str) -> String {
+        match res {
+            Ok(_) => panic!("server unexpectedly started (expected error containing '{needle}')"),
+            Err(CoreError::Ipc(msg)) => {
+                assert!(
+                    msg.contains(needle),
+                    "error '{msg}' does not contain '{needle}'"
+                );
+                msg
+            }
+            Err(other) => panic!("unexpected error kind: {other:?}"),
+        }
+    }
+
+    fn endpoint_str(path: &Path) -> String {
+        path.to_str().expect("utf-8 path").to_owned()
+    }
+
+    fn is_socket(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket())
+    }
+
+    #[tokio::test]
+    async fn refuses_to_delete_regular_file_at_endpoint() {
+        let scratch = Scratch::new("file");
+        let endpoint = scratch.path("k.sock");
+        std::fs::write(&endpoint, b"important user data").unwrap();
+
+        let res = start(IpcServerAdapter::new(endpoint_str(&endpoint))).await;
+        expect_ipc_error(res, "a regular file");
+
+        assert_eq!(std::fs::read(&endpoint).unwrap(), b"important user data");
+    }
+
+    #[tokio::test]
+    async fn refuses_to_delete_directory_at_endpoint() {
+        let scratch = Scratch::new("dir");
+        let endpoint = scratch.path("k.sock");
+        std::fs::create_dir(&endpoint).unwrap();
+        std::fs::write(endpoint.join("keep"), b"x").unwrap();
+
+        let res = start(IpcServerAdapter::new(endpoint_str(&endpoint))).await;
+        expect_ipc_error(res, "a directory");
+
+        assert!(endpoint.join("keep").exists());
+    }
+
+    #[tokio::test]
+    async fn refuses_to_delete_symlink_at_endpoint() {
+        let scratch = Scratch::new("link");
+        let target = scratch.path("target.txt");
+        std::fs::write(&target, b"target").unwrap();
+        let endpoint = scratch.path("k.sock");
+        std::os::unix::fs::symlink(&target, &endpoint).unwrap();
+
+        let res = start(IpcServerAdapter::new(endpoint_str(&endpoint))).await;
+        expect_ipc_error(res, "a symlink");
+
+        let meta = std::fs::symlink_metadata(&endpoint).unwrap();
+        assert!(meta.file_type().is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"target");
+    }
+
+    #[tokio::test]
+    async fn refuses_to_delete_dangling_symlink_at_endpoint() {
+        let scratch = Scratch::new("dangle");
+        let endpoint = scratch.path("k.sock");
+        std::os::unix::fs::symlink(scratch.path("missing"), &endpoint).unwrap();
+
+        let res = start(IpcServerAdapter::new(endpoint_str(&endpoint))).await;
+        expect_ipc_error(res, "a symlink");
+        assert!(std::fs::symlink_metadata(&endpoint).is_ok());
+    }
+
+    #[tokio::test]
+    async fn reuses_stale_socket_owned_by_current_user() {
+        let scratch = Scratch::new("stale");
+        let endpoint = scratch.path("k.sock");
+        drop(StdUnixListener::bind(&endpoint).unwrap());
+        assert!(is_socket(&endpoint), "stale socket file remains after drop");
+
+        let running = start(IpcServerAdapter::new(endpoint_str(&endpoint)))
+            .await
+            .expect("stale own socket is replaced");
+        assert!(is_socket(&endpoint));
+        let mode = std::fs::metadata(&endpoint).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        running.stop().await;
+
+        assert!(
+            std::fs::symlink_metadata(&endpoint).is_err(),
+            "own socket is removed on shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_live_socket_and_leaves_it_in_place() {
+        let scratch = Scratch::new("live");
+        let endpoint = scratch.path("k.sock");
+        let live = StdUnixListener::bind(&endpoint).unwrap();
+
+        let res = start(IpcServerAdapter::new(endpoint_str(&endpoint))).await;
+        expect_ipc_error(res, "already in use");
+        assert!(is_socket(&endpoint));
+        drop(live);
+    }
+
+    #[tokio::test]
+    async fn refuses_stale_socket_owned_by_another_user() {
+        if !running_as_root() {
+            eprintln!("skipping: changing socket ownership requires root");
+            return;
+        }
+        let scratch = Scratch::new("foreign");
+        let endpoint = scratch.path("k.sock");
+        drop(StdUnixListener::bind(&endpoint).unwrap());
+        std::os::unix::fs::lchown(&endpoint, Some(OTHER_UID), None).unwrap();
+
+        let res = start(IpcServerAdapter::new(endpoint_str(&endpoint))).await;
+        expect_ipc_error(res, "owned by uid 65534");
+        assert!(is_socket(&endpoint));
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_delete_a_path_replaced_after_bind() {
+        let scratch = Scratch::new("swap");
+        let endpoint = scratch.path("k.sock");
+        let running = start(IpcServerAdapter::new(endpoint_str(&endpoint)))
+            .await
+            .expect("server starts");
+
+        std::fs::remove_file(&endpoint).unwrap();
+        std::fs::write(&endpoint, b"replacement").unwrap();
+        running.stop().await;
+
+        assert_eq!(std::fs::read(&endpoint).unwrap(), b"replacement");
+    }
+
+    #[tokio::test]
+    async fn private_dir_is_created_with_mode_0700() {
+        let scratch = Scratch::new("mk");
+        let dir = scratch.path("kotoha-x");
+        let endpoint = dir.join("kotoha_v1.sock");
+
+        let running = start(IpcServerAdapter::new(endpoint_str(&endpoint)).with_private_dir(&dir))
+            .await
+            .expect("server creates private dir");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o700);
+        assert!(is_socket(&endpoint));
+        running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn existing_private_dir_with_0700_is_accepted() {
+        let scratch = Scratch::new("ok");
+        let dir = scratch.path("kotoha-x");
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let endpoint = dir.join("kotoha_v1.sock");
+
+        let running = start(IpcServerAdapter::new(endpoint_str(&endpoint)).with_private_dir(&dir))
+            .await
+            .expect("0700 private dir is accepted");
+        running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn private_dir_with_group_or_other_bits_is_refused() {
+        for mode in [0o750, 0o705, 0o770, 0o777, 0o1777, 0o710] {
+            let scratch = Scratch::new("perm");
+            let dir = scratch.path("kotoha-x");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let endpoint = dir.join("kotoha_v1.sock");
+
+            let res =
+                start(IpcServerAdapter::new(endpoint_str(&endpoint)).with_private_dir(&dir)).await;
+            expect_ipc_error(res, "grant group/other access");
+            assert!(
+                std::fs::symlink_metadata(&endpoint).is_err(),
+                "no socket is created in an insecure dir (mode {mode:o})"
+            );
+            // The server must not "fix" a directory it does not trust.
+            let after = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(after, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn private_dir_that_is_a_symlink_is_refused() {
+        let scratch = Scratch::new("dlink");
+        let real = scratch.path("real");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&real)
+            .unwrap();
+        let dir = scratch.path("kotoha-x");
+        std::os::unix::fs::symlink(&real, &dir).unwrap();
+        let endpoint = dir.join("kotoha_v1.sock");
+
+        let res =
+            start(IpcServerAdapter::new(endpoint_str(&endpoint)).with_private_dir(&dir)).await;
+        expect_ipc_error(res, "not a directory");
+        assert!(std::fs::read_dir(&real).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn private_dir_that_is_a_regular_file_is_refused() {
+        let scratch = Scratch::new("dfile");
+        let dir = scratch.path("kotoha-x");
+        std::fs::write(&dir, b"not a dir").unwrap();
+        let endpoint = dir.join("kotoha_v1.sock");
+
+        let res =
+            start(IpcServerAdapter::new(endpoint_str(&endpoint)).with_private_dir(&dir)).await;
+        expect_ipc_error(res, "not a directory");
+        assert_eq!(std::fs::read(&dir).unwrap(), b"not a dir");
+    }
+
+    #[tokio::test]
+    async fn private_dir_owned_by_another_user_is_refused() {
+        if !running_as_root() {
+            eprintln!("skipping: changing directory ownership requires root");
+            return;
+        }
+        let scratch = Scratch::new("downer");
+        let dir = scratch.path("kotoha-x");
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        std::os::unix::fs::chown(&dir, Some(OTHER_UID), None).unwrap();
+        let endpoint = dir.join("kotoha_v1.sock");
+
+        let res =
+            start(IpcServerAdapter::new(endpoint_str(&endpoint)).with_private_dir(&dir)).await;
+        expect_ipc_error(res, "owned by uid 65534");
+    }
+
+    #[test]
+    fn from_env_derives_private_dir_only_for_fallback_rule() {
+        // Pure check of the adapter wiring without mutating the process environment.
+        let resolved = kotoha_protocol::resolve_endpoint_details();
+        let server = IpcServerAdapter::from_env();
+        assert_eq!(server.endpoint(), resolved.endpoint);
+        assert_eq!(
+            server.private_dir().map(|p| p.to_str().unwrap().to_owned()),
+            resolved.private_dir
+        );
+        assert!(IpcServerAdapter::new("/tmp/x.sock").private_dir().is_none());
+
+        let cfg_server =
+            IpcServerAdapter::from_env_with_config(kotoha_core::infrastructure::IpcServerConfig {
+                max_connections: 3,
+                ..Default::default()
+            });
+        assert_eq!(cfg_server.endpoint(), resolved.endpoint);
+        assert_eq!(
+            cfg_server
+                .private_dir()
+                .map(|p| p.to_str().unwrap().to_owned()),
+            resolved.private_dir
+        );
+    }
+
+    #[tokio::test]
+    async fn private_dir_composes_with_explicit_config() {
+        let scratch = Scratch::new("cfg");
+        let dir = scratch.path("kotoha-x");
+        let endpoint = dir.join("kotoha_v1.sock");
+        let config = kotoha_core::infrastructure::IpcServerConfig {
+            max_connections: 2,
+            ..Default::default()
+        };
+        let server =
+            IpcServerAdapter::with_config(endpoint_str(&endpoint), config).with_private_dir(&dir);
+        assert_eq!(server.private_dir(), Some(dir.as_path()));
+
+        let running = start(server)
+            .await
+            .expect("server starts with config + dir");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o700);
+        assert!(is_socket(&endpoint));
+        running.stop().await;
     }
 }

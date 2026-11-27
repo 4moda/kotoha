@@ -42,6 +42,7 @@ kotoha-stt-sherpa = { path = "crates/kotoha-stt-sherpa" }
 kotoha-translate-http = { path = "crates/kotoha-translate-http" }
 kotoha-translate-local = { path = "crates/kotoha-translate-local" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustix = { version = "1", default-features = false, features = ["std", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

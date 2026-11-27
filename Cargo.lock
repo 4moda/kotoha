@@ -1146,6 +1146,7 @@ dependencies = [
 name = "kotoha-protocol"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "thiserror",
 ]
 

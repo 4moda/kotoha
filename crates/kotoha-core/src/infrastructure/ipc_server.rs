@@ -2,8 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
-#[cfg(unix)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,10 +20,12 @@ use interprocess::os::unix::local_socket::ListenerOptionsExt as _;
 use interprocess::os::windows::{
     local_socket::ListenerOptionsExt as _, security_descriptor::SecurityDescriptor,
 };
+#[cfg(unix)]
+use kotoha_protocol::current_euid;
 #[cfg(windows)]
 use kotoha_protocol::extract_windows_pipe_name;
 use kotoha_protocol::{
-    resolve_endpoint, FrameHeader, Message, ProtocolError, TalkingStateKind,
+    resolve_endpoint_details, FrameHeader, Message, ProtocolError, TalkingStateKind,
     AUDIO_FLAG_IS_LOCAL_USER, FRAME_HEADER_LEN,
 };
 use tokio::io::AsyncReadExt;
@@ -64,9 +65,14 @@ type OwnerRegistry = Arc<Mutex<HashMap<String, (u64, oneshot::Sender<()>)>>>;
 
 /// Cross-platform asynchronous IPC v1 server accepting plugin connections over Unix Domain
 /// Sockets (Linux/macOS, `0600` permissions) or Windows Named Pipes.
+///
+/// On Unix, an existing path at the endpoint is only removed when it is a socket owned by the
+/// effective UID and no live server answers on it; anything else (regular file, directory,
+/// symlink, another user's socket) makes [`IpcServerAdapter::run`] fail without touching it.
 #[derive(Debug, Clone)]
 pub struct IpcServerAdapter {
     endpoint: String,
+    private_dir: Option<PathBuf>,
     next_conn_id: Arc<AtomicU64>,
     config: IpcServerConfig,
     owners: OwnerRegistry,
@@ -84,22 +90,57 @@ impl IpcServerAdapter {
     pub fn with_config(endpoint: impl Into<String>, config: IpcServerConfig) -> Self {
         Self {
             endpoint: endpoint.into(),
+            private_dir: None,
             next_conn_id: Arc::new(AtomicU64::new(1)),
             config,
             owners: Arc::default(),
         }
     }
 
-    /// Creates an [`IpcServerAdapter`] using [`kotoha_protocol::resolve_endpoint`].
+    /// Creates an [`IpcServerAdapter`] using [`kotoha_protocol::resolve_endpoint_details`].
+    ///
+    /// When the endpoint was derived from the per-user private directory fallback
+    /// (`${TMPDIR:-/tmp}/kotoha-<euid>/`), that directory is enforced as described in
+    /// [`IpcServerAdapter::with_private_dir`].
     #[must_use]
     pub fn from_env() -> Self {
-        Self::new(resolve_endpoint())
+        Self::from_env_with_config(IpcServerConfig::default())
+    }
+
+    /// Like [`IpcServerAdapter::from_env`], but with explicit liveness limits.
+    #[must_use]
+    pub fn from_env_with_config(config: IpcServerConfig) -> Self {
+        let resolved = resolve_endpoint_details();
+        let server = Self::with_config(resolved.endpoint, config);
+        match resolved.private_dir {
+            Some(dir) => server.with_private_dir(dir),
+            None => server,
+        }
+    }
+
+    /// Marks `dir` as the per-user private directory that must contain the endpoint (Unix only;
+    /// ignored on Windows). Composes with [`IpcServerAdapter::with_config`], e.g.
+    /// `IpcServerAdapter::with_config(endpoint, config).with_private_dir(dir)`.
+    ///
+    /// Before binding, the server creates `dir` with mode `0700` if it is missing (its parent
+    /// must exist) and refuses to start unless `dir` is a real directory (not a symlink) owned
+    /// by the effective UID with no group/other permission bits.
+    #[must_use]
+    pub fn with_private_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.private_dir = Some(dir.into());
+        self
     }
 
     /// Returns the configured IPC endpoint string.
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Returns the enforced per-user private directory, if any.
+    #[must_use]
+    pub fn private_dir(&self) -> Option<&Path> {
+        self.private_dir.as_deref()
     }
 
     /// Binds the IPC listener and serves incoming client connections until `shutdown_rx` signals
@@ -114,7 +155,8 @@ impl IpcServerAdapter {
         ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<(), CoreError> {
         #[cfg(unix)]
-        let listener = bind_unix_listener(&self.endpoint).await?;
+        let (listener, bound_identity) =
+            bind_unix_listener(&self.endpoint, self.private_dir.as_deref()).await?;
         #[cfg(windows)]
         let listener = bind_windows_listener(&self.endpoint)?;
 
@@ -177,7 +219,7 @@ impl IpcServerAdapter {
 
         drop(listener);
         #[cfg(unix)]
-        cleanup_unix_socket_on_shutdown(&self.endpoint);
+        cleanup_unix_socket_on_shutdown(&self.endpoint, bound_identity);
 
         if accept_err.is_some() {
             client_tasks.abort_all();
@@ -188,59 +230,172 @@ impl IpcServerAdapter {
     }
 }
 
+/// Identity (device + inode) of the socket file this server bound, used so that shutdown cleanup
+/// never removes a path that was replaced after bind.
 #[cfg(unix)]
-async fn bind_unix_listener(
-    endpoint: &str,
-) -> Result<interprocess::local_socket::tokio::Listener, CoreError> {
-    let path = Path::new(endpoint);
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                CoreError::Ipc(format!(
-                    "failed to create parent directory '{}' for socket: {e}",
-                    parent.display()
-                ))
-            })?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SocketIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+impl SocketIdentity {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+}
+
+/// Creates (mode `0700`) and validates the per-user private directory that holds the endpoint.
+#[cfg(unix)]
+fn ensure_private_dir(dir: &Path) -> Result<(), CoreError> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(CoreError::Ipc(format!(
+                "failed to create private IPC directory '{}': {err}",
+                dir.display()
+            )));
         }
     }
 
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => {
-            // Probe whether another live server is already listening before removing a stale socket
-            // or dangling symlink.
-            let probe_name = path.to_fs_name::<GenericFilePath>().map_err(|e| {
-                CoreError::Ipc(format!("invalid Unix socket path '{endpoint}': {e}"))
-            })?;
-            match LocalSocketStream::connect(probe_name).await {
-                Ok(_active_stream) => {
-                    return Err(CoreError::Ipc(format!(
-                        "IPC endpoint '{endpoint}' is already in use by an active server"
-                    )));
-                }
-                Err(_) => {
-                    if let Err(err) = std::fs::remove_file(path) {
-                        if err.kind() != ErrorKind::NotFound {
-                            return Err(CoreError::Ipc(format!(
-                                "failed to remove stale socket file '{endpoint}': {err}"
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| {
+        CoreError::Ipc(format!(
+            "failed to inspect private IPC directory '{}': {e}",
+            dir.display()
+        ))
+    })?;
+    if !meta.file_type().is_dir() {
+        return Err(CoreError::Ipc(format!(
+            "refusing to use private IPC directory '{}': it is not a directory (symlinks are not \
+             allowed)",
+            dir.display()
+        )));
+    }
+    let euid = current_euid();
+    if meta.uid() != euid {
+        return Err(CoreError::Ipc(format!(
+            "refusing to use private IPC directory '{}': owned by uid {} instead of uid {euid}",
+            dir.display(),
+            meta.uid()
+        )));
+    }
+    let mode = meta.mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        return Err(CoreError::Ipc(format!(
+            "refusing to use private IPC directory '{}': permissions {mode:04o} grant group/other \
+             access (expected 0700)",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Inspects an existing path at the endpoint and removes it only if it is a stale socket owned by
+/// the effective UID. Returns an error (without deleting anything) in every other case.
+#[cfg(unix)]
+async fn remove_stale_unix_socket(path: &Path, endpoint: &str) -> Result<(), CoreError> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
         Err(err) => {
             return Err(CoreError::Ipc(format!(
                 "failed to inspect Unix socket path '{endpoint}': {err}"
             )));
         }
+    };
+
+    let file_type = meta.file_type();
+    if !file_type.is_socket() {
+        let kind = if file_type.is_symlink() {
+            "a symlink"
+        } else if file_type.is_dir() {
+            "a directory"
+        } else if file_type.is_file() {
+            "a regular file"
+        } else {
+            "not a socket"
+        };
+        return Err(CoreError::Ipc(format!(
+            "refusing to replace IPC endpoint '{endpoint}': existing path is {kind}, not a socket; \
+             remove it manually or choose another endpoint"
+        )));
     }
+
+    let euid = current_euid();
+    if meta.uid() != euid {
+        return Err(CoreError::Ipc(format!(
+            "refusing to replace IPC endpoint '{endpoint}': existing socket is owned by uid {} \
+             (current uid {euid})",
+            meta.uid()
+        )));
+    }
+
+    // Probe whether another live server of ours is already listening before removing.
+    let probe_name = path
+        .to_fs_name::<GenericFilePath>()
+        .map_err(|e| CoreError::Ipc(format!("invalid Unix socket path '{endpoint}': {e}")))?;
+    if LocalSocketStream::connect(probe_name).await.is_ok() {
+        return Err(CoreError::Ipc(format!(
+            "IPC endpoint '{endpoint}' is already in use by an active server"
+        )));
+    }
+
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(CoreError::Ipc(format!(
+            "failed to remove stale socket file '{endpoint}': {err}"
+        ))),
+    }
+}
+
+#[cfg(unix)]
+async fn bind_unix_listener(
+    endpoint: &str,
+    private_dir: Option<&Path>,
+) -> Result<(interprocess::local_socket::tokio::Listener, SocketIdentity), CoreError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let path = Path::new(endpoint);
+    if let Some(dir) = private_dir {
+        ensure_private_dir(dir)?;
+    } else if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(|e| {
+                    CoreError::Ipc(format!(
+                        "failed to create parent directory '{}' for socket: {e}",
+                        parent.display()
+                    ))
+                })?;
+        }
+    }
+
+    remove_stale_unix_socket(path, endpoint).await?;
 
     let name = path
         .to_fs_name::<GenericFilePath>()
         .map_err(|e| CoreError::Ipc(format!("invalid Unix socket path '{endpoint}': {e}")))?;
 
-    let options = ListenerOptions::new().name(name);
+    // Disable `interprocess` name reclamation: its drop guard unlinks the path unconditionally.
+    // Cleanup is done by `cleanup_unix_socket_on_shutdown`, which verifies the file first.
+    let options = ListenerOptions::new()
+        .name(name)
+        .reclaim_name(false)
+        .try_overwrite(false);
     #[cfg(target_os = "linux")]
     let options = options.mode(0o600);
 
@@ -248,13 +403,23 @@ async fn bind_unix_listener(
         .create_tokio()
         .map_err(|e| CoreError::Ipc(format!("failed to bind Unix socket '{endpoint}': {e}")))?;
 
+    let identity = match std::fs::symlink_metadata(path) {
+        Ok(meta) => SocketIdentity::of(&meta),
+        Err(err) => {
+            drop(listener);
+            return Err(CoreError::Ipc(format!(
+                "failed to inspect bound Unix socket '{endpoint}': {err}"
+            )));
+        }
+    };
+
     // Enforce 0600 permissions explicitly after bind across Linux and macOS; unlink on failure.
     if let Err(err) = apply_unix_socket_permissions(path) {
         drop(listener);
-        let _ = std::fs::remove_file(path);
+        cleanup_unix_socket_on_shutdown(endpoint, identity);
         return Err(err);
     }
-    Ok(listener)
+    Ok((listener, identity))
 }
 
 #[cfg(unix)]
@@ -278,6 +443,8 @@ fn bind_windows_listener(
         .to_ns_name::<GenericNamespaced>()
         .map_err(|e| CoreError::Ipc(format!("invalid Windows pipe name '{pipe_name}': {e}")))?;
 
+    // Squatting protection: `interprocess` creates the first pipe instance with
+    // `FILE_FLAG_FIRST_PIPE_INSTANCE`, so binding fails if another process already owns the name.
     // Restrict Named Pipe DACL to Local System (SY), Built-in Administrators (BA), and the
     // current user SID (OW/CO) so unprivileged local users and network clients cannot connect.
     let sd = SecurityDescriptor::deserialize(u16cstr!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)"))
@@ -294,10 +461,20 @@ fn bind_windows_listener(
         .map_err(|e| CoreError::Ipc(format!("failed to bind Named Pipe '{endpoint}': {e}")))
 }
 
+/// Removes the socket file on shutdown, but only if the path still refers to the very socket this
+/// server bound (same device/inode, still a socket, still owned by the effective UID). A path
+/// that has since been replaced by anything else is left untouched.
 #[cfg(unix)]
-fn cleanup_unix_socket_on_shutdown(endpoint: &str) {
+fn cleanup_unix_socket_on_shutdown(endpoint: &str, bound: SocketIdentity) {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
     let path = Path::new(endpoint);
-    if std::fs::symlink_metadata(path).is_ok() {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    let unchanged = meta.file_type().is_socket()
+        && meta.uid() == current_euid()
+        && SocketIdentity::of(&meta) == bound;
+    if unchanged {
         let _ = std::fs::remove_file(path);
     }
 }
