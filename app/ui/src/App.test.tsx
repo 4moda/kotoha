@@ -268,4 +268,103 @@ describe('App', () => {
       );
     });
   });
+  it('flushes the debounced provider sync before storing a secret and never renders the value', async () => {
+    const bridge = createMockBridge({ wizard_completed: true });
+    const order: string[] = [];
+    const originalSwitch = bridge.switchTranslationProvider.bind(bridge);
+    const originalSet = bridge.setProviderSecret.bind(bridge);
+    const switchSpy = vi.spyOn(bridge, 'switchTranslationProvider');
+    switchSpy.mockImplementation((...args) => {
+      order.push('switch');
+      return originalSwitch(...args);
+    });
+    const setSpy = vi.spyOn(bridge, 'setProviderSecret');
+    setSpy.mockImplementation((kind, value) => {
+      order.push('set');
+      return originalSet(kind, value);
+    });
+
+    render(<App bridge={bridge} />);
+    await waitFor(() => {
+      expect(screen.getByTestId('ipc-status-pill')).toHaveTextContent('IPC connected');
+    });
+    fireEvent.click(screen.getByTestId('mode-settings-btn'));
+    fireEvent.click(screen.getByTestId('provider-tab-openai_compatible'));
+    await waitFor(() => expect(order).toEqual(['switch']));
+    order.length = 0;
+
+    // A pending (debounced) base_url edit must be saved before the key is stored.
+    fireEvent.change(document.getElementById('openai-base-url') as HTMLInputElement, {
+      target: { value: 'https://api.example.com/v1' },
+    });
+    expect(order).toEqual([]);
+
+    expect(screen.getByTestId('secret-badge-open_ai_api_key')).toHaveTextContent('未設定');
+    fireEvent.change(document.getElementById('openai-api-key') as HTMLInputElement, {
+      target: { value: 'sk-ui-secret-value' },
+    });
+    fireEvent.click(screen.getByTestId('secret-set-open_ai_api_key'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('secret-badge-open_ai_api_key')).toHaveTextContent('設定済み');
+    });
+    expect(order).toEqual(['switch', 'set']);
+    expect(switchSpy).toHaveBeenLastCalledWith(
+      expect.objectContaining({ base_url: 'https://api.example.com/v1' }),
+      'en',
+      'ja',
+    );
+    expect(setSpy).toHaveBeenCalledWith('open_ai_api_key', 'sk-ui-secret-value');
+    expect((document.getElementById('openai-api-key') as HTMLInputElement).value).toBe('');
+    expect(document.body.innerHTML).not.toContain('sk-ui-secret-value');
+  });
+
+  it('reflects secrets cleared by a provider switch in the badge', async () => {
+    const bridge = createMockBridge({ wizard_completed: true });
+    render(<App bridge={bridge} />);
+    await waitFor(() => {
+      expect(screen.getByTestId('ipc-status-pill')).toHaveTextContent('IPC connected');
+    });
+    fireEvent.click(screen.getByTestId('mode-settings-btn'));
+    fireEvent.click(screen.getByTestId('provider-tab-openai_compatible'));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    fireEvent.change(document.getElementById('openai-api-key') as HTMLInputElement, {
+      target: { value: 'k' },
+    });
+    fireEvent.click(screen.getByTestId('secret-set-open_ai_api_key'));
+    await waitFor(() => {
+      expect(screen.getByTestId('secret-badge-open_ai_api_key')).toHaveTextContent('設定済み');
+    });
+
+    fireEvent.click(screen.getByTestId('provider-tab-deepl'));
+    fireEvent.click(screen.getByTestId('provider-tab-openai_compatible'));
+    await waitFor(() => {
+      expect(screen.getByTestId('secret-badge-open_ai_api_key')).toHaveTextContent('未設定');
+    });
+  });
+
+  it('reports a rejected secret write in the error banner', async () => {
+    const bridge = createMockBridge({ wizard_completed: true });
+    vi.spyOn(bridge, 'setProviderSecret').mockRejectedValue(new Error('store unavailable'));
+    render(<App bridge={bridge} />);
+    await waitFor(() => {
+      expect(screen.getByTestId('ipc-status-pill')).toHaveTextContent('IPC connected');
+    });
+    fireEvent.click(screen.getByTestId('mode-settings-btn'));
+    fireEvent.click(screen.getByTestId('provider-tab-deepl'));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    fireEvent.change(document.getElementById('deepl-api-key') as HTMLInputElement, {
+      target: { value: 'k' },
+    });
+    fireEvent.click(screen.getByTestId('secret-set-deep_l_api_key'));
+    await waitFor(() => {
+      expect(screen.getByTestId('app-error-banner')).toHaveTextContent('store unavailable');
+    });
+    expect(screen.getByTestId('secret-badge-deep_l_api_key')).toHaveTextContent('未設定');
+  });
 });

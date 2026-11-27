@@ -10,6 +10,7 @@ import {
 import {
   DEFAULT_GLOSSARY_PROFILES,
   DEFAULT_OVERLAY_OPTIONS,
+  EMPTY_SECRET_STATUS,
   INITIAL_SUBTITLES,
   getKotohaBridge,
   isTauriRuntime,
@@ -21,6 +22,8 @@ import type {
   GlossarySettingsState,
   HostOsPlatform,
   OverlayDisplayOptions,
+  ProviderSecretKind,
+  SecretStatus,
   SubtitleEntry,
   TranslationProviderConfig,
 } from './types/kotoha';
@@ -100,6 +103,7 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
   const [provider, setProvider] = useState<TranslationProviderConfig>(() =>
     createDefaultProviderConfig('local_model'),
   );
+  const [secrets, setSecrets] = useState<SecretStatus>(() => ({ ...EMPTY_SECRET_STATUS }));
   const [overlayOptions, setOverlayOptions] = useState<OverlayDisplayOptions>(
     DEFAULT_OVERLAY_OPTIONS,
   );
@@ -139,6 +143,12 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
   const overlayStyleDebounceTimerRef = useRef<number | null>(null);
   const glossaryDebounceTimerRef = useRef<number | null>(null);
   const latestProviderRequestRef = useRef(0);
+  const pendingProviderSyncRef = useRef<{
+    config: TranslationProviderConfig;
+    src: string;
+    tgt: string;
+  } | null>(null);
+  const inflightProviderCommitRef = useRef<Promise<void>>(Promise.resolve());
   const latestOverlayStyleRequestRef = useRef(0);
   const latestGlossaryRequestRef = useRef(0);
 
@@ -187,6 +197,7 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
         setSrcLang(state.src_lang);
         setTgtLang(state.tgt_lang);
         setProvider(state.provider);
+        setSecrets(state.secrets);
         setOverlayOptions(state.overlay_options);
         setGlossarySettings(state.glossary);
         setConnection(state.connection);
@@ -279,10 +290,12 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
   const commitTranslationProvider = useCallback(
     (nextConfig: TranslationProviderConfig, nextSrc: string, nextTgt: string) => {
       const requestId = ++latestProviderRequestRef.current;
-      void bridge
+      const request = bridge
         .switchTranslationProvider(nextConfig, nextSrc, nextTgt)
-        .then(() => {
+        .then((state) => {
           if (isMountedRef.current && latestProviderRequestRef.current === requestId) {
+            // Switching provider / origin may have deleted stored secrets on the Rust side.
+            setSecrets(state.secrets);
             setStatusError(null);
           }
         })
@@ -291,6 +304,7 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
             reportIpcError(error, '翻訳エンジン設定の保存に失敗しました。');
           }
         });
+      inflightProviderCommitRef.current = request;
     },
     [bridge, reportIpcError],
   );
@@ -307,15 +321,67 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
         providerDebounceTimerRef.current = null;
       }
       if (immediate) {
+        pendingProviderSyncRef.current = null;
         commitTranslationProvider(nextConfig, nextSrc, nextTgt);
         return;
       }
+      pendingProviderSyncRef.current = { config: nextConfig, src: nextSrc, tgt: nextTgt };
       providerDebounceTimerRef.current = window.setTimeout(() => {
         providerDebounceTimerRef.current = null;
+        pendingProviderSyncRef.current = null;
         commitTranslationProvider(nextConfig, nextSrc, nextTgt);
       }, SETTINGS_DEBOUNCE_MS);
     },
     [commitTranslationProvider],
+  );
+
+  /** Saves any debounced provider edit now and waits for in-flight saves to finish. */
+  const flushProviderSync = useCallback(async () => {
+    if (providerDebounceTimerRef.current !== null) {
+      window.clearTimeout(providerDebounceTimerRef.current);
+      providerDebounceTimerRef.current = null;
+    }
+    const pending = pendingProviderSyncRef.current;
+    pendingProviderSyncRef.current = null;
+    if (pending) {
+      commitTranslationProvider(pending.config, pending.src, pending.tgt);
+    }
+    await inflightProviderCommitRef.current;
+  }, [commitTranslationProvider]);
+
+  const handleSetSecret = useCallback(
+    async (kind: ProviderSecretKind, value: string) => {
+      try {
+        // Save the provider (and base_url) first so the key is not invalidated by a later sync.
+        await flushProviderSync();
+        const status = await bridge.setProviderSecret(kind, value);
+        if (isMountedRef.current) {
+          setSecrets(status);
+          setStatusError(null);
+        }
+      } catch (error) {
+        reportIpcError(error, 'シークレットの保存に失敗しました。');
+        throw error;
+      }
+    },
+    [bridge, flushProviderSync, reportIpcError],
+  );
+
+  const handleClearSecret = useCallback(
+    async (kind: ProviderSecretKind) => {
+      try {
+        await flushProviderSync();
+        const status = await bridge.clearProviderSecret(kind);
+        if (isMountedRef.current) {
+          setSecrets(status);
+          setStatusError(null);
+        }
+      } catch (error) {
+        reportIpcError(error, 'シークレットの削除に失敗しました。');
+        throw error;
+      }
+    },
+    [bridge, flushProviderSync, reportIpcError],
   );
 
   const commitOverlayStyle = useCallback(
@@ -732,10 +798,13 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
             srcLang={srcLang}
             tgtLang={tgtLang}
             provider={provider}
+            secrets={secrets}
             overlayOptions={overlayOptions}
             glossarySettings={glossarySettings}
             onChangeLanguages={handleUpdateLanguages}
             onChangeProvider={handleUpdateProvider}
+            onSetSecret={handleSetSecret}
+            onClearSecret={handleClearSecret}
             onChangeOverlayOptions={handleUpdateOverlayOptions}
             onChangeGlossarySettings={handleUpdateGlossarySettings}
           />

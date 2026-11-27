@@ -530,6 +530,48 @@ body {
   color: var(--text-secondary);
 }
 
+.secret-field-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.secret-field-row input {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+.secret-field-button {
+  padding: 8px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.secret-field-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.secret-badge {
+  font-size: 0.74rem;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary);
+}
+
+.secret-badge.is-configured {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
 .provider-description {
   margin: 0;
   font-size: 0.86rem;

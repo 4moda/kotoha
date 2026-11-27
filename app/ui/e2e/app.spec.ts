@@ -94,6 +94,17 @@ test.describe('Kotoha UI E2E', () => {
     await page.getByTestId('provider-tab-deepl').click();
     await expect(page.getByTestId('config-deepl')).toBeVisible();
 
+    // Secrets are write-only: the badge reflects status and the value is never rendered back.
+    const secretValue = 'e2e-secret-deepl-key';
+    await expect(page.getByTestId('secret-badge-deep_l_api_key')).toHaveText('未設定');
+    await page.locator('#deepl-api-key').fill(secretValue);
+    await page.getByTestId('secret-set-deep_l_api_key').click();
+    await expect(page.getByTestId('secret-badge-deep_l_api_key')).toHaveText('設定済み');
+    await expect(page.locator('#deepl-api-key')).toHaveValue('');
+    expect(await page.content()).not.toContain(secretValue);
+    await page.getByTestId('secret-clear-deep_l_api_key').click();
+    await expect(page.getByTestId('secret-badge-deep_l_api_key')).toHaveText('未設定');
+
     await page.getByTestId('provider-tab-google_cloud').click();
     await expect(page.getByTestId('config-google-cloud')).toBeVisible();
 

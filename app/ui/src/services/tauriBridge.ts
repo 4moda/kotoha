@@ -11,6 +11,8 @@ import type {
   GlossarySettingsState,
   OverlayDisplayOptions,
   PluginInstallResult,
+  ProviderSecretKind,
+  SecretStatus,
   SubtitleEntry,
   TranslationProviderConfig,
 } from '../types/kotoha';
@@ -99,6 +101,53 @@ export interface OverlayStyleUpdateInput {
   background_opacity?: number;
 }
 
+export const EMPTY_SECRET_STATUS: SecretStatus = {
+  openai_api_key: false,
+  deepl_api_key: false,
+  google_cloud_api_key: false,
+  gas_endpoint_url: false,
+  gas_bearer_token: false,
+};
+
+/** Maps the serde wire name of a secret kind to its `SecretStatus` field. */
+export const SECRET_STATUS_FIELD: Record<ProviderSecretKind, keyof SecretStatus> = {
+  open_ai_api_key: 'openai_api_key',
+  deep_l_api_key: 'deepl_api_key',
+  google_cloud_api_key: 'google_cloud_api_key',
+  gas_endpoint_url: 'gas_endpoint_url',
+  gas_bearer_token: 'gas_bearer_token',
+};
+
+function secretKindAppliesTo(
+  kind: ProviderSecretKind,
+  provider: TranslationProviderConfig,
+): boolean {
+  switch (kind) {
+    case 'open_ai_api_key':
+      return provider.type === 'openai_compatible';
+    case 'deep_l_api_key':
+      return provider.type === 'deepl';
+    case 'google_cloud_api_key':
+      return provider.type === 'google_cloud';
+    case 'gas_endpoint_url':
+    case 'gas_bearer_token':
+      return provider.type === 'gas_webhook';
+  }
+}
+
+/** Lower-cased `scheme://host[:port]`, mirroring Rust `url_origin`. */
+function urlOrigin(url: string): string {
+  const trimmed = url.trim().toLowerCase();
+  const sep = trimmed.indexOf('://');
+  if (sep < 0) {
+    return trimmed;
+  }
+  const scheme = trimmed.slice(0, sep);
+  const authority = trimmed.slice(sep + 3).split(/[/?#]/)[0] ?? '';
+  const hostPort = authority.slice(authority.lastIndexOf('@') + 1);
+  return `${scheme}://${hostPort}`;
+}
+
 export interface KotohaEventHandlers {
   onSubtitle?: (entry: SubtitleEntry) => void;
   onConnectionStatus?: (status: ConnectionStatus) => void;
@@ -119,6 +168,9 @@ export interface KotohaBridge {
     srcLang?: string,
     tgtLang?: string,
   ): Promise<AppRuntimeState>;
+  /** Write-only: the value is never returned, only the resulting booleans. */
+  setProviderSecret(kind: ProviderSecretKind, value: string): Promise<SecretStatus>;
+  clearProviderSecret(kind: ProviderSecretKind): Promise<SecretStatus>;
   updateGlossarySettings(input: GlossaryUpdateInput): Promise<GlossarySettingsState>;
   updateOverlayStyle(style: OverlayStyleUpdateInput): Promise<OverlayDisplayOptions>;
   completeFirstRunWizard(): Promise<AppRuntimeState>;
@@ -141,6 +193,7 @@ function createInitialMockState(): AppRuntimeState {
     src_lang: 'en',
     tgt_lang: 'ja',
     provider: createDefaultProviderConfig('local_model'),
+    secrets: { ...EMPTY_SECRET_STATUS },
     overlay_options: { ...DEFAULT_OVERLAY_OPTIONS },
     overlay_visible: true,
     glossary: {
@@ -354,13 +407,50 @@ export function createMockBridge(
       srcLang?: string,
       tgtLang?: string,
     ): Promise<AppRuntimeState> {
+      // Mirrors Rust: a key is bound to the origin it was entered for, and replacing the GAS
+      // endpoint drops its bearer token.
+      const secrets = { ...state.secrets };
+      if (
+        config.type === 'openai_compatible' &&
+        !(
+          state.provider.type === 'openai_compatible' &&
+          urlOrigin(state.provider.base_url) === urlOrigin(config.base_url)
+        )
+      ) {
+        secrets.openai_api_key = false;
+      }
       state = {
         ...state,
         provider: cloneState(config),
+        secrets,
         src_lang: srcLang ?? state.src_lang,
         tgt_lang: tgtLang ?? state.tgt_lang,
       };
       return cloneState(state);
+    },
+
+    async setProviderSecret(kind: ProviderSecretKind, value: string): Promise<SecretStatus> {
+      if (value.trim() === '') {
+        throw new Error('secret value must not be empty (use clear to remove it)');
+      }
+      if (!secretKindAppliesTo(kind, state.provider)) {
+        throw new Error('this secret does not belong to the active translation provider');
+      }
+      const secrets = { ...state.secrets, [SECRET_STATUS_FIELD[kind]]: true };
+      if (kind === 'gas_endpoint_url') {
+        secrets.gas_bearer_token = false;
+      }
+      state = { ...state, secrets };
+      return { ...state.secrets };
+    },
+
+    async clearProviderSecret(kind: ProviderSecretKind): Promise<SecretStatus> {
+      const secrets = { ...state.secrets, [SECRET_STATUS_FIELD[kind]]: false };
+      if (kind === 'gas_endpoint_url') {
+        secrets.gas_bearer_token = false;
+      }
+      state = { ...state, secrets };
+      return { ...state.secrets };
     },
 
     async updateGlossarySettings(input: GlossaryUpdateInput): Promise<GlossarySettingsState> {
@@ -511,6 +601,14 @@ export function createTauriBridge(): KotohaBridge {
         srcLang: srcLang ?? null,
         tgtLang: tgtLang ?? null,
       });
+    },
+
+    setProviderSecret(kind: ProviderSecretKind, value: string) {
+      return invokeCommand<SecretStatus>('set_provider_secret', { kind, value });
+    },
+
+    clearProviderSecret(kind: ProviderSecretKind) {
+      return invokeCommand<SecretStatus>('clear_provider_secret', { kind });
     },
 
     updateGlossarySettings(input: GlossaryUpdateInput) {
