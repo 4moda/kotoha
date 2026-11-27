@@ -766,7 +766,7 @@ async fn pipeline_drops_chunk_when_resample_fails() {
         )),
         sink.clone(),
         Arc::new(|chunk: &AudioChunk| {
-            if chunk.seq % 2 == 0 {
+            if chunk.seq.is_multiple_of(2) {
                 Err(CoreError::InvalidAudio("simulated bad chunk".to_owned()))
             } else {
                 AudioPreprocessor::process_chunk(chunk)
