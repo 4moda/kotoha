@@ -1150,6 +1150,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kotoha-setup"
+version = "0.1.0"
+dependencies = [
+ "kotoha-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "kotoha-stt-sherpa"
 version = "0.1.0"
 dependencies = [

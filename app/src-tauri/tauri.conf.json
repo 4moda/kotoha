@@ -1,0 +1,51 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Kotoha",
+  "version": "0.1.0",
+  "identifier": "io.github.4moda.kotoha",
+  "build": {
+    "frontendDist": "../ui/dist",
+    "devUrl": "http://localhost:4173"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "overlay",
+        "title": "Kotoha Overlay",
+        "url": "index.html?window=overlay",
+        "width": 760,
+        "height": 220,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "resizable": true,
+        "visible": true
+      },
+      {
+        "label": "settings",
+        "title": "Kotoha — 設定 & セットアップ",
+        "url": "index.html?window=settings",
+        "width": 960,
+        "height": 720,
+        "resizable": true,
+        "visible": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ]
+  }
+}

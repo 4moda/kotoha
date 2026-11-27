@@ -100,6 +100,7 @@ export type ConnectionState = 'connected' | 'reconnecting' | 'disconnected';
 export interface ConnectionStatus {
   state: ConnectionState;
   source: string;
+  plugin_version: string | null;
   endpoint: string;
   active_speakers: number;
   dropped_frames: number;
@@ -112,4 +113,71 @@ export interface OverlayDisplayOptions {
   locked: boolean;
   font_size_px: number;
   background_opacity: number;
+}
+
+export interface GlossaryProfileSummary {
+  id: string;
+  name: string;
+  src_lang: string;
+  tgt_lang: string;
+  term_count: number;
+  enabled: boolean;
+  file_path?: string;
+}
+
+export interface GlossarySettingsState {
+  profiles: GlossaryProfileSummary[];
+  enabled_profiles: string[];
+  hotwords_score: number;
+  glossary_dir: string | null;
+}
+
+export type PluginInstallStatus =
+  | 'installed'
+  | 'already_up_to_date'
+  | 'locked_by_running_app'
+  | 'not_found'
+  | 'error';
+
+export type HostOsPlatform = 'windows' | 'macos' | 'linux';
+
+export interface PluginInstallResult {
+  status: PluginInstallStatus;
+  platform: HostOsPlatform;
+  target_path: string;
+  detected_paths: string[];
+  is_flatpak: boolean;
+  flatpak_hint?: string;
+  message: string;
+}
+
+export type ModelDownloadStatus =
+  | 'idle'
+  | 'downloading'
+  | 'verifying_sha256'
+  | 'verified'
+  | 'failed';
+
+export interface DownloadProgressEvent {
+  model_id: string;
+  bytes_downloaded: number;
+  total_bytes: number;
+  status: ModelDownloadStatus;
+  sha256_verified: boolean;
+  error_message?: string;
+}
+
+export interface AppRuntimeState {
+  src_lang: string;
+  tgt_lang: string;
+  provider: TranslationProviderConfig;
+  overlay_options: OverlayDisplayOptions;
+  overlay_visible: boolean;
+  glossary: GlossarySettingsState;
+  connection: ConnectionStatus;
+  subtitles: SubtitleEntry[];
+  wizard_completed: boolean;
+  platform: HostOsPlatform;
+  detected_mumble_paths: string[];
+  is_flatpak_mumble: boolean;
 }

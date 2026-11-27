@@ -87,9 +87,33 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
+            app/src-tauri/target/
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-release-
+
+      - name: Install Linux Tauri system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/ui/package-lock.json
+
+      - name: Build UI bundle for Tauri frontendDist
+        working-directory: app/ui
+        run: |
+          npm ci
+          npm run build
 
       - name: Configure C++ plugins (CMake Release)
         run: cmake -S plugins -B plugins/build -DCMAKE_BUILD_TYPE=Release -DKOTOHA_WARNINGS_AS_ERRORS=ON
@@ -106,14 +130,24 @@ jobs:
       - name: Run Rust workspace unit & Cross-Language IPC E2E gate (nextest)
         run: cargo nextest run --workspace
 
-      # Phase 3 hook:
-      # Once app/src-tauri is introduced:
-      # 1. Copy the built kotoha_mumble shared library into app/src-tauri/resources/ (or embed via include_bytes!).
-      # 2. Setup Node.js 22 and run `npm ci && npm run build` inside app/ui.
-      # 3. Run `tauri-apps/tauri-action@v0` to produce .msi / .dmg / .AppImage / .deb bundles
-      #    (with optional Windows/macOS code signing & latest.json generation in Phase 4).
+      - name: Install Tauri CLI
+        run: npm --prefix app/ui exec --yes -- @tauri-apps/cli@2 --version
 
-      - name: Package release archive and SHA-256 checksum
+      - name: Build Tauri v2 desktop bundle (with embedded Mumble plugin)
+        shell: bash
+        env:
+          PLUGIN_RELPATH: ${{ matrix.plugin_relpath }}
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "true"
+        run: |
+          set -euo pipefail
+          export KOTOHA_MUMBLE_PLUGIN_PATH="${GITHUB_WORKSPACE}/${PLUGIN_RELPATH}"
+          echo "Embedding Mumble plugin from ${KOTOHA_MUMBLE_PLUGIN_PATH}"
+          test -f "${KOTOHA_MUMBLE_PLUGIN_PATH}"
+          cd app/src-tauri
+          npx --yes @tauri-apps/cli@2 build
+
+      - name: Package release archive, Tauri bundles, and SHA-256 checksums
         shell: python
         env:
           RELEASE_TAG: ${{ steps.meta.outputs.tag }}
@@ -167,10 +201,26 @@ jobs:
           else:
               raise ValueError(f"Unsupported archive extension: {archive_ext}")
 
-          digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+          packaged_files = [archive_path]
+          bundle_root = Path("app/src-tauri/target/release/bundle")
+          bundle_exts = (".deb", ".AppImage", ".rpm", ".dmg", ".msi", ".exe")
+          if bundle_root.is_dir():
+              for candidate in sorted(bundle_root.rglob("*")):
+                  if candidate.is_file() and candidate.name.endswith(bundle_exts):
+                      dest = dist_dir / candidate.name
+                      if dest.exists():
+                          dest = dist_dir / f"{candidate.stem}-{target}{candidate.suffix}"
+                      shutil.copy2(candidate, dest)
+                      packaged_files.append(dest)
+
+          checksum_lines = []
+          for artifact in packaged_files:
+              digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+              checksum_lines.append(f"{digest}  {artifact.name}\n")
+              print(f"Packaged {artifact} (sha256={digest})")
+
           checksum_file = dist_dir / f"SHA256SUMS-{target}.txt"
-          checksum_file.write_text(f"{digest}  {archive_name}\n", encoding="utf-8")
-          print(f"Packaged {archive_path} (sha256={digest})")
+          checksum_file.write_text("".join(checksum_lines), encoding="utf-8")
 
       - name: Upload packaged release artifact
         uses: actions/upload-artifact@v4
@@ -179,6 +229,12 @@ jobs:
           path: |
             dist/kotoha-*.tar.gz
             dist/kotoha-*.zip
+            dist/*.deb
+            dist/*.AppImage
+            dist/*.rpm
+            dist/*.dmg
+            dist/*.msi
+            dist/*.exe
             dist/SHA256SUMS-*.txt
           if-no-files-found: error
 
@@ -233,4 +289,10 @@ jobs:
           files: |
             release-artifacts/kotoha-*.tar.gz
             release-artifacts/kotoha-*.zip
+            release-artifacts/*.deb
+            release-artifacts/*.AppImage
+            release-artifacts/*.rpm
+            release-artifacts/*.dmg
+            release-artifacts/*.msi
+            release-artifacts/*.exe
             release-artifacts/SHA256SUMS.txt

@@ -1,0 +1,47 @@
+[package]
+name = "kotoha-app"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/4moda/kotoha"
+rust-version = "1.82"
+description = "Tauri v2 desktop shell, transparent subtitle overlay, tray, and setup wizard for Kotoha"
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+
+[lib]
+name = "kotoha_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "kotoha-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+async-trait = "0.1"
+kotoha-core = { path = "../../crates/kotoha-core" }
+kotoha-protocol = { path = "../../crates/kotoha-protocol" }
+kotoha-setup = { path = "../../crates/kotoha-setup" }
+kotoha-translate-http = { path = "../../crates/kotoha-translate-http" }
+kotoha-translate-local = { path = "../../crates/kotoha-translate-local" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }

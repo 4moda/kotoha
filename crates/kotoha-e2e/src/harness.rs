@@ -29,6 +29,10 @@ pub const ENV_MOCK_CLIENT_BIN: &str = "KOTOHA_MOCK_CLIENT_BIN";
 /// Environment variable overriding automatic discovery of the Rust `kotoha-ipc-monitor` binary.
 pub const ENV_IPC_MONITOR_BIN: &str = "KOTOHA_IPC_MONITOR_BIN";
 
+/// Environment variable forcing local E2E tests to fail instead of skipping when C++ binaries
+/// are absent (also enforced automatically whenever `CI` is set and non-empty).
+pub const ENV_REQUIRE_CPP_E2E: &str = "KOTOHA_REQUIRE_CPP_E2E";
+
 static ENDPOINT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Error returned by the Kotoha E2E test harness.
@@ -122,6 +126,47 @@ impl E2eBinaries {
             mock_client,
             ipc_monitor,
         })
+    }
+
+    /// Discovers `kotoha_mock_client` and `kotoha-ipc-monitor`, returning `Ok(None)` in local
+    /// developer environments when `kotoha_mock_client` has not been built yet.
+    ///
+    /// When `CI` or `KOTOHA_REQUIRE_CPP_E2E` is set and non-empty, missing binaries ALWAYS return
+    /// `Err(E2eError::BinaryNotFound)` so CI never silently skips cross-language E2E tests.
+    pub fn discover_or_skip_local() -> Result<Option<Self>, E2eError> {
+        Self::discover_or_skip_local_with(
+            Self::discover,
+            env::var_os("CI").is_some_and(|v| !v.is_empty()),
+            env::var_os(ENV_REQUIRE_CPP_E2E).is_some_and(|v| !v.is_empty()),
+        )
+    }
+
+    fn discover_or_skip_local_with<F>(
+        discover_fn: F,
+        is_ci: bool,
+        require_cpp_e2e: bool,
+    ) -> Result<Option<Self>, E2eError>
+    where
+        F: FnOnce() -> Result<Self, E2eError>,
+    {
+        match discover_fn() {
+            Ok(bins) => Ok(Some(bins)),
+            Err(
+                err @ E2eError::BinaryNotFound {
+                    label: "kotoha_mock_client",
+                    ..
+                },
+            ) if !is_ci && !require_cpp_e2e => {
+                eprintln!(
+                    "skipping cross-language IPC E2E test: {err}\n\
+                     build the C++ plugin test binaries first:\n\
+                       cmake -S plugins -B plugins/build && cmake --build plugins/build\n\
+                     (set {ENV_REQUIRE_CPP_E2E}=1 or CI=1 to treat missing C++ binaries as an error)"
+                );
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Discovers only the C++ `kotoha_mock_client` binary (useful for tests hosting an in-process
@@ -1375,4 +1420,65 @@ fn collect_user_info_names<'a>(
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discover_or_skip_local_skips_missing_mock_client_when_not_ci() {
+        let missing_mock = || {
+            Err(E2eError::BinaryNotFound {
+                label: "kotoha_mock_client",
+                searched: vec![PathBuf::from("plugins/build/tests/kotoha_mock_client")],
+            })
+        };
+
+        let result = E2eBinaries::discover_or_skip_local_with(missing_mock, false, false);
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn discover_or_skip_local_errors_in_ci_or_when_required() {
+        let missing_mock = || {
+            Err(E2eError::BinaryNotFound {
+                label: "kotoha_mock_client",
+                searched: vec![PathBuf::from("plugins/build/tests/kotoha_mock_client")],
+            })
+        };
+
+        assert!(matches!(
+            E2eBinaries::discover_or_skip_local_with(missing_mock, true, false),
+            Err(E2eError::BinaryNotFound {
+                label: "kotoha_mock_client",
+                ..
+            })
+        ));
+        assert!(matches!(
+            E2eBinaries::discover_or_skip_local_with(missing_mock, false, true),
+            Err(E2eError::BinaryNotFound {
+                label: "kotoha_mock_client",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn discover_or_skip_local_always_errors_on_missing_ipc_monitor() {
+        let missing_monitor = || {
+            Err(E2eError::BinaryNotFound {
+                label: "kotoha-ipc-monitor",
+                searched: vec![PathBuf::from("target/release/kotoha-ipc-monitor")],
+            })
+        };
+
+        assert!(matches!(
+            E2eBinaries::discover_or_skip_local_with(missing_monitor, false, false),
+            Err(E2eError::BinaryNotFound {
+                label: "kotoha-ipc-monitor",
+                ..
+            })
+        ));
+    }
 }

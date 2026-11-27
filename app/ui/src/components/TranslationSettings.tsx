@@ -7,6 +7,7 @@ import {
 } from '../data/modelCatalog';
 import type {
   ComputeDevice,
+  GlossarySettingsState,
   OverlayDisplayOptions,
   TranslationProviderConfig,
   TranslationProviderType,
@@ -17,9 +18,14 @@ export interface TranslationSettingsProps {
   tgtLang: string;
   provider: TranslationProviderConfig;
   overlayOptions: OverlayDisplayOptions;
+  glossarySettings: GlossarySettingsState;
   onChangeLanguages: (srcLang: string, tgtLang: string) => void;
   onChangeProvider: (config: TranslationProviderConfig) => void;
   onChangeOverlayOptions: (options: OverlayDisplayOptions) => void;
+  onChangeGlossarySettings: (next: {
+    enabled_profiles: string[];
+    hotwords_score: number;
+  }) => void;
 }
 
 const LANGUAGE_OPTIONS = [
@@ -34,14 +40,30 @@ export function TranslationSettings({
   tgtLang,
   provider,
   overlayOptions,
+  glossarySettings,
   onChangeLanguages,
   onChangeProvider,
   onChangeOverlayOptions,
+  onChangeGlossarySettings,
 }: TranslationSettingsProps) {
   const handleProviderSelect = (nextType: TranslationProviderType) => {
     if (nextType !== provider.type) {
       onChangeProvider(createDefaultProviderConfig(nextType));
     }
+  };
+
+  const handleToggleGlossaryProfile = (profileName: string, checked: boolean) => {
+    const current = glossarySettings.enabled_profiles;
+    const nextProfiles = checked
+      ? current.includes(profileName)
+        ? current
+        : [...current, profileName]
+      : current.filter((name) => name !== profileName);
+
+    onChangeGlossarySettings({
+      enabled_profiles: nextProfiles,
+      hotwords_score: glossarySettings.hotwords_score,
+    });
   };
 
   const selectedModel =
@@ -466,6 +488,82 @@ export function TranslationSettings({
             </label>
           </div>
         )}
+      </div>
+
+      <div className="settings-section" data-testid="glossary-hotwords-section">
+        <div className="section-header-row">
+          <div>
+            <h2 className="section-title">汎用カスタム辞書 (TOML Glossary) &amp; STT Hotwords</h2>
+            <p className="provider-description">
+              有効化した TOML 辞書の <code>[terms]</code> が STT Hotwords と翻訳辞書を単一ソースとして駆動します。
+            </p>
+          </div>
+          {glossarySettings.glossary_dir && (
+            <code className="glossary-dir-badge">{glossarySettings.glossary_dir}</code>
+          )}
+        </div>
+
+        <div className="glossary-profile-list" data-testid="glossary-profile-list">
+          {glossarySettings.profiles.length === 0 ? (
+            <p className="provider-description" data-testid="glossary-empty-notice">
+              読み込まれた TOML プロファイルがありません。
+            </p>
+          ) : (
+            glossarySettings.profiles.map((profile) => {
+              const checked = glossarySettings.enabled_profiles.includes(profile.name);
+              return (
+                <label
+                  key={profile.id}
+                  className={`glossary-profile-row ${checked ? 'is-enabled' : ''}`}
+                  data-testid={`glossary-profile-${profile.id}`}
+                >
+                  <div className="glossary-profile-main">
+                    <input
+                      type="checkbox"
+                      id={`glossary-toggle-${profile.id}`}
+                      data-testid={`glossary-toggle-${profile.id}`}
+                      checked={checked}
+                      onChange={(e) =>
+                        handleToggleGlossaryProfile(profile.name, e.target.checked)
+                      }
+                    />
+                    <span className="glossary-profile-name">{profile.name}</span>
+                  </div>
+                  <div className="glossary-profile-meta">
+                    <span className="glossary-lang-pill">
+                      {profile.src_lang} -&gt; {profile.tgt_lang}
+                    </span>
+                    <span className="glossary-term-count">{profile.term_count} terms</span>
+                  </div>
+                </label>
+              );
+            })
+          )}
+        </div>
+
+        <label className="field">
+          <span className="field-label" data-testid="hotwords-score-label">
+            STT Hotwords Boost Score (hotwords_score: {glossarySettings.hotwords_score.toFixed(1)})
+          </span>
+          <input
+            id="hotwords-score-slider"
+            data-testid="hotwords-score-slider"
+            type="range"
+            min={0.5}
+            max={3.0}
+            step={0.1}
+            value={glossarySettings.hotwords_score}
+            onChange={(e) =>
+              onChangeGlossarySettings({
+                enabled_profiles: glossarySettings.enabled_profiles,
+                hotwords_score: Number(e.target.value),
+              })
+            }
+          />
+          <span className="field-hint">
+            推奨範囲: 0.5 〜 3.0（デフォルト 1.5。高すぎると一般語への誤反応が増えます）
+          </span>
+        </label>
       </div>
 
       <div className="settings-section">
