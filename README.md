@@ -68,9 +68,18 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Rust 単体テスト & クロス言語 IPC E2E (`ipc_single_source`, `ipc_multi_source`)
-# ※ 先に C++ `plugins/` と `cargo build --release --bin kotoha-ipc-monitor` をビルドしてください
-cargo nextest run --workspace
-# （または cargo test --workspace）
+# ※ クロス言語 E2E を実際に実行するには、先に C++ テストバイナリ (`plugins/build/tests/kotoha_mock_client`) と
+#   `cargo build --release --bin kotoha-ipc-monitor` をビルドしてください:
+cmake -S plugins -B plugins/build && cmake --build plugins/build
+cargo build --release --bin kotoha-ipc-monitor
+
+# ローカル環境で `kotoha_mock_client` が未ビルドの場合、IPC E2E テストは案内メッセージを出力してスキップします。
+# 未ビルド時にスキップせず失敗させたい場合（CI と同等の厳格チェック）は `KOTOHA_REQUIRE_CPP_E2E=1` を指定してください:
+KOTOHA_REQUIRE_CPP_E2E=1 cargo nextest run --workspace
+# （または KOTOHA_REQUIRE_CPP_E2E=1 cargo test --workspace）
+
+# Doctest の実行（cargo-nextest は doctest を実行しないため個別実行）
+cargo test --workspace --doc
 
 # 実音声 E2E (`C++ kotoha_mock_client --wav` -> OS IPC -> sherpa-onnx Zipformer STT -> HTTP 翻訳)
 KOTOHA_E2E_MODEL_DIR=/path/to/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17-mobile \
