@@ -18,6 +18,11 @@ if(WIN32)
 endif()
 add_test(NAME kotoha_test_ipc_client COMMAND test_ipc_client)
 
+add_executable(test_wav_reader test_wav_reader.cpp)
+target_link_libraries(test_wav_reader PRIVATE kotoha_strict_warnings)
+target_compile_features(test_wav_reader PRIVATE cxx_std_20)
+add_test(NAME kotoha_test_wav_reader COMMAND test_wav_reader)
+
 add_executable(kotoha_mock_client kotoha_mock_client.cpp)
 target_link_libraries(kotoha_mock_client PRIVATE kotoha::common kotoha_strict_warnings)
 

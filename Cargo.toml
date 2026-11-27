@@ -4,6 +4,9 @@ members = [
     "crates/kotoha-protocol",
     "crates/kotoha-core",
     "crates/kotoha-stt-sherpa",
+    "crates/kotoha-translate-http",
+    "crates/kotoha-translate-local",
+    "crates/kotoha-e2e",
 ]
 
 [workspace.package]
@@ -29,11 +32,18 @@ module_name_repetitions = "allow"
 
 [workspace.dependencies]
 async-trait = "0.1"
+ct2rs = "0.11.3"
 interprocess = { version = "2.4", features = ["tokio"] }
 kotoha-core = { path = "crates/kotoha-core" }
 kotoha-protocol = { path = "crates/kotoha-protocol" }
+kotoha-stt-sherpa = { path = "crates/kotoha-stt-sherpa" }
+kotoha-translate-http = { path = "crates/kotoha-translate-http" }
+kotoha-translate-local = { path = "crates/kotoha-translate-local" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 sherpa-onnx = "2.0.3"
 thiserror = "2.0"
-tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8"

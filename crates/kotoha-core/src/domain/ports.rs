@@ -1,11 +1,12 @@
 //! Hexagonal Port traits defined by the domain layer and implemented by adapters.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::domain::entities::{
-    LanguageCode, SpeakerKey, SttHotwordsConfig, SubtitleEntry, TranscriptEvent,
+    GlossaryProfile, LanguageCode, SpeakerKey, SttHotwordsConfig, SubtitleEntry, TranscriptEvent,
     TranslationProviderConfig, TranslationRequest, TranslationResult,
 };
 use crate::domain::error::CoreError;
@@ -72,4 +73,13 @@ pub trait SubtitleSink: Send + Sync {
     async fn clear_source(&self, _source: &str) -> Result<(), CoreError> {
         Ok(())
     }
+}
+
+/// Repository loading custom [`GlossaryProfile`] definitions from storage.
+pub trait GlossaryRepository: Send + Sync {
+    /// Loads and validates a single [`GlossaryProfile`] file at `path`.
+    fn load_file(&self, path: &Path) -> Result<GlossaryProfile, CoreError>;
+
+    /// Loads all glossary profile files from `dir` in deterministic sorted filename order.
+    fn load_dir(&self, dir: &Path) -> Result<Vec<GlossaryProfile>, CoreError>;
 }

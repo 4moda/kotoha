@@ -74,11 +74,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
@@ -96,14 +98,11 @@ jobs:
       - name: Run C++ unit & ABI tests (CTest gate)
         run: ctest --test-dir plugins/build -C Release --output-on-failure
 
-      - name: Run Rust workspace tests (unit gate)
-        run: cargo test --workspace
-
       - name: Build Rust IPC monitor (Release)
         run: cargo build --release --bin kotoha-ipc-monitor
 
-      - name: Run Cross-Language IPC E2E gate (C++ <-> Rust)
-        run: python tests/e2e/run_ipc_e2e.py
+      - name: Run Rust workspace unit & Cross-Language IPC E2E gate (nextest)
+        run: cargo nextest run --workspace
 
       # Phase 3 hook:
       # Once app/src-tauri is introduced:

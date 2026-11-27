@@ -715,7 +715,7 @@ pub fn default_model_catalog() -> Vec<ModelProfile> {
 }
 
 /// Runtime-selectable translation provider configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TranslationProviderConfig {
     /// Local `CTranslate2` NMT model selected by `model_id` and compute target.
@@ -770,4 +770,64 @@ pub enum TranslationProviderConfig {
         /// Prefix prepended to translated text (e.g., `"[ja] "`).
         prefix: String,
     },
+}
+
+impl std::fmt::Debug for TranslationProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LocalModel {
+                model_id,
+                device,
+                threads,
+            } => f
+                .debug_struct("LocalModel")
+                .field("model_id", model_id)
+                .field("device", device)
+                .field("threads", threads)
+                .finish(),
+            Self::OpenAiCompatible {
+                base_url,
+                model,
+                api_key,
+                timeout_ms,
+            } => f
+                .debug_struct("OpenAiCompatible")
+                .field("base_url", base_url)
+                .field("model", model)
+                .field("api_key", &api_key.as_ref().map(|_| "[REDACTED]"))
+                .field("timeout_ms", timeout_ms)
+                .finish(),
+            Self::DeepL {
+                api_key: _,
+                use_free_endpoint,
+                timeout_ms,
+            } => f
+                .debug_struct("DeepL")
+                .field("api_key", &"[REDACTED]")
+                .field("use_free_endpoint", use_free_endpoint)
+                .field("timeout_ms", timeout_ms)
+                .finish(),
+            Self::GoogleCloud {
+                api_key: _,
+                project_id,
+                timeout_ms,
+            } => f
+                .debug_struct("GoogleCloud")
+                .field("api_key", &"[REDACTED]")
+                .field("project_id", project_id)
+                .field("timeout_ms", timeout_ms)
+                .finish(),
+            Self::GasWebhook {
+                endpoint_url,
+                bearer_token,
+                timeout_ms,
+            } => f
+                .debug_struct("GasWebhook")
+                .field("endpoint_url", endpoint_url)
+                .field("bearer_token", &bearer_token.as_ref().map(|_| "[REDACTED]"))
+                .field("timeout_ms", timeout_ms)
+                .finish(),
+            Self::Mock { prefix } => f.debug_struct("Mock").field("prefix", prefix).finish(),
+        }
+    }
 }

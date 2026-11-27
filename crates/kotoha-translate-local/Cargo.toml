@@ -1,0 +1,23 @@
+[package]
+name = "kotoha-translate-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Local CTranslate2 (ct2rs) NMT adapter, ModelProfile verification, hardware selection, and CompositeTranslatorFactory for Kotoha"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+native-ct2 = ["dep:ct2rs"]
+
+[dependencies]
+async-trait.workspace = true
+ct2rs = { workspace = true, optional = true }
+kotoha-core.workspace = true
+kotoha-translate-http.workspace = true
+sha2.workspace = true
+tokio.workspace = true

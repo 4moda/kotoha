@@ -136,19 +136,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
@@ -166,11 +163,92 @@ jobs:
       - name: Run C++ unit & ABI tests (CTest)
         run: ctest --test-dir plugins/build -C Release --output-on-failure
 
-      - name: Run Rust workspace tests
-        run: cargo test --workspace
-
       - name: Build Rust IPC monitor (Release)
         run: cargo build --release --bin kotoha-ipc-monitor
 
-      - name: Run Cross-Language IPC E2E suite (C++ <-> Rust)
-        run: python tests/e2e/run_ipc_e2e.py
+      - name: Run Rust workspace unit & Cross-Language IPC E2E tests (nextest)
+        run: cargo nextest run --workspace
+
+  real-audio-e2e:
+    name: Real-Audio E2E (C++ IPC -> sherpa-onnx STT -> HTTP Translation)
+    runs-on: ubuntu-latest
+    env:
+      SHERPA_ONNX_VERSION: "v2.0.3"
+      SHERPA_ARCHIVE_NAME: "sherpa-onnx-v2.0.3-linux-x64-static-lib"
+      ZIPFORMER_MODEL_NAME: "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17-mobile"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-real-audio-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-real-audio-e2e-
+
+      - name: Build C++ kotoha_mock_client (Release)
+        run: |
+          cmake -S plugins -B plugins/build -DCMAKE_BUILD_TYPE=Release -DKOTOHA_WARNINGS_AS_ERRORS=ON
+          cmake --build plugins/build --config Release --target kotoha_mock_client --parallel
+
+      - name: Cache sherpa-onnx v2.0.3 Linux x64 static libraries
+        id: cache-sherpa-lib
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/kotoha-ci/sherpa-onnx-v2.0.3-linux-x64-static-lib
+          key: sherpa-onnx-${{ env.SHERPA_ONNX_VERSION }}-linux-x64-static-lib-v1
+
+      - name: Download and extract sherpa-onnx v2.0.3 static libraries
+        if: steps.cache-sherpa-lib.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.cache/kotoha-ci
+          archive_url="https://github.com/k2-fsa/sherpa-onnx/releases/download/${SHERPA_ONNX_VERSION}/${SHERPA_ARCHIVE_NAME}.tar.bz2"
+          tmp_archive="$(mktemp /tmp/sherpa-onnx-lib-XXXXXX.tar.bz2)"
+          trap 'rm -f "${tmp_archive}"' EXIT
+          curl -fLsS --retry 3 --retry-delay 5 "${archive_url}" -o "${tmp_archive}"
+          tar -xjf "${tmp_archive}" -C ~/.cache/kotoha-ci
+
+      - name: Cache Zipformer English 20M streaming model
+        id: cache-zipformer-model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/kotoha-ci/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17-mobile
+          key: zipformer-en-20m-2023-02-17-mobile-v1
+
+      - name: Download and extract Zipformer English 20M streaming model
+        if: steps.cache-zipformer-model.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.cache/kotoha-ci
+          model_url="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${ZIPFORMER_MODEL_NAME}.tar.bz2"
+          tmp_model="$(mktemp /tmp/zipformer-model-XXXXXX.tar.bz2)"
+          trap 'rm -f "${tmp_model}"' EXIT
+          curl -fLsS --retry 3 --retry-delay 5 "${model_url}" -o "${tmp_model}"
+          tar -xjf "${tmp_model}" -C ~/.cache/kotoha-ci
+
+      - name: Clippy native sherpa-onnx STT & real-audio E2E crates
+        run: |
+          export SHERPA_ONNX_LIB_DIR="${HOME}/.cache/kotoha-ci/${SHERPA_ARCHIVE_NAME}/lib"
+          cargo clippy -p kotoha-stt-sherpa --all-targets --features native-sherpa -- -D warnings
+          cargo clippy -p kotoha-e2e --all-targets --features real-audio-e2e -- -D warnings
+
+      - name: Run Real-Audio E2E pipeline (nextest)
+        run: |
+          export SHERPA_ONNX_LIB_DIR="${HOME}/.cache/kotoha-ci/${SHERPA_ARCHIVE_NAME}/lib"
+          export KOTOHA_E2E_MODEL_DIR="${HOME}/.cache/kotoha-ci/${ZIPFORMER_MODEL_NAME}"
+          cargo nextest run -p kotoha-e2e --features real-audio-e2e --test real_audio_pipeline --no-capture
