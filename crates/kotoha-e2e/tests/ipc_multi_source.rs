@@ -12,7 +12,11 @@ use kotoha_e2e::{
 #[tokio::test]
 async fn concurrent_multi_source_isolates_speaker_keys() {
     // Arrange
-    let bins = E2eBinaries::discover().expect("discover kotoha_mock_client and kotoha-ipc-monitor");
+    let Some(bins) = E2eBinaries::discover_or_skip_local()
+        .expect("discover kotoha_mock_client and kotoha-ipc-monitor")
+    else {
+        return;
+    };
     let endpoint = UniqueIpcEndpoint::new("m2").expect("create unique IPC endpoint");
     let mut monitor = MonitorSession::start(&bins.ipc_monitor, &endpoint, Some(64))
         .await
