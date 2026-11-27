@@ -28,6 +28,7 @@ enum MonitorEvent<'a> {
         conn_id: u64,
         source: &'a str,
         cleared_speakers: usize,
+        reason: String,
     },
     SourceReset {
         conn_id: u64,
@@ -189,11 +190,15 @@ fn emit_event(
             source,
             plugin_version,
         } => emit_hello(*conn_id, source, plugin_version, action, json),
-        AudioInputEvent::SourceDisconnected { conn_id, source } => {
-            emit_cleared("DISCONNECT", *conn_id, source, action, json, false);
+        AudioInputEvent::SourceDisconnected {
+            conn_id,
+            source,
+            reason,
+        } => {
+            emit_cleared("DISCONNECT", *conn_id, source, action, json, Some(reason));
         }
         AudioInputEvent::SourceReset { conn_id, source } => {
-            emit_cleared("SOURCE_RESET", *conn_id, source, action, json, true);
+            emit_cleared("SOURCE_RESET", *conn_id, source, action, json, None);
         }
         AudioInputEvent::UserInfoUpdated {
             conn_id: _,
@@ -303,7 +308,7 @@ fn emit_cleared(
     source: &str,
     action: &SessionAction,
     json: bool,
-    is_reset: bool,
+    disconnect_reason: Option<&kotoha_core::domain::DisconnectReason>,
 ) {
     let cleared_speakers = match action {
         SessionAction::ClearSpeakers {
@@ -312,19 +317,22 @@ fn emit_cleared(
         _ => 0,
     };
     if json {
-        if is_reset {
+        if let Some(reason) = disconnect_reason {
+            print_json(&MonitorEvent::Disconnected {
+                conn_id,
+                source,
+                cleared_speakers,
+                reason: reason_slug(reason),
+            });
+        } else {
             print_json(&MonitorEvent::SourceReset {
                 conn_id,
                 source,
                 cleared_speakers,
             });
-        } else {
-            print_json(&MonitorEvent::Disconnected {
-                conn_id,
-                source,
-                cleared_speakers,
-            });
         }
+    } else if let Some(reason) = disconnect_reason {
+        println!("[{label}] conn_id={conn_id} source={source} cleared_speakers={cleared_speakers} reason={reason:?}");
     } else {
         println!("[{label}] conn_id={conn_id} source={source} cleared_speakers={cleared_speakers}");
     }
@@ -384,5 +392,19 @@ fn emit_audio_frame(
 fn print_json<T: Serialize>(value: &T) {
     if let Ok(line) = serde_json::to_string(value) {
         println!("{line}");
+    }
+}
+
+/// Stable snake_case identifier for a disconnect reason (used in JSON output).
+fn reason_slug(reason: &kotoha_core::domain::DisconnectReason) -> String {
+    use kotoha_core::domain::DisconnectReason as R;
+    match reason {
+        R::Eof => "eof".to_owned(),
+        R::IoError(_) => "io_error".to_owned(),
+        R::Protocol(_) => "protocol".to_owned(),
+        R::HelloTimeout => "hello_timeout".to_owned(),
+        R::IdleTimeout => "idle_timeout".to_owned(),
+        R::Superseded => "superseded".to_owned(),
+        R::Shutdown => "shutdown".to_owned(),
     }
 }

@@ -3,7 +3,9 @@
 #![allow(clippy::expect_used, clippy::too_many_lines)]
 
 use kotoha_core::application::{SeqStatus, SessionAction, SourceSessionManager};
-use kotoha_core::domain::{AudioChunk, AudioInputEvent, SpeakerKey, TalkingState};
+use kotoha_core::domain::{
+    AudioChunk, AudioInputEvent, DisconnectReason, SpeakerKey, TalkingState,
+};
 
 #[test]
 fn session_manager_conn_id_supersede_and_seq_tracking() {
@@ -51,6 +53,7 @@ fn session_manager_conn_id_supersede_and_seq_tracking() {
         mgr.handle_event(&AudioInputEvent::SourceDisconnected {
             conn_id: 1,
             source: "mumble".to_owned(),
+            reason: DisconnectReason::Superseded,
         }),
         SessionAction::None
     );
@@ -167,6 +170,7 @@ fn session_manager_conn_id_supersede_and_seq_tracking() {
     let disc_action = mgr.handle_event(&AudioInputEvent::SourceDisconnected {
         conn_id: 2,
         source: "mumble".to_owned(),
+        reason: DisconnectReason::Eof,
     });
     assert_eq!(
         disc_action,

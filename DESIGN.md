@@ -131,8 +131,9 @@ C++ クライアント・Rust サーバー双方が同一の優先順位でエ�
   - **C++ Plugin = Client (Connect)**: ホスト起動・プラグイン有効化時に非同期ワーカースレッドが接続を試行する。
 - **接続所有権と同一 `source` 再接続レース防止 (`conn_id`)**:
   - `IpcServer` は Accept したすべての接続に単調増加の一意な **`conn_id: u64`** を割り当てる。
-  - `Hello` 受信により接続の `source` 名が確定した際、`active_sources: HashMap<String, u64>` に当該 `source -> conn_id` を登録する。既に同一 `source` の別 `conn_id` がアクティブであった場合は即座に新しい `conn_id` で上書き（または旧接続をキャンセル・置き換え）する。
-  - `SourceReset` 受信時または EOF / I/O エラー検知時のクリーンアップは、**必ず `active_sources.get(&source) == Some(&conn_id)` を検証した上でのみ**実行する。これにより、再接続直後に旧ソケットの遅延 EOF が新接続の話者状態や STT ストリームを誤破棄するレースコンディションを完全に排除する。
+  - `Hello` 受信により接続の `source` 名が確定した際、`active_sources: HashMap<String, u64>` に当該 `source -> conn_id` を登録する。既に同一 `source` の別 `conn_id` がアクティブであった場合は即座に新しい `conn_id` で上書きし、**旧接続のタスクを能動的にキャンセルして切断する**（実装: IPC アダプタが `source -> (conn_id, cancel)` の表を保持し、新しい `Hello` 完了時に旧接続へキャンセルを通知する。旧接続は `SourceDisconnected { reason: Superseded }` を送出するが、所有権チェックにより `SourceSessionManager` では無視される）。
+  - `SourceReset` 受信時または EOF / I/O エラー検知時のクリーンアップは、**必ず `active_sources.get(&source) == Some(&conn_id)` を検証した上でのみ**実行する。これにより、再接続直後に旧ソケットの遅延 EOF が新接続の話者状態や STT ストリームを誤破棄するレースを防ぐ。さらに、サーバーは「所有権表の更新・旧接続のキャンセル・`SourceConnected` のチャネル投入」を同一ロック内で行い（チャネル容量を先に確保してから）、ほぼ同時の `Hello` でもチャネル上のイベント順と所有権の順序が一致するようにしている。
+  - **注意（同名 `source` の多重起動）**: 同じ `source` 名を使う 2 つのプラグインインスタンスが同時に接続すると、再接続のたびに互いを置き換え合い（flapping）、安定して接続できない。`source` 名はホストアプリごとに一意とすること。
 - **自動再接続**: 接続失敗または切断検知時、C++ クライアントは **1000 ms (1 秒) 間隔** でリトライする（シャットダウン要求時は 50 ms 以内など速やかにループ離脱できるよう条件変数 `wait_for` で待機する）。
 - **セッション初期化 (`Hello`) 厳密ルール**:
   - クライアントは接続確立直後、他のどのメッセージよりも先に **`Hello` (`0x00`)** を 1 回送信しなければならない。
@@ -141,7 +142,11 @@ C++ クライアント・Rust サーバー双方が同一の優先順位でエ�
   - ヘッダ検証エラー（`InvalidMagic`, `UnsupportedVersion`, `PayloadTooLarge`, `UnknownMessageType`）およびペイロード検証エラー（`InvalidPayloadLength`, `InvalidUtf8`, `InvalidFlags`, `InvalidPcmSample`, `InvalidTalkingState` 等）が発生した場合、フレーミング境界が喪失またはピアが破損しているため、デコーダはエラーを返し、サーバーは**必ず該当ピア接続を即座に切断**する（リカバー継続しない）。
 - **Keepalive (`Heartbeat`)**:
   - クライアントは送信する他メッセージがない場合を含め、原則 **1000 ms (1 秒) ごと** に `Heartbeat` (`0x04`) を送信する。
-  - サーバーは任意の間隔（推奨タイムアウト: 5 秒など、テスト設定で調整可）で生存監視や UI の接続ステータス表示（「接続中 / 未接続」）に利用する。
+  - サーバーは生存監視と UI の接続ステータス表示（「接続中 / 未接続」）に `Heartbeat` を利用する。実装済みのタイムアウト（`IpcServerConfig`、`IpcServerAdapter::with_config` で調整可）:
+  - **`hello_timeout`（既定 2 秒）**: 接続受理から有効な `Hello` が届くまでの上限。超過した接続は切断する（`HelloTimeout`、`Hello` 未完了のため `SourceDisconnected` は発行しない）。
+  - **`idle_timeout`（既定 5 秒）**: `Hello` 後、**任意の種別のフレーム**（`Heartbeat` 含む）が届かない時間の上限。超過した接続は切断し `SourceDisconnected { reason: IdleTimeout }` を発行する。
+  - **`max_connections`（既定 16）**: 同時接続数の上限。超過分の新規接続は即座に破棄する。
+  - 切断理由は `AudioInputEvent::SourceDisconnected.reason`（`DisconnectReason`: `Eof` / `IoError` / `Protocol` / `HelloTimeout` / `IdleTimeout` / `Superseded` / `Shutdown`）で通知され、`kotoha-ipc-monitor` が表示する。
 - **切断クリーンアップ (`SourceReset` / EOF)**:
   - クライアントはプラグイン停止時やボイスチャットサーバー切断時（`mumble_onServerDisconnected`）に `SourceReset` (`0x06`) を送信する。
   - サーバーは `SourceReset` 受信時または TCP/IPC EOF・I/O エラー検知時に（`conn_id` 所有権チェックのもとで）、該当接続の `source` に紐づくすべてのアクティブ話者・STT ストリームを安全に破棄・フラッシュする。

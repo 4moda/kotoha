@@ -123,9 +123,9 @@ impl SourceSessionManager {
                 source,
                 plugin_version,
             } => self.on_source_connected(*conn_id, source, plugin_version),
-            AudioInputEvent::SourceDisconnected { conn_id, source } => {
-                self.on_source_disconnected(*conn_id, source)
-            }
+            AudioInputEvent::SourceDisconnected {
+                conn_id, source, ..
+            } => self.on_source_disconnected(*conn_id, source),
             AudioInputEvent::SourceReset { conn_id, source } => {
                 self.on_source_reset(*conn_id, source)
             }
