@@ -779,7 +779,13 @@ kotoha/
 │   │           └── kotoha_ipc_monitor.rs
 │   ├── kotoha-stt-sherpa/           # (Phase 2) sherpa-onnx ストリーミング STT アダプタ
 │   ├── kotoha-translate-local/      # (Phase 2) ct2rs Local NMT アダプタ & ModelProfile カタログ/DL
-│   └── kotoha-translate-http/       # (Phase 2) OpenAI 互換 / DeepL / Google Cloud / GAS アダプタ
+│   ├── kotoha-translate-http/       # (Phase 2) OpenAI 互換 / DeepL / Google Cloud / GAS アダプタ
+│   └── kotoha-e2e/                  # クロス言語 (C++ <-> Rust) IPC & 実音声パイプライン E2E スイート
+│       ├── src/harness.rs
+│       └── tests/
+│           ├── ipc_single_source.rs
+│           ├── ipc_multi_source.rs
+│           └── real_audio_pipeline.rs
 │
 ├── app/                             # デスクトップアプリ本体
 │   ├── ui/                          # React + TypeScript + Vite + Vitest + Playwright
@@ -792,12 +798,9 @@ kotoha/
 │       ├── tauri.conf.json
 │       └── src/
 │
-├── tests/                           # クロス言語 E2E テストスイート
-│   └── e2e/
-│
 └── .github/
     └── workflows/
-        ├── ci.yml                   # 3OS 静的解析・ビルド・単体テスト・UI/E2E テスト
+        ├── ci.yml                   # 3OS 静的解析・ビルド・単体テスト・UI/E2E & 実音声 E2E テスト
         └── release.yml              # 3OS リリースビルド・SHA-256・GitHub Releases 公開
 ```
 
@@ -819,28 +822,27 @@ kotoha/
 2. **Tier 2: バイナリ ABI & 疎通結合テスト**
    - **C++ Mumble プラグイン ABI テスト**: ビルドした共有ライブラリ（`.so`/`.dylib`/`.dll`）をテストランナーから動的ロード（`dlopen` / `LoadLibrary`）し、Mumble Plugin API v1.0.x 必須エクスポート関数群の解決、擬似コールバック（`isSpeech == true/false`、`mumble_onUserTalkingStateChanged`）の呼び出しと戻り値 `false`、メモリ破壊ゼロを検証。
    - **UI ブラウザ E2E (`Playwright`)**: モックイベントを注入した状態で字幕オーバーレイ描画・設定画面切替をヘッドレスブラウザで検証。
-3. **Tier 3: クロス言語・実 OS IPC E2E テスト**
-   - 一時 `KOTOHA_IPC_ENDPOINT`（Unix ドメインソケットまたは固有 Named Pipe）を設定した上で：
-     1. Rust 側 `kotoha-ipc-monitor`（または E2E サーバーハーネス）を起動。
-     2. C++ 側 `kotoha_mock_client`（および実 Mumble プラグインのテストハーネス）を起動し、`Hello` → `UserInfo` → `TalkingState` → 複数チャンネル/高レート合成 PCM `AudioFrame` → `Heartbeat` → `UserRemoved` → `SourceReset` を実 OS IPC 経由で送信。
-     3. Rust 側が 1 バイトの欠損・デコードエラーもなく全メッセージを受信し、16 kHz モノラルへの正規化・`SpeakerKey` 管理・Mock STT/翻訳まで完走することを全 3 OS 上で自動検証する。
+3. **Tier 3: クロス言語・実 OS IPC & 実音声パイプライン E2E テスト (`crates/kotoha-e2e`)**
+   - 一時 `KOTOHA_IPC_ENDPOINT`（Unix ドメインソケットまたは固有 Named Pipe）を設定した上で `cargo nextest run --workspace`（または `cargo test -p kotoha-e2e`）により以下を自動検証する：
+     1. **`ipc_single_source` / `ipc_multi_source`**: Rust 側 `kotoha-ipc-monitor` と C++ 側 `kotoha_mock_client` を実 OS IPC で接続し、`Hello` → `UserInfo` → `TalkingState` → 複数チャンネル/高レート合成 PCM `AudioFrame` → `Heartbeat` → `UserRemoved` → `SourceReset` の 1 バイト欠損もない受信と `SpeakerKey { source, user_id }` 分離を全 3 OS 上で検証。
+     2. **`real_audio_pipeline`（`--features real-audio-e2e` + `KOTOHA_E2E_MODEL_DIR`）**: C++ 側 `kotoha_mock_client --wav` が実音声 WAV を OS IPC 経由でストリーミングし、`AudioPreprocessor` → ネイティブ `sherpa-onnx` Zipformer STT（TOML 用語辞書 Hotwords 含む）→ ローカル HTTP `OpenAiCompatibleTranslator` → 3 段階 `CollectingSubtitleSink` までをエンドツーエンドで検証。
 
 ### 6.2 3OS GitHub Actions CI & Release パイプライン
 
 - **対象ランナーマトリクス**: `ubuntu-latest` (Linux x86_64), `windows-latest` (Windows x86_64), `macos-latest` (macOS arm64)。
-- **`.github/workflows/ci.yml`**（PR / `main` push 時に全 3 OS で実行）:
+- **`.github/workflows/ci.yml`**（PR / `main` push 時に実行）:
   1. **Lint / Format**:
-     - Rust: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`
-     - C++: `clang-format --dry-run --Werror`（Ubuntu 等で全 `plugins/common` / `plugins/mumble` ソース検証）
+     - Rust: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`（および `real-audio-e2e` ジョブで `native-sherpa` / `real-audio-e2e` 機能付き Clippy）
+     - C++: `clang-format --dry-run --Werror`, `clang-tidy`（Ubuntu で全 `plugins/common` / `plugins/mumble` ソース検証）
      - UI: `npm run lint`, `npm run typecheck`
   2. **Build & Test**:
      - C++: CMake Configure + Build + `ctest --output-on-failure`
-     - Rust: `cargo test --workspace`
+     - Rust & Cross-Language E2E: `cargo build --release --bin kotoha-ipc-monitor` + `cargo nextest run --workspace`（全 3 OS で単体テストおよび `kotoha_mock_client` ↔ `kotoha-ipc-monitor` 実 IPC E2E を実行）
      - UI: `npm test` (Vitest) + Playwright E2E + `npm run build`
-  3. **Cross-Language E2E**:
-     - 3OS それぞれで `kotoha_mock_client` ↔ `kotoha-ipc-monitor`（および Mumble プラグインハーネス）の実 IPC E2E を実行。
+  3. **Real-Audio E2E (`real-audio-e2e` on `ubuntu-latest`)**:
+     - キャッシュされた `sherpa-onnx` static lib（`SHERPA_ONNX_LIB_DIR`）および Zipformer 英語モデル（`KOTOHA_E2E_MODEL_DIR`）を用いて、`cargo nextest run -p kotoha-e2e --features real-audio-e2e --test real_audio_pipeline --no-capture` を PR 毎に実行。
 - **`.github/workflows/release.yml`**（`v*` タグ push 時）:
-  - 3OS それぞれのプラグイン共有ライブラリおよびデスクトップアプリ（Phase 3 で Tauri `.msi` / `.dmg` / `.AppImage` / `.deb` を追加）をビルド。
+  - 全 3 OS で CMake Release + CTest + `cargo nextest run --workspace` ゲートを通過後、プラグイン共有ライブラリおよびバイナリ（Phase 3 で Tauri `.msi` / `.dmg` / `.AppImage` / `.deb` を追加）をパッケージ。
   - 全配布成果物の `SHA256SUMS.txt` を生成して GitHub Releases へ自動公開。
   - Phase 4 で Windows/macOS コード署名（シークレット設定時のみ有効化するオプショナル構成）および Tauri Updater 用 `latest.json` 生成を追加。
 
