@@ -7,7 +7,7 @@ pub mod mock_adapters;
 
 pub use audio::{AudioPreprocessor, TARGET_SAMPLE_RATE};
 pub use glossary_toml::TomlGlossaryRepository;
-pub use ipc_server::{connect_local_socket, IpcServerAdapter};
+pub use ipc_server::{connect_local_socket, IpcServerAdapter, IpcServerConfig};
 pub use mock_adapters::{
     CollectingSubtitleSink, DefaultTranslatorFactory, MockSttEngine, MockTranslator,
 };

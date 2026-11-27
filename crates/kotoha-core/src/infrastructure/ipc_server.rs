@@ -1,10 +1,12 @@
 //! Asynchronous cross-platform IPC server adapter built on `tokio` + `interprocess` + `kotoha-protocol`.
 
+use std::collections::HashMap;
 use std::io::ErrorKind;
 #[cfg(unix)]
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::tokio::Stream as LocalSocketStream;
@@ -26,12 +28,39 @@ use kotoha_protocol::{
     AUDIO_FLAG_IS_LOCAL_USER, FRAME_HEADER_LEN,
 };
 use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 #[cfg(windows)]
 use widestring::u16cstr;
 
-use crate::domain::{AudioChunk, AudioInputEvent, CoreError, SpeakerKey, TalkingState};
+use crate::domain::{
+    AudioChunk, AudioInputEvent, CoreError, DisconnectReason, SpeakerKey, TalkingState,
+};
+
+/// Liveness and capacity limits for [`IpcServerAdapter`] (see `DESIGN.md` Section 3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpcServerConfig {
+    /// Maximum time between accepting a connection and receiving a valid `Hello`.
+    pub hello_timeout: Duration,
+    /// Maximum time without receiving any frame (`Heartbeat` included) after `Hello`.
+    pub idle_timeout: Duration,
+    /// Maximum number of simultaneously served connections; extra connections are dropped.
+    pub max_connections: usize,
+}
+
+impl Default for IpcServerConfig {
+    fn default() -> Self {
+        Self {
+            hello_timeout: Duration::from_secs(2),
+            idle_timeout: Duration::from_secs(5),
+            max_connections: 16,
+        }
+    }
+}
+
+/// `source -> (conn_id, cancel)` for the connection that currently owns each source.
+type OwnerRegistry = Arc<Mutex<HashMap<String, (u64, oneshot::Sender<()>)>>>;
 
 /// Cross-platform asynchronous IPC v1 server accepting plugin connections over Unix Domain
 /// Sockets (Linux/macOS, `0600` permissions) or Windows Named Pipes.
@@ -39,15 +68,25 @@ use crate::domain::{AudioChunk, AudioInputEvent, CoreError, SpeakerKey, TalkingS
 pub struct IpcServerAdapter {
     endpoint: String,
     next_conn_id: Arc<AtomicU64>,
+    config: IpcServerConfig,
+    owners: OwnerRegistry,
 }
 
 impl IpcServerAdapter {
     /// Creates an [`IpcServerAdapter`] bound to `endpoint`.
     #[must_use]
     pub fn new(endpoint: impl Into<String>) -> Self {
+        Self::with_config(endpoint, IpcServerConfig::default())
+    }
+
+    /// Creates an [`IpcServerAdapter`] bound to `endpoint` with explicit liveness limits.
+    #[must_use]
+    pub fn with_config(endpoint: impl Into<String>, config: IpcServerConfig) -> Self {
         Self {
             endpoint: endpoint.into(),
             next_conn_id: Arc::new(AtomicU64::new(1)),
+            config,
+            owners: Arc::default(),
         }
     }
 
@@ -100,10 +139,26 @@ impl IpcServerAdapter {
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok(stream) => {
+                            while client_tasks.try_join_next().is_some() {}
+                            if client_tasks.len() >= self.config.max_connections {
+                                // Over capacity: drop the new connection immediately.
+                                drop(stream);
+                                continue;
+                            }
                             let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
                             let client_tx = tx.clone();
+                            let config = self.config;
+                            let owners = Arc::clone(&self.owners);
                             client_tasks.spawn(async move {
-                                handle_connection(conn_id, stream, client_tx, client_shutdown).await;
+                                handle_connection(
+                                    conn_id,
+                                    stream,
+                                    client_tx,
+                                    client_shutdown,
+                                    config,
+                                    owners,
+                                )
+                                .await;
                             });
                         }
                         Err(err) => {
@@ -272,58 +327,114 @@ async fn handle_connection(
     mut stream: LocalSocketStream,
     tx: mpsc::Sender<AudioInputEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
+    config: IpcServerConfig,
+    owners: OwnerRegistry,
 ) {
     let mut source_name: Option<String> = None;
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    // Resolves only when a newer connection signals supersession; a dropped sender never cancels.
+    let superseded = async move {
+        if cancel_rx.await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(superseded);
+    let mut cancel_tx = Some(cancel_tx);
+    let mut deadline = Instant::now() + config.hello_timeout;
 
-    loop {
-        if *shutdown_rx.borrow_and_update() {
-            break;
+    let reason = loop {
+        let stopping = *shutdown_rx.borrow_and_update();
+        if stopping {
+            break DisconnectReason::Shutdown;
         }
 
         let msg_res = tokio::select! {
             biased;
             _ = shutdown_rx.wait_for(|v| *v) => {
-                break;
+                break DisconnectReason::Shutdown;
             }
+            () = &mut superseded => {
+                break DisconnectReason::Superseded;
+            }
+            // Read before the deadline so a frame that is already available always wins.
             frame = read_next_message(&mut stream) => frame,
+            () = tokio::time::sleep_until(deadline) => {
+                break if source_name.is_some() {
+                    DisconnectReason::IdleTimeout
+                } else {
+                    DisconnectReason::HelloTimeout
+                };
+            }
         };
 
-        let Ok(Some(msg)) = msg_res else { break };
+        let msg = match msg_res {
+            Ok(Some(msg)) => msg,
+            Ok(None) => break DisconnectReason::Eof,
+            Err(CoreError::Protocol(err)) => break DisconnectReason::Protocol(err.to_string()),
+            Err(err) => break DisconnectReason::IoError(err.to_string()),
+        };
 
         if let Some(source) = &source_name {
             let Some(event) = message_to_event(conn_id, source, msg) else {
                 // Duplicate Hello mid-session is a protocol violation -> immediate disconnect.
-                break;
+                break DisconnectReason::Protocol("duplicate Hello".to_owned());
             };
             if tx.send(event).await.is_err() {
-                break;
+                break DisconnectReason::Shutdown;
             }
+            // Restart the idle window only after the send completed, so time spent blocked on a
+            // slow consumer is not counted as client silence.
+            deadline = Instant::now() + config.idle_timeout;
         } else if let Message::Hello {
             app_name,
             plugin_version,
         } = msg
         {
+            // Reserve channel capacity BEFORE taking the registry lock, then insert, cancel the
+            // previous owner and enqueue `SourceConnected` while holding the lock. This keeps the
+            // channel order identical to the registry order, so a superseded connection's events
+            // can never be observed after (and override) the new owner's `SourceConnected`.
+            let Ok(permit) = tx.reserve().await else {
+                break DisconnectReason::Shutdown;
+            };
             source_name = Some(app_name.clone());
-            if tx
-                .send(AudioInputEvent::SourceConnected {
+            if let Some(cancel) = cancel_tx.take() {
+                let mut map = owners
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let previous = map.insert(app_name.clone(), (conn_id, cancel));
+                if let Some((_, old_cancel)) = previous {
+                    let _ = old_cancel.send(());
+                }
+                permit.send(AudioInputEvent::SourceConnected {
                     conn_id,
                     source: app_name,
                     plugin_version,
-                })
-                .await
-                .is_err()
-            {
-                break;
+                });
+                drop(map);
             }
+            deadline = Instant::now() + config.idle_timeout;
         } else {
             // Any non-Hello frame before handshake is a protocol violation -> immediate disconnect.
-            break;
+            break DisconnectReason::Protocol("frame received before Hello".to_owned());
         }
-    }
+    };
 
     if let Some(source) = source_name {
+        {
+            let mut map = owners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if map.get(&source).is_some_and(|(id, _)| *id == conn_id) {
+                map.remove(&source);
+            }
+        }
         let _ = tx
-            .send(AudioInputEvent::SourceDisconnected { conn_id, source })
+            .send(AudioInputEvent::SourceDisconnected {
+                conn_id,
+                source,
+                reason,
+            })
             .await;
     }
 }

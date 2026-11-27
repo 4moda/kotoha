@@ -8,12 +8,12 @@ pub mod logic;
 pub mod ports;
 
 pub use entities::{
-    default_model_catalog, AudioChunk, AudioInputEvent, ComputeDevice, GlossaryEntry,
-    GlossaryProfile, GlossarySettings, HistoryEntry, LanguageCode, MergedGlossary, ModelBackend,
-    ModelProfile, PreprocessedAudio, SpeakerKey, SttDecodingMethod, SttHotwordsConfig,
-    SubtitleEntry, SubtitleStage, TalkingState, TranscriptEvent, TranslateContext,
-    TranslationProviderConfig, TranslationRequest, TranslationResult, UtteranceId,
-    DEFAULT_HOTWORDS_SCORE,
+    default_model_catalog, AudioChunk, AudioInputEvent, ComputeDevice, DisconnectReason,
+    GlossaryEntry, GlossaryProfile, GlossarySettings, HistoryEntry, LanguageCode, MergedGlossary,
+    ModelBackend, ModelProfile, PreprocessedAudio, SpeakerKey, SttDecodingMethod,
+    SttHotwordsConfig, SubtitleEntry, SubtitleStage, TalkingState, TranscriptEvent,
+    TranslateContext, TranslationProviderConfig, TranslationRequest, TranslationResult,
+    UtteranceId, DEFAULT_HOTWORDS_SCORE,
 };
 pub use error::CoreError;
 pub use logic::{
