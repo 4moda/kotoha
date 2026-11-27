@@ -166,7 +166,7 @@ bool unix_peer_has_uid(int fd, uint32_t expected_uid) noexcept {
         return false;
     }
 #if defined(SO_PEERCRED)
-    struct ucred cred {};
+    ucred cred{};
     socklen_t len = sizeof(cred);
     if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0 || len != sizeof(cred)) {
         return false;
