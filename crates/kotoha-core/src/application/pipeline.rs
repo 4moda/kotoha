@@ -12,9 +12,9 @@ use tokio::task::JoinSet;
 use crate::application::session::{SessionAction, SourceSessionManager};
 use crate::application::translator_manager::TranslatorManager;
 use crate::domain::{
-    AudioChunk, AudioInputEvent, ContextWindow, CoreError, HistoryEntry, LanguageCode, PreFilter,
-    SpeakerKey, SttEngine, SttStream, SubtitleEntry, SubtitleSink, SubtitleStage, TranscriptEvent,
-    TranslationRequest,
+    AudioChunk, AudioInputEvent, ContextWindow, CoreError, HistoryEntry, LanguageCode,
+    MergedGlossary, PreFilter, SpeakerKey, SttEngine, SttStream, SubtitleEntry, SubtitleSink,
+    SubtitleStage, TranscriptEvent, TranslationRequest, DEFAULT_HOTWORDS_SCORE,
 };
 
 /// Audio normalization callback converting raw interleaved [`AudioChunk`] into 16 kHz mono `f32`.
@@ -58,6 +58,7 @@ pub struct PipelineService {
     subtitle_sink: Arc<dyn SubtitleSink>,
     resample_fn: ResampleFn,
     pre_filter: PreFilter,
+    active_glossary: MergedGlossary,
     session_manager: SourceSessionManager,
     speaker_streams: HashMap<SpeakerKey, Box<dyn SttStream>>,
     source_contexts: HashMap<String, Arc<Mutex<ContextWindow>>>,
@@ -83,6 +84,7 @@ impl PipelineService {
             subtitle_sink,
             resample_fn,
             pre_filter: PreFilter::default(),
+            active_glossary: MergedGlossary::default(),
             session_manager: SourceSessionManager::new(),
             speaker_streams: HashMap::new(),
             source_contexts: HashMap::new(),
@@ -94,6 +96,40 @@ impl PipelineService {
     /// Replaces the default [`PreFilter`] rules.
     pub fn set_pre_filter(&mut self, pre_filter: PreFilter) {
         self.pre_filter = pre_filter;
+    }
+
+    /// Updates the active merged glossary at runtime using [`DEFAULT_HOTWORDS_SCORE`].
+    ///
+    /// Propagates the updated glossary to all active source [`ContextWindow`]s (and future
+    /// sources) and forwards normalized hotwords to [`SttEngine::update_hotwords`].
+    pub async fn set_glossary(
+        &mut self,
+        glossary: impl Into<MergedGlossary>,
+    ) -> Result<(), CoreError> {
+        self.set_glossary_with_score(glossary, DEFAULT_HOTWORDS_SCORE)
+            .await
+    }
+
+    /// Updates the active merged glossary at runtime with an explicit STT hotword boosting score.
+    pub async fn set_glossary_with_score(
+        &mut self,
+        glossary: impl Into<MergedGlossary>,
+        hotwords_score: f32,
+    ) -> Result<(), CoreError> {
+        let merged = glossary.into();
+        let hotwords_config = merged.to_stt_hotwords_config(hotwords_score);
+        self.stt_engine.update_hotwords(&hotwords_config)?;
+        self.active_glossary = merged.clone();
+        for ctx in self.source_contexts.values() {
+            ctx.lock().await.set_glossary(merged.clone());
+        }
+        Ok(())
+    }
+
+    /// Returns the currently active [`MergedGlossary`].
+    #[must_use]
+    pub const fn active_glossary(&self) -> &MergedGlossary {
+        &self.active_glossary
     }
 
     /// Returns read-only access to the underlying [`SourceSessionManager`].
@@ -322,10 +358,15 @@ impl PipelineService {
 
     fn source_context(&mut self, source: &str) -> Arc<Mutex<ContextWindow>> {
         let cap = self.config.context_window_capacity;
+        let active_glossary = &self.active_glossary;
         Arc::clone(
             self.source_contexts
                 .entry(source.to_owned())
-                .or_insert_with(|| Arc::new(Mutex::new(ContextWindow::new(cap)))),
+                .or_insert_with(|| {
+                    let mut window = ContextWindow::new(cap);
+                    window.set_glossary(active_glossary.clone());
+                    Arc::new(Mutex::new(window))
+                }),
         )
     }
 

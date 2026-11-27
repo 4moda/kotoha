@@ -1,5 +1,7 @@
 //! Domain entities, value objects, and model catalog definitions (zero external I/O).
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::domain::error::CoreError;
@@ -256,13 +258,281 @@ pub struct GlossaryEntry {
     pub translation: String,
 }
 
+/// Default hotword boosting score used by [`SttHotwordsConfig`].
+pub const DEFAULT_HOTWORDS_SCORE: f32 = 1.5;
+
+/// Language-pair-scoped custom glossary profile (e.g., loaded from a TOML profile).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlossaryProfile {
+    /// Profile identifier or display name (e.g., `"eve-online"`, `"valorant"`).
+    pub name: String,
+    /// Source language code (e.g., `"en"`).
+    pub src_lang: LanguageCode,
+    /// Target language code (e.g., `"ja"`).
+    pub tgt_lang: LanguageCode,
+    /// Ordered mapping of `source term / STT hotword -> fixed target translation`.
+    #[serde(default)]
+    pub terms: BTreeMap<String, String>,
+}
+
+impl GlossaryProfile {
+    /// Creates a new [`GlossaryProfile`].
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        src_lang: LanguageCode,
+        tgt_lang: LanguageCode,
+        terms: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            src_lang,
+            tgt_lang,
+            terms,
+        }
+    }
+
+    /// Returns `true` when this profile targets `(src_lang, tgt_lang)`.
+    #[must_use]
+    pub fn matches_pair(&self, src_lang: &LanguageCode, tgt_lang: &LanguageCode) -> bool {
+        &self.src_lang == src_lang && &self.tgt_lang == tgt_lang
+    }
+
+    /// Merges all profiles matching `(src_lang, tgt_lang)` in slice order (later overrides earlier).
+    #[must_use]
+    pub fn merge(
+        profiles: &[Self],
+        src_lang: &LanguageCode,
+        tgt_lang: &LanguageCode,
+    ) -> BTreeMap<String, String> {
+        let mut merged = BTreeMap::new();
+        for profile in profiles {
+            if profile.matches_pair(src_lang, tgt_lang) {
+                for (key, value) in &profile.terms {
+                    if !key.trim().is_empty() {
+                        merged.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        merged
+    }
+}
+
+/// Merged active glossary terms ordered deterministically for STT hotwords and translation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergedGlossary {
+    terms: BTreeMap<String, String>,
+}
+
+impl MergedGlossary {
+    /// Creates a [`MergedGlossary`] from an explicit `BTreeMap` (dropping blank keys).
+    #[must_use]
+    pub fn new(terms: BTreeMap<String, String>) -> Self {
+        Self {
+            terms: terms
+                .into_iter()
+                .filter(|(k, _)| !k.trim().is_empty())
+                .collect(),
+        }
+    }
+
+    /// Merges all `profiles` matching `(src_lang, tgt_lang)` in slice order (later overrides earlier).
+    #[must_use]
+    pub fn from_profiles(
+        profiles: &[GlossaryProfile],
+        src_lang: &LanguageCode,
+        tgt_lang: &LanguageCode,
+    ) -> Self {
+        Self {
+            terms: GlossaryProfile::merge(profiles, src_lang, tgt_lang),
+        }
+    }
+
+    /// Merges profiles matching `enabled_profiles` in priority order (later overrides earlier)
+    /// and filtered by `(src_lang, tgt_lang)`.
+    #[must_use]
+    pub fn from_enabled_profiles(
+        profiles: &[GlossaryProfile],
+        enabled_profiles: &[String],
+        src_lang: &LanguageCode,
+        tgt_lang: &LanguageCode,
+    ) -> Self {
+        let mut merged = BTreeMap::new();
+        for name in enabled_profiles {
+            for profile in profiles
+                .iter()
+                .filter(|p| p.name == *name && p.matches_pair(src_lang, tgt_lang))
+            {
+                for (key, value) in &profile.terms {
+                    if !key.trim().is_empty() {
+                        merged.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        Self { terms: merged }
+    }
+
+    /// Returns the merged `source -> target` translation map.
+    #[must_use]
+    pub const fn terms(&self) -> &BTreeMap<String, String> {
+        &self.terms
+    }
+
+    /// Consumes this [`MergedGlossary`] and returns its inner `BTreeMap`.
+    #[must_use]
+    pub fn into_terms(self) -> BTreeMap<String, String> {
+        self.terms
+    }
+
+    /// Returns `true` if no glossary terms are present.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+
+    /// Returns the number of merged glossary entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.terms.len()
+    }
+
+    /// Extracts STT hotword keys verbatim from the merged glossary (preserving internal spaces
+    /// such as `"M W D"` for BPE/subword hotword biasing while skipping empty/whitespace-only keys).
+    #[must_use]
+    pub fn hotword_keys(&self) -> Vec<String> {
+        self.terms
+            .keys()
+            .filter(|key| !key.trim().is_empty())
+            .cloned()
+            .collect()
+    }
+
+    /// Builds an [`SttHotwordsConfig`] from [`Self::hotword_keys`].
+    #[must_use]
+    pub fn to_stt_hotwords_config(&self, hotwords_score: f32) -> SttHotwordsConfig {
+        let hotwords = self.hotword_keys();
+        let decoding_method = if hotwords.is_empty() {
+            SttDecodingMethod::GreedySearch
+        } else {
+            SttDecodingMethod::ModifiedBeamSearch
+        };
+        SttHotwordsConfig {
+            decoding_method,
+            hotwords_score,
+            hotwords,
+        }
+    }
+
+    /// Converts the terms into a list of [`GlossaryEntry`] values.
+    #[must_use]
+    pub fn entries(&self) -> Vec<GlossaryEntry> {
+        self.terms
+            .iter()
+            .map(|(term, translation)| GlossaryEntry {
+                term: term.clone(),
+                translation: translation.clone(),
+            })
+            .collect()
+    }
+}
+
+impl From<BTreeMap<String, String>> for MergedGlossary {
+    fn from(terms: BTreeMap<String, String>) -> Self {
+        Self::new(terms)
+    }
+}
+
+impl From<Vec<GlossaryEntry>> for MergedGlossary {
+    fn from(entries: Vec<GlossaryEntry>) -> Self {
+        let mut terms = BTreeMap::new();
+        for entry in entries {
+            if !entry.term.trim().is_empty() {
+                terms.insert(entry.term, entry.translation);
+            }
+        }
+        Self { terms }
+    }
+}
+
+impl From<MergedGlossary> for BTreeMap<String, String> {
+    fn from(glossary: MergedGlossary) -> Self {
+        glossary.terms
+    }
+}
+
+/// Persistent user configuration for custom glossary profile selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlossarySettings {
+    /// Enabled profile names in priority order (later overrides earlier).
+    #[serde(default)]
+    pub enabled_profiles: Vec<String>,
+    /// Optional custom directory containing `.toml` glossary profiles.
+    #[serde(default)]
+    pub glossary_dir: Option<String>,
+}
+
+/// Decoding strategy for streaming STT engines supporting hotwords.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SttDecodingMethod {
+    /// Greedy decoding (default when no hotwords are active).
+    #[default]
+    GreedySearch,
+    /// Modified beam search with contextual hotword biasing.
+    ModifiedBeamSearch,
+}
+
+/// Runtime hotword configuration forwarded to [`crate::domain::ports::SttEngine::update_hotwords`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SttHotwordsConfig {
+    /// Active decoding strategy (`ModifiedBeamSearch` when hotwords active, else `GreedySearch`).
+    pub decoding_method: SttDecodingMethod,
+    /// Contextual boosting score for hotwords (default `1.5`).
+    pub hotwords_score: f32,
+    /// Normalized hotword phrases passed to the STT recognizer.
+    #[serde(default)]
+    pub hotwords: Vec<String>,
+}
+
+impl Default for SttHotwordsConfig {
+    fn default() -> Self {
+        Self {
+            decoding_method: SttDecodingMethod::GreedySearch,
+            hotwords_score: DEFAULT_HOTWORDS_SCORE,
+            hotwords: Vec::new(),
+        }
+    }
+}
+
+impl SttHotwordsConfig {
+    /// Creates an [`SttHotwordsConfig`] choosing `ModifiedBeamSearch` if `hotwords` is non-empty,
+    /// or `GreedySearch` otherwise, with [`DEFAULT_HOTWORDS_SCORE`].
+    #[must_use]
+    pub fn from_hotwords(hotwords: Vec<String>) -> Self {
+        let decoding_method = if hotwords.is_empty() {
+            SttDecodingMethod::GreedySearch
+        } else {
+            SttDecodingMethod::ModifiedBeamSearch
+        };
+        Self {
+            decoding_method,
+            hotwords_score: DEFAULT_HOTWORDS_SCORE,
+            hotwords,
+        }
+    }
+}
+
 /// Context passed to a translator alongside the utterance to translate.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranslateContext {
     /// Recent conversation turns (`5..=10` typical, default 8).
+    #[serde(default)]
     pub recent_history: Vec<HistoryEntry>,
-    /// User-defined glossary mappings.
-    pub glossary: Vec<GlossaryEntry>,
+    /// Merged user-defined glossary mappings (`source term -> target translation`).
+    #[serde(default)]
+    pub glossary: BTreeMap<String, String>,
 }
 
 /// Request sent to a [`crate::domain::ports::Translator`] implementation.

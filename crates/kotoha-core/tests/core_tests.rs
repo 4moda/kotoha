@@ -7,9 +7,9 @@
     clippy::too_many_lines
 )]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::f32::consts::PI;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,10 +18,12 @@ use kotoha_core::application::{
     TranslatorManager,
 };
 use kotoha_core::domain::{
-    default_model_catalog, AudioChunk, AudioInputEvent, ComputeDevice, ContextWindow, CoreError,
-    GlossaryEntry, HistoryEntry, LanguageCode, PreFilter, SpeakerKey, SubtitleStage,
+    default_model_catalog, protect_terms, restore_terms, AudioChunk, AudioInputEvent,
+    ComputeDevice, ContextWindow, CoreError, GlossaryEntry, GlossaryPlaceholderGuard,
+    GlossaryProfile, GlossarySettings, HistoryEntry, LanguageCode, MergedGlossary, PreFilter,
+    SpeakerKey, SttDecodingMethod, SttEngine, SttHotwordsConfig, SttStream, SubtitleStage,
     TranslationProviderConfig, TranslationRequest, TranslationResult, Translator,
-    TranslatorFactory, UtteranceId,
+    TranslatorFactory, UtteranceId, DEFAULT_HOTWORDS_SCORE,
 };
 use kotoha_core::infrastructure::{
     connect_local_socket, AudioPreprocessor, CollectingSubtitleSink, DefaultTranslatorFactory,
@@ -93,9 +95,132 @@ fn domain_prefilter_and_context_window() {
 
     let snap = ctx.snapshot();
     assert_eq!(snap.glossary.len(), 1);
+    assert_eq!(
+        snap.glossary.get("GG").map(String::as_str),
+        Some("ナイスゲーム")
+    );
     assert_eq!(snap.recent_history.len(), 3);
     assert_eq!(snap.recent_history[0].original_text, "src-3");
     assert_eq!(snap.recent_history[2].original_text, "src-5");
+}
+
+#[test]
+fn domain_glossary_profile_merge_language_filter_and_hotword_keys() {
+    let en = LanguageCode::new("en").unwrap();
+    let ja = LanguageCode::new("ja").unwrap();
+    let ko = LanguageCode::new("ko").unwrap();
+
+    let base_profile = GlossaryProfile::new(
+        "general",
+        en.clone(),
+        ja.clone(),
+        BTreeMap::from([
+            ("GG".to_owned(), "ナイスゲーム".to_owned()),
+            ("M W D".to_owned(), "マイクロワープドライブ".to_owned()),
+            ("Ice Beam".to_owned(), "冷凍ビーム".to_owned()),
+        ]),
+    );
+    let game_override = GlossaryProfile::new(
+        "eve",
+        en.clone(),
+        ja.clone(),
+        BTreeMap::from([
+            ("GG".to_owned(), "お疲れ様".to_owned()),
+            ("Tackle".to_owned(), "タックル".to_owned()),
+        ]),
+    );
+    let wrong_lang = GlossaryProfile::new(
+        "eve-ko",
+        en.clone(),
+        ko,
+        BTreeMap::from([("Tackle".to_owned(), "다른".to_owned())]),
+    );
+
+    let profiles = vec![base_profile, game_override, wrong_lang];
+
+    // Direct merge by pair: later overrides earlier, mismatched language ignored
+    let raw_merged = GlossaryProfile::merge(&profiles, &en, &ja);
+    assert_eq!(raw_merged.get("GG").map(String::as_str), Some("お疲れ様"));
+    assert_eq!(
+        raw_merged.get("Tackle").map(String::as_str),
+        Some("タックル")
+    );
+    assert_eq!(raw_merged.len(), 4);
+
+    // Priority merge using GlossarySettings.enabled_profiles
+    let settings = GlossarySettings {
+        enabled_profiles: vec!["eve".to_owned(), "general".to_owned(), "eve-ko".to_owned()],
+        glossary_dir: None,
+    };
+    let merged =
+        MergedGlossary::from_enabled_profiles(&profiles, &settings.enabled_profiles, &en, &ja);
+    // "general" came after "eve" in enabled_profiles so "GG" reverts to general's translation
+    assert_eq!(
+        merged.terms().get("GG").map(String::as_str),
+        Some("ナイスゲーム")
+    );
+    assert_eq!(
+        merged.terms().get("Tackle").map(String::as_str),
+        Some("タックル")
+    );
+
+    // Raw keys including space-separated subword hints ("M W D") are preserved as-is for STT
+    let hotwords = merged.hotword_keys();
+    assert_eq!(
+        hotwords,
+        vec![
+            "GG".to_owned(),
+            "Ice Beam".to_owned(),
+            "M W D".to_owned(),
+            "Tackle".to_owned()
+        ]
+    );
+
+    let hw_cfg = merged.to_stt_hotwords_config(DEFAULT_HOTWORDS_SCORE);
+    assert_eq!(
+        hw_cfg.decoding_method,
+        SttDecodingMethod::ModifiedBeamSearch
+    );
+    assert!((hw_cfg.hotwords_score - 1.5).abs() < f32::EPSILON);
+    assert_eq!(hw_cfg.hotwords, hotwords);
+
+    let empty_cfg = MergedGlossary::default().to_stt_hotwords_config(DEFAULT_HOTWORDS_SCORE);
+    assert_eq!(empty_cfg.decoding_method, SttDecodingMethod::GreedySearch);
+    assert_eq!(empty_cfg.hotwords, Vec::<String>::new());
+}
+
+#[test]
+fn domain_glossary_placeholder_guard_longest_match_and_restore() {
+    let terms = BTreeMap::from([
+        ("Ice".to_owned(), "氷".to_owned()),
+        ("Ice Beam".to_owned(), "冷凍ビーム".to_owned()),
+        ("Beam".to_owned(), "光線".to_owned()),
+        ("MWD".to_owned(), "マイクロワープドライブ".to_owned()),
+    ]);
+
+    let input = "Use Ice Beam then MWD and Ice Beam again, not Ice!";
+    let (protected, guard) = protect_terms(input, &terms);
+    assert_eq!(
+        protected,
+        "Use __TERM_0__ then __TERM_1__ and __TERM_0__ again, not __TERM_2__!"
+    );
+    assert_eq!(guard.len(), 3);
+
+    // Simulate NMT translating surrounding words while keeping placeholders intact
+    let translated_with_placeholders =
+        "__TERM_0__ を使ってから __TERM_1__ と __TERM_0__ を再び、__TERM_2__ ではなく！";
+    let restored = restore_terms(translated_with_placeholders, &guard);
+    assert_eq!(
+        restored,
+        "冷凍ビーム を使ってから マイクロワープドライブ と 冷凍ビーム を再び、氷 ではなく！"
+    );
+
+    // Also test direct guard API with empty matches
+    let (untouched, empty_guard) =
+        GlossaryPlaceholderGuard::protect("nothing matches here", &terms);
+    assert_eq!(untouched, "nothing matches here");
+    assert!(empty_guard.is_empty());
+    assert_eq!(empty_guard.restore("そのまま"), "そのまま");
 }
 
 #[test]
@@ -656,4 +781,157 @@ async fn ipc_server_rejects_non_hello_first_frame_and_malformed_bytes() {
 
     let _ = shutdown_tx.send(true);
     server_task.await.expect("server join").expect("server ok");
+}
+
+struct HotwordTrackingSttEngine {
+    inner: MockSttEngine,
+    hotword_updates: Arc<StdMutex<Vec<SttHotwordsConfig>>>,
+}
+
+impl HotwordTrackingSttEngine {
+    fn new() -> Self {
+        Self {
+            inner: MockSttEngine::new(0.01, 1),
+            hotword_updates: Arc::new(StdMutex::new(Vec::new())),
+        }
+    }
+}
+
+impl SttEngine for HotwordTrackingSttEngine {
+    fn name(&self) -> &'static str {
+        "hotword-tracking-mock"
+    }
+
+    fn hotwords_supported(&self) -> bool {
+        true
+    }
+
+    fn update_hotwords(&self, config: &SttHotwordsConfig) -> Result<(), CoreError> {
+        self.hotword_updates
+            .lock()
+            .expect("lock")
+            .push(config.clone());
+        Ok(())
+    }
+
+    fn create_stream(
+        &self,
+        speaker_key: SpeakerKey,
+        src_lang: &LanguageCode,
+    ) -> Result<Box<dyn SttStream>, CoreError> {
+        self.inner.create_stream(speaker_key, src_lang)
+    }
+}
+
+struct CapturingTranslator {
+    captured_requests: Arc<StdMutex<Vec<TranslationRequest>>>,
+}
+
+#[async_trait]
+impl Translator for CapturingTranslator {
+    fn provider_id(&self) -> &'static str {
+        "capturing-mock"
+    }
+
+    async fn translate(&self, req: TranslationRequest) -> Result<TranslationResult, CoreError> {
+        self.captured_requests
+            .lock()
+            .expect("lock")
+            .push(req.clone());
+        Ok(TranslationResult {
+            utterance_id: req.utterance_id,
+            original_text: req.text.clone(),
+            translated_text: format!("[ja] {}", req.text),
+            provider_id: "capturing-mock".to_owned(),
+            latency_ms: 0,
+        })
+    }
+}
+
+#[tokio::test]
+async fn pipeline_passes_active_glossary_to_translation_context_and_stt_hotwords() {
+    let stt = Arc::new(HotwordTrackingSttEngine::new());
+    let captured_requests = Arc::new(StdMutex::new(Vec::new()));
+    let translator = Arc::new(CapturingTranslator {
+        captured_requests: Arc::clone(&captured_requests),
+    });
+    let translator_mgr = Arc::new(TranslatorManager::new(
+        translator,
+        TranslationProviderConfig::Mock {
+            prefix: "[ja] ".to_owned(),
+        },
+    ));
+    let sink = Arc::new(CollectingSubtitleSink::new());
+    let resample_fn = Arc::new(AudioPreprocessor::process_chunk);
+
+    let mut pipeline = PipelineService::new(
+        PipelineConfig::new(
+            LanguageCode::new("en").unwrap(),
+            LanguageCode::new("ja").unwrap(),
+        ),
+        stt.clone(),
+        translator_mgr,
+        sink,
+        resample_fn,
+    );
+
+    let merged = MergedGlossary::new(BTreeMap::from([
+        ("M W D".to_owned(), "マイクロワープドライブ".to_owned()),
+        ("Tackle".to_owned(), "タックル".to_owned()),
+    ]));
+    pipeline
+        .set_glossary(merged.clone())
+        .await
+        .expect("set_glossary");
+
+    // Verify STT engine received raw hotword keys verbatim with ModifiedBeamSearch
+    {
+        let updates = stt.hotword_updates.lock().expect("lock");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].decoding_method,
+            SttDecodingMethod::ModifiedBeamSearch
+        );
+        assert_eq!(
+            updates[0].hotwords,
+            vec!["M W D".to_owned(), "Tackle".to_owned()]
+        );
+    }
+
+    // Drive an audio frame through the pipeline and verify TranslationRequest.context.glossary
+    let mut tasks = tokio::task::JoinSet::new();
+    pipeline
+        .process_event(
+            AudioInputEvent::SourceConnected {
+                conn_id: 1,
+                source: "mumble".to_owned(),
+                plugin_version: "0.1.0".to_owned(),
+            },
+            &mut tasks,
+        )
+        .await
+        .expect("connect");
+
+    pipeline
+        .process_event(
+            AudioInputEvent::AudioFrame(AudioChunk {
+                speaker_key: SpeakerKey::new("mumble", 5),
+                seq: 0,
+                sample_rate: 16_000,
+                channels: 1,
+                is_local_user: false,
+                samples: vec![0.2; 320],
+            }),
+            &mut tasks,
+        )
+        .await
+        .expect("audio frame");
+
+    while let Some(res) = tasks.join_next().await {
+        res.expect("task join").expect("task ok");
+    }
+
+    let reqs = captured_requests.lock().expect("lock");
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(&reqs[0].context.glossary, merged.terms());
 }

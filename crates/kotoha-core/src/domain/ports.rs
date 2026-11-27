@@ -5,8 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::domain::entities::{
-    LanguageCode, SpeakerKey, SubtitleEntry, TranscriptEvent, TranslationProviderConfig,
-    TranslationRequest, TranslationResult,
+    LanguageCode, SpeakerKey, SttHotwordsConfig, SubtitleEntry, TranscriptEvent,
+    TranslationProviderConfig, TranslationRequest, TranslationResult,
 };
 use crate::domain::error::CoreError;
 
@@ -27,6 +27,16 @@ pub trait SttStream: Send {
 pub trait SttEngine: Send + Sync {
     /// Engine name identifier (e.g., `"mock-stt"`, `"sherpa-onnx"`).
     fn name(&self) -> &str;
+
+    /// Returns `true` if this engine supports contextual STT hotword biasing.
+    fn hotwords_supported(&self) -> bool {
+        false
+    }
+
+    /// Hot-reloads contextual STT hotwords for subsequent streams (no-op by default).
+    fn update_hotwords(&self, _config: &SttHotwordsConfig) -> Result<(), CoreError> {
+        Ok(())
+    }
 
     /// Creates a new independent stream bound to `speaker_key` and `src_lang`.
     fn create_stream(
