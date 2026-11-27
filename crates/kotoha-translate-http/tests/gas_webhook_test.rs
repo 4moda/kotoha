@@ -131,11 +131,9 @@ async fn gas_webhook_redirect_limit_is_per_request_not_per_client() {
     .unwrap();
 
     for call in 0..12 {
-        let translation = gas
-            .translate(sample_request("Ferox with M W D"))
-            .await
-            .unwrap_or_else(|err| panic!("call {call} must succeed: {err:?}"));
-        assert_eq!(translation.translated_text, "GAS: Ferox と MWD");
+        let result = gas.translate(sample_request("Ferox with M W D")).await;
+        assert!(result.is_ok(), "call {call} must succeed: {result:?}");
+        assert_eq!(result.unwrap().translated_text, "GAS: Ferox と MWD");
     }
     assert_eq!(server.requests().len(), 24);
 }
