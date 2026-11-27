@@ -1,0 +1,231 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-artifacts:
+    name: Build & Verify (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            archive_ext: tar.gz
+            plugin_relpath: plugins/build/mumble/libkotoha_mumble.so
+            monitor_relpath: target/release/kotoha-ipc-monitor
+          - os: macos-latest
+            target: macos-arm64
+            archive_ext: tar.gz
+            plugin_relpath: plugins/build/mumble/libkotoha_mumble.dylib
+            monitor_relpath: target/release/kotoha-ipc-monitor
+          - os: windows-latest
+            target: windows-x86_64
+            archive_ext: zip
+            plugin_relpath: plugins/build/mumble/Release/kotoha_mumble.dll
+            monitor_relpath: target/release/kotoha-ipc-monitor.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: meta
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+
+          tag = os.environ.get("INPUT_TAG", "").strip()
+          if not tag:
+              ref_name = os.environ.get("GITHUB_REF_NAME", "").strip()
+              tag = ref_name
+          if not tag:
+              raise SystemExit("Unable to resolve release tag")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"tag={tag}\n")
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Configure C++ plugins (CMake Release)
+        run: cmake -S plugins -B plugins/build -DCMAKE_BUILD_TYPE=Release -DKOTOHA_WARNINGS_AS_ERRORS=ON
+
+      - name: Build C++ plugins (Release)
+        run: cmake --build plugins/build --config Release --parallel
+
+      - name: Run C++ unit & ABI tests (CTest gate)
+        run: ctest --test-dir plugins/build -C Release --output-on-failure
+
+      - name: Run Rust workspace tests (unit gate)
+        run: cargo test --workspace
+
+      - name: Build Rust IPC monitor (Release)
+        run: cargo build --release --bin kotoha-ipc-monitor
+
+      - name: Run Cross-Language IPC E2E gate (C++ <-> Rust)
+        run: python tests/e2e/run_ipc_e2e.py
+
+      # Phase 3 hook:
+      # Once app/src-tauri is introduced:
+      # 1. Copy the built kotoha_mumble shared library into app/src-tauri/resources/ (or embed via include_bytes!).
+      # 2. Setup Node.js 22 and run `npm ci && npm run build` inside app/ui.
+      # 3. Run `tauri-apps/tauri-action@v0` to produce .msi / .dmg / .AppImage / .deb bundles
+      #    (with optional Windows/macOS code signing & latest.json generation in Phase 4).
+
+      - name: Package release archive and SHA-256 checksum
+        shell: python
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          TARGET_NAME: ${{ matrix.target }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+          PLUGIN_RELPATH: ${{ matrix.plugin_relpath }}
+          MONITOR_RELPATH: ${{ matrix.monitor_relpath }}
+        run: |
+          import hashlib
+          import os
+          import shutil
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          target = os.environ["TARGET_NAME"]
+          archive_ext = os.environ["ARCHIVE_EXT"]
+          plugin_path = Path(os.environ["PLUGIN_RELPATH"])
+          monitor_path = Path(os.environ["MONITOR_RELPATH"])
+
+          for p in (plugin_path, monitor_path):
+              if not p.is_file():
+                  raise FileNotFoundError(f"Expected built release binary not found: {p}")
+
+          dist_dir = Path("dist")
+          stage_dir = dist_dir / f"kotoha-{tag}-{target}"
+          stage_dir.mkdir(parents=True, exist_ok=True)
+
+          (stage_dir / "plugin").mkdir(exist_ok=True)
+          shutil.copy2(plugin_path, stage_dir / "plugin" / plugin_path.name)
+          shutil.copy2(monitor_path, stage_dir / monitor_path.name)
+          shutil.copy2(Path("LICENSE"), stage_dir / "LICENSE")
+          shutil.copy2(Path("README.md"), stage_dir / "README.md")
+          shutil.copy2(
+              Path("plugins/mumble/third_party/mumble/LICENSE"),
+              stage_dir / "LICENSE-MUMBLE-API",
+          )
+
+          archive_name = f"kotoha-{tag}-{target}.{archive_ext}"
+          archive_path = dist_dir / archive_name
+
+          if archive_ext == "tar.gz":
+              with tarfile.open(archive_path, "w:gz") as tf:
+                  tf.add(stage_dir, arcname=stage_dir.name)
+          elif archive_ext == "zip":
+              with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                  for item in sorted(stage_dir.rglob("*")):
+                      if item.is_file():
+                          zf.write(item, arcname=str(Path(stage_dir.name) / item.relative_to(stage_dir)))
+          else:
+              raise ValueError(f"Unsupported archive extension: {archive_ext}")
+
+          digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+          checksum_file = dist_dir / f"SHA256SUMS-{target}.txt"
+          checksum_file.write_text(f"{digest}  {archive_name}\n", encoding="utf-8")
+          print(f"Packaged {archive_path} (sha256={digest})")
+
+      - name: Upload packaged release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/kotoha-*.tar.gz
+            dist/kotoha-*.zip
+            dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: meta
+        shell: python
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          import os
+          tag = os.environ.get("INPUT_TAG", "").strip() or os.environ.get("GITHUB_REF_NAME", "").strip()
+          if not tag:
+              raise SystemExit("Unable to resolve release tag")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"tag={tag}\n")
+
+      - name: Download all OS build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Merge SHA256SUMS.txt and verify digests
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          cat SHA256SUMS-*.txt | sort -k2 > SHA256SUMS.txt
+          rm -f SHA256SUMS-*.txt
+          sha256sum -c SHA256SUMS.txt
+          ls -lh
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Kotoha ${{ steps.meta.outputs.tag }}
+          generate_notes: true
+          files: |
+            release-artifacts/kotoha-*.tar.gz
+            release-artifacts/kotoha-*.zip
+            release-artifacts/SHA256SUMS.txt

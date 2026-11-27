@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-lint:
+    name: Rust Lint (fmt & clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-lint-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  cpp-lint:
+    name: C++ Lint (clang-format & clang-tidy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install LLVM tooling (clang-format, clang-tidy)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-format clang-tidy cmake ninja-build
+
+      - name: Check C++ formatting (clang-format)
+        run: |
+          find plugins \( -path 'plugins/build' -o -path 'plugins/mumble/third_party' \) -prune \
+            -o -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) -print0 \
+            | xargs -0 -r clang-format --dry-run --Werror
+
+      - name: Configure CMake for compile_commands.json
+        run: |
+          cmake -S plugins -B plugins/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DKOTOHA_WARNINGS_AS_ERRORS=ON
+
+      - name: Run clang-tidy on C++ sources
+        run: |
+          find plugins \( -path 'plugins/build' -o -path 'plugins/mumble/third_party' \) -prune \
+            -o -type f -name '*.cpp' -print0 \
+            | xargs -0 -r clang-tidy -p plugins/build --warnings-as-errors='*'
+
+  ui-ci:
+    name: UI Lint, Typecheck, Unit & Playwright E2E
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app/ui
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/ui/package-lock.json
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: TypeScript typecheck
+        run: npm run typecheck
+
+      - name: Unit tests (Vitest)
+        run: npm run test
+
+      - name: Production build
+        run: npm run build
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser E2E tests (Playwright)
+        run: npm run test:e2e
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            app/ui/playwright-report/
+            app/ui/test-results/
+          retention-days: 7
+
+  matrix-build-test-e2e:
+    name: Build, Unit Tests & Cross-Language E2E (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-e2e-
+
+      - name: Configure C++ plugins (CMake)
+        run: cmake -S plugins -B plugins/build -DCMAKE_BUILD_TYPE=Release -DKOTOHA_WARNINGS_AS_ERRORS=ON
+
+      - name: Build C++ plugins
+        run: cmake --build plugins/build --config Release --parallel
+
+      - name: Run C++ unit & ABI tests (CTest)
+        run: ctest --test-dir plugins/build -C Release --output-on-failure
+
+      - name: Run Rust workspace tests
+        run: cargo test --workspace
+
+      - name: Build Rust IPC monitor (Release)
+        run: cargo build --release --bin kotoha-ipc-monitor
+
+      - name: Run Cross-Language IPC E2E suite (C++ <-> Rust)
+        run: python tests/e2e/run_ipc_e2e.py
