@@ -38,10 +38,9 @@
 
 - [`DESIGN.md`](./DESIGN.md) — 全体設計書・IPC プロトコル v1 バイナリ仕様（Single Source of Truth）
 - `plugins/` — C++20 プラグイン群（`common`, `mumble`, 将来 `ts3`）
-- `crates/` — Rust ワークスペース（`kotoha-protocol`, `kotoha-core` [`domain`/`application`/`infrastructure`], 将来 `kotoha-stt-sherpa` / `kotoha-translate-local` / `kotoha-translate-http`）
+- `crates/` — Rust ワークスペース（`kotoha-protocol`, `kotoha-core` [`domain`/`application`/`infrastructure`], `kotoha-stt-sherpa`, `kotoha-translate-local`, `kotoha-translate-http`, `kotoha-e2e` [クロス言語 C++ ↔ Rust IPC & 実音声 E2E スイート]）
 - `app/ui/` — React + TypeScript + Vite フロントエンド
 - `app/src-tauri/` — Tauri v2 デスクトップ統合
-- `tests/e2e/` — クロス言語（C++ プラグイン ↔ Rust IPC サーバー）E2E テストスイート
 - `.github/workflows/` — Windows / macOS / Linux 3OS CI & リリースワークフロー
 
 ---
@@ -62,12 +61,22 @@ ctest --test-dir plugins/build --output-on-failure -C Release
 find plugins \( -path 'plugins/build' -o -path 'plugins/mumble/third_party' \) -prune -o -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) -print0 | xargs -0 -r clang-format --dry-run --Werror
 ```
 
-### Rust コア (`crates/`)
+### Rust コア & クロス言語 E2E (`crates/`)
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Rust 単体テスト & クロス言語 IPC E2E (`ipc_single_source`, `ipc_multi_source`)
+# ※ 先に C++ `plugins/` と `cargo build --release --bin kotoha-ipc-monitor` をビルドしてください
+cargo nextest run --workspace
+# （または cargo test --workspace）
+
+# 実音声 E2E (`C++ kotoha_mock_client --wav` -> OS IPC -> sherpa-onnx Zipformer STT -> HTTP 翻訳)
+KOTOHA_E2E_MODEL_DIR=/path/to/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17-mobile \
+  SHERPA_ONNX_LIB_DIR=/path/to/sherpa-onnx-v2.0.3-linux-x64-static-lib/lib \
+  cargo test -p kotoha-e2e --features real-audio-e2e --test real_audio_pipeline -- --nocapture
+# （cargo-nextest 使用時: cargo nextest run -p kotoha-e2e --features real-audio-e2e --test real_audio_pipeline --no-capture）
 ```
 
 ### UI フロントエンド (`app/ui/`)
