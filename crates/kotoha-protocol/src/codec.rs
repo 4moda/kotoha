@@ -618,7 +618,7 @@ fn decode_audio_frame_payload(payload: &[u8]) -> Result<Message, ProtocolError> 
 
     let pcm_bytes = &payload[AUDIO_FRAME_HEADER_LEN..];
     let frame_stride = 4 * usize::from(channels);
-    if pcm_bytes.len() % frame_stride != 0 {
+    if !pcm_bytes.len().is_multiple_of(frame_stride) {
         return Err(ProtocolError::InvalidPayloadLength {
             message: "AudioFrame",
             detail: format!(

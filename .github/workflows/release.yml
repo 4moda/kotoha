@@ -72,7 +72,9 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest

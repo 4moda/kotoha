@@ -250,13 +250,13 @@ impl GlossaryPlaceholderGuard {
 
     /// Returns the number of distinct matched terms guarded by this instance.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.replacements.len()
     }
 
     /// Returns `true` if no glossary terms matched during [`Self::protect`].
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.replacements.is_empty()
     }
 }

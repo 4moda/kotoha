@@ -244,7 +244,7 @@ fn join_unix_socket_path(dir: &str) -> String {
     }
 }
 
-fn strip_ascii_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+const fn strip_ascii_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     if value.len() < prefix.len() || !value.is_char_boundary(prefix.len()) {
         return None;
     }
