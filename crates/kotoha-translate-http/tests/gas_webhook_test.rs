@@ -110,3 +110,86 @@ async fn gas_webhook_follows_302_redirect_handles_auto_and_blocks_ssrf_redirects
         .expect_err("link-local redirect must be blocked");
     assert!(matches!(ssrf_err, CoreError::Translation(_)));
 }
+
+#[tokio::test]
+async fn gas_webhook_redirect_limit_is_per_request_not_per_client() {
+    // Google Apps Script answers every POST with a 302; the hop budget must reset per request.
+    let server = MockHttpServer::start(|req| match (req.method.as_str(), req.target.as_str()) {
+        ("POST", "/macros/s/abc/exec") => ScriptedHttpResponse::redirect_302("/final".to_owned()),
+        ("GET", "/final") => ScriptedHttpResponse::json_ok(
+            serde_json::json!({ "translatedText": "GAS: __TERM_0__ と __TERM_1__" }).to_string(),
+        ),
+        _ => ScriptedHttpResponse::json_status("404 Not Found", "{}"),
+    })
+    .await;
+
+    let gas = GasWebhookTranslator::new(&GasWebhookConfig {
+        endpoint_url: format!("{}/macros/s/abc/exec", server.base_url),
+        bearer_token: None,
+        timeout_ms: 5_000,
+    })
+    .unwrap();
+
+    for call in 0..12 {
+        let result = gas.translate(sample_request("Ferox with M W D")).await;
+        assert!(result.is_ok(), "call {call} must succeed: {result:?}");
+        assert_eq!(result.unwrap().translated_text, "GAS: Ferox と MWD");
+    }
+    assert_eq!(server.requests().len(), 24);
+}
+
+#[tokio::test]
+async fn gas_webhook_rejects_more_than_max_redirects_within_a_single_request() {
+    let server = MockHttpServer::start(|req| {
+        let target = req.target.as_str();
+        match (req.method.as_str(), target) {
+            ("POST", "/macros/s/ok/exec") => {
+                ScriptedHttpResponse::redirect_302("/chain5/1".to_owned())
+            }
+            ("POST", "/macros/s/loop/exec") => {
+                ScriptedHttpResponse::redirect_302("/hop/1".to_owned())
+            }
+            ("GET", t) if t.starts_with("/chain5/") => {
+                let n: usize = t["/chain5/".len()..].parse().unwrap();
+                if n < 5 {
+                    ScriptedHttpResponse::redirect_302(format!("/chain5/{}", n + 1))
+                } else {
+                    ScriptedHttpResponse::json_ok(
+                        serde_json::json!({ "translatedText": "ok" }).to_string(),
+                    )
+                }
+            }
+            ("GET", t) if t.starts_with("/hop/") => {
+                let n: usize = t["/hop/".len()..].parse().unwrap();
+                ScriptedHttpResponse::redirect_302(format!("/hop/{}", n + 1))
+            }
+            _ => ScriptedHttpResponse::json_status("404 Not Found", "{}"),
+        }
+    })
+    .await;
+
+    let make = |path: &str| {
+        GasWebhookTranslator::new(&GasWebhookConfig {
+            endpoint_url: format!("{}{path}", server.base_url),
+            bearer_token: None,
+            timeout_ms: 5_000,
+        })
+        .unwrap()
+    };
+
+    // Exactly 5 redirects (the configured maximum) in a single request is still accepted.
+    make("/macros/s/ok/exec")
+        .translate(sample_request("Hello"))
+        .await
+        .expect("5 redirects in one request are allowed");
+
+    // An endless redirect chain is cut off after the limit.
+    let err = make("/macros/s/loop/exec")
+        .translate(sample_request("Hello"))
+        .await
+        .expect_err("redirect chain beyond max_hops must be rejected");
+    assert!(
+        matches!(err, CoreError::Translation(ref msg) if msg.contains("redirect blocked")),
+        "unexpected error: {err:?}"
+    );
+}
