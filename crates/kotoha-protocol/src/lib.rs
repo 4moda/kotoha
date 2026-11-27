@@ -14,8 +14,10 @@ pub use codec::{
     MIN_SAMPLE_RATE, PROTOCOL_MAGIC, PROTOCOL_VERSION,
 };
 pub use endpoint::{
-    extract_windows_pipe_name, resolve_endpoint, resolve_endpoint_with, resolve_windows_pipe_name,
-    TargetOs, DEFAULT_UNIX_FALLBACK_ENDPOINT, DEFAULT_UNIX_SOCKET_NAME, DEFAULT_WINDOWS_ENDPOINT,
-    DEFAULT_WINDOWS_PIPE_NAME, ENV_IPC_ENDPOINT, WINDOWS_PIPE_PREFIX,
+    current_euid, extract_windows_pipe_name, resolve_endpoint, resolve_endpoint_details,
+    resolve_endpoint_details_with, resolve_endpoint_with, resolve_windows_pipe_name, EndpointEnv,
+    ResolvedEndpoint, TargetOs, DEFAULT_UNIX_SOCKET_NAME, DEFAULT_UNIX_TMP_BASE,
+    DEFAULT_WINDOWS_ENDPOINT, DEFAULT_WINDOWS_PIPE_NAME, ENV_IPC_ENDPOINT, MAX_UNIX_ENDPOINT_LEN,
+    PRIVATE_DIR_PREFIX, WINDOWS_PIPE_PREFIX,
 };
 pub use error::ProtocolError;
