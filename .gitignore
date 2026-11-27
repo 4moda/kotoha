@@ -1,0 +1,62 @@
+# Rust / Cargo
+/target/
+**/target/
+Cargo.lock.bak
+**/*.rs.bk
+
+# C / C++ / CMake
+/build/
+**/build/
+**/cmake-build-*/
+.cache/
+compile_commands.json
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# Node / Vite / Playwright / Tauri UI
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+**/dist-ssr/
+.vite/
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+app/src-tauri/gen/
+app/src-tauri/target/
+
+# Downloaded models / runtime artifacts
+models/
+*.onnx
+models/**/*.bin
+*.gguf
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# IDEs & Editors
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
