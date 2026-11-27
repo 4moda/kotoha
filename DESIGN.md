@@ -415,7 +415,8 @@ pub struct SubtitleEntry {
     pub speaker_color: String,
     pub src_text: String,
     pub translated_text: Option<String>, // None while Partial/Final STT, Some after translation
-    pub is_final_stt: bool,
+    pub stage: SubtitleStage, // Interim / FinalPendingTranslation / Translated / TranslationFailed
+    pub failure_reason: Option<String>, // TranslationFailed 時のみ。固定の利用者向け文言（serde で None は省略）
     pub timestamp_ms: u64,
 }
 
@@ -504,6 +505,21 @@ pub trait GlossaryRepository: Send + Sync {
 3. **並列翻訳・順序保証 (`PipelineService`)**:
    - 翻訳処理は `tokio::sync::Semaphore` で同時実行数上限（例: 4）を制御しつつ非同期並列実行する。
    - UI への翻訳結果反映は `utterance_id` をキーとして紐付けるため、翻訳完了順が前後しても対応する字幕カードが正確に更新され、表示順序の破綻を防ぐ。
+   - **エラー方針（単一障害でパイプラインを止めない）**: Domain の純粋関数 `CoreError::scope() -> ErrorScope`（`Chunk < Utterance < Speaker < Fatal`）でエラーの影響範囲を分類し、呼び出し箇所ごとの上限（`ErrorScope::at_most`）で丸めた範囲だけを破棄して処理を継続する。`run()` を終了させるのは `Fatal`（パイプライン自身の不変条件違反。例: 翻訳 Semaphore の close）のみで、入力チャンネルの close は `Ok(())` での正常終了とする。
+
+     | 発生箇所 | 上限スコープ | 回復動作 |
+     |---|---|---|
+     | `ResampleFn`（不正チャンク） | `Chunk` | 当該チャンクを破棄 |
+     | `SttEngine::create_stream` / `SttStream::accept_audio` | `Speaker` | `Chunk` ならチャンクのみ破棄、それ以外は当該話者ストリームを破棄し次チャンクで再生成 |
+     | `SttStream::flush` | `Speaker` | 当該話者ストリームを破棄 |
+     | `Translator::translate`（エラー・panic とも） | `Utterance` | `SubtitleStage::TranslationFailed`（JSON: `"translation_failed"`、`failure_reason` に固定文言）を通知。Context Window には記録しない |
+     | `SubtitleSink::emit` / `clear_source` | `Utterance` | 当該更新のみ欠落（UI 未接続でも継続） |
+     | 翻訳タスクの `JoinError` | `Utterance` | 計上して継続 |
+
+     - `failure_reason` はアダプタのエラーメッセージ（プロバイダ応答本文を含み得る）を転送せず、`CoreError::translation_failure_reason()` の固定文言（例: `"translation provider error"`、panic 時は `"translation engine crashed"`）のみを UI へ渡す。
+     - ロギング依存（`tracing` / `log`）は現時点で導入せず、非致命エラーは `PipelineStats`（`translation_failures` / `stt_errors` / `stt_stream_resets` / `dropped_chunks` / `sink_errors` / `task_panics`）に計上する。`PipelineService::stats_handle()` で `run()` 実行中もロックフリーに参照できる。
+     - **リトライ / バックオフ**: パイプラインは翻訳を再試行しない（リアルタイム字幕では遅延した再試行より次の発話を優先する）。再試行が必要な場合は翻訳アダプタ（`kotoha-translate-http`）側の責務とする。
+     - 話者別 STT ワーカー・上限付き翻訳キューへの再構成（#27）後も、同じ `ErrorScope` 分類と `PipelineStatsHandle`（`Clone` 可能）を各ワーカーで共有する前提とする。
 4. **実行時ホットスワップ (`TranslatorManager` / `GlossaryManager`)**:
    - `TranslatorManager` は現在の `Arc<dyn Translator>` を `tokio::sync::RwLock`（または `arc_swap`）で保持し、ユーザーが設定画面でプロバイダや `ModelProfile` を切り替えても、進行中の IPC 接続や話者 STT ストリームを切断せずに即座に後続発話から新エンジンへ切り替えられる。
    - 用語辞書プロファイルや `hotwords_score` が更新された場合は、`GlossaryManager` がマージ済み `[terms]` を再計算し、以後の翻訳リクエストおよび STT ストリームへ即時反映する。
@@ -697,6 +713,7 @@ Kotoha は「ローカル NMT」を単一の固定モデルとして扱わず、
        - Phase A: `Partial STT`（認識中テキストを淡色・イタリック等で即座に表示）
        - Phase B: `Final STT`（確定原文へ更新）
        - Phase C: `Translated`（`utterance_id` 一致の訳文をメイン表示し、任意で原文を小さく併記）
+       - Phase C（失敗）: `TranslationFailed`（`stage == "translation_failed"`。確定原文を残したまま「翻訳失敗」と判別できる表示にし、`failure_reason` を任意で併記）
      - **話者カラー自動割当**: `SpeakerKey` のハッシュ等により視認性の高いパレットから自動割当。
      - **位置・サイズ変更**: 通常時は完全クリックスルー。システムトレイ（またはグローバルショートカット）から「位置ロック解除」すると一時的にドラッグ＆リサイズ可能になり、再ロックで即座にクリックスルーへ戻る。
   2. **システムトレイ (`System Tray`)**:

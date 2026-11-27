@@ -15,7 +15,7 @@ pub use entities::{
     TranslationProviderConfig, TranslationRequest, TranslationResult, UtteranceId,
     DEFAULT_HOTWORDS_SCORE,
 };
-pub use error::CoreError;
+pub use error::{CoreError, ErrorScope};
 pub use logic::{
     protect_terms, restore_terms, ContextWindow, GlossaryPlaceholderGuard, PreFilter,
     DEFAULT_CONTEXT_WINDOW_CAPACITY,
