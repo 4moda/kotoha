@@ -34,6 +34,11 @@ template <size_t MaxSlotSamples = kDefaultMaxAudioSlotSamples> struct AudioSlot 
     std::array<float, MaxSlotSamples> samples{};
 };
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)  // Intentional cache-line alignment padding for lock-free SPSC
+#endif
+
 template <size_t Capacity = kDefaultAudioRingCapacity,
           size_t MaxSlotSamples = kDefaultMaxAudioSlotSamples>
 class SpscAudioRingBuffer {
@@ -212,5 +217,9 @@ private:
     alignas(kCacheLineSize) std::atomic<uint32_t> next_seq_{0};
     alignas(kCacheLineSize) std::atomic<uint64_t> dropped_count_{0};
 };
+
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 }  // namespace kotoha::ipc
