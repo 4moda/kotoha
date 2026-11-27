@@ -228,6 +228,7 @@ fn event_names_and_dto_mappings_match_tauri_bridge_contract() {
         src_text: "Hello".to_owned(),
         translated_text: Some("こんにちは".to_owned()),
         stage: SubtitleStage::Translated,
+        failure_reason: None,
         timestamp_ms: 1_700_000_001_000,
     };
     let sub_json = serde_json::to_value(&subtitle).unwrap();
