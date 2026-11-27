@@ -192,9 +192,10 @@ impl Translator for MockTranslator {
     }
 }
 
-/// Phase 1 [`TranslatorFactory`] supporting [`TranslationProviderConfig::Mock`] and validating
-/// Phase 2 provider configurations with clear [`CoreError::NotConfigured`] /
-/// [`CoreError::UnsupportedInPhase1`] diagnostics.
+/// Phase 1 [`TranslatorFactory`] for mock translation.
+///
+/// Supports [`TranslationProviderConfig::Mock`] and validates Phase 2 provider configurations
+/// with clear [`CoreError::NotConfigured`] / [`CoreError::UnsupportedInPhase1`] diagnostics.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultTranslatorFactory;
 

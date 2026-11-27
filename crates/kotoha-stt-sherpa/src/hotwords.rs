@@ -36,7 +36,7 @@ pub struct HotwordsSnapshot {
 impl HotwordsSnapshot {
     /// Returns `true` if no hotword phrases are active.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.phrases.is_empty()
     }
 }
@@ -170,7 +170,7 @@ impl TempFileGuard {
         Self { path, armed: true }
     }
 
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         self.armed = false;
     }
 }

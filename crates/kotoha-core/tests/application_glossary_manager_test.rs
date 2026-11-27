@@ -232,6 +232,7 @@ async fn glossary_manager_priority_merge_and_hot_reload_syncs_pipeline_and_stt()
                 "M W D".to_owned()
             ]
         );
+        drop(updates);
     }
 
     let _ = std::fs::remove_dir_all(&temp_dir);

@@ -272,6 +272,7 @@ async fn pipeline_passes_active_glossary_to_translation_context_and_stt_hotwords
             updates[0].hotwords,
             vec!["M W D".to_owned(), "Tackle".to_owned()]
         );
+        drop(updates);
     }
 
     // Drive an audio frame through the pipeline and verify TranslationRequest.context.glossary
@@ -313,6 +314,7 @@ async fn pipeline_passes_active_glossary_to_translation_context_and_stt_hotwords
     let reqs = captured_requests.lock().expect("lock");
     assert_eq!(reqs.len(), 1);
     assert_eq!(&reqs[0].context.glossary, merged.terms());
+    drop(reqs);
 }
 
 #[tokio::test]

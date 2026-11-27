@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/4moda/kotoha"
-rust-version = "1.82"
+rust-version = "1.97"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -542,7 +542,7 @@ impl SttHotwordsConfig {
     /// Creates an [`SttHotwordsConfig`] choosing `ModifiedBeamSearch` if `hotwords` is non-empty,
     /// or `GreedySearch` otherwise, with [`DEFAULT_HOTWORDS_SCORE`].
     #[must_use]
-    pub fn from_hotwords(hotwords: Vec<String>) -> Self {
+    pub const fn from_hotwords(hotwords: Vec<String>) -> Self {
         let decoding_method = if hotwords.is_empty() {
             SttDecodingMethod::GreedySearch
         } else {
