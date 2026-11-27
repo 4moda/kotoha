@@ -5,12 +5,11 @@ use std::process::ExitCode;
 use kotoha_core::application::{SeqStatus, SessionAction, SourceSessionManager};
 use kotoha_core::domain::AudioInputEvent;
 use kotoha_core::infrastructure::{AudioPreprocessor, IpcServerAdapter};
-use kotoha_protocol::resolve_endpoint;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 
 struct CliArgs {
-    endpoint: String,
+    endpoint: Option<String>,
     max_events: Option<usize>,
     json: bool,
 }
@@ -104,7 +103,7 @@ fn parse_args() -> Result<CliArgs, String> {
     }
 
     Ok(CliArgs {
-        endpoint: endpoint.unwrap_or_else(resolve_endpoint),
+        endpoint,
         max_events,
         json,
     })
@@ -124,7 +123,11 @@ async fn main() -> ExitCode {
         }
     };
 
-    let server = IpcServerAdapter::new(cli.endpoint.clone());
+    let server = cli
+        .endpoint
+        .clone()
+        .map_or_else(IpcServerAdapter::from_env, IpcServerAdapter::new);
+    let listening_on = server.endpoint().to_owned();
     let (event_tx, mut event_rx) = mpsc::channel::<AudioInputEvent>(256);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -133,12 +136,15 @@ async fn main() -> ExitCode {
         tokio::spawn(async move { server.run(event_tx, shutdown_rx, Some(ready_tx)).await });
 
     if ready_rx.await.is_err() {
-        eprintln!("IPC server failed before becoming ready");
+        match server_handle.await {
+            Ok(Err(err)) => eprintln!("IPC server failed before becoming ready: {err}"),
+            _ => eprintln!("IPC server failed before becoming ready"),
+        }
         return ExitCode::FAILURE;
     }
 
     if !cli.json {
-        eprintln!("kotoha-ipc-monitor listening on {}", cli.endpoint);
+        eprintln!("kotoha-ipc-monitor listening on {listening_on}");
     }
 
     let shutdown_ctrl = shutdown_tx.clone();
