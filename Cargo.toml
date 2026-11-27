@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/kotoha-protocol",
     "crates/kotoha-core",
+    "crates/kotoha-stt-sherpa",
 ]
 
 [workspace.package]
@@ -29,8 +30,10 @@ module_name_repetitions = "allow"
 [workspace.dependencies]
 async-trait = "0.1"
 interprocess = { version = "2.4", features = ["tokio"] }
+kotoha-core = { path = "crates/kotoha-core" }
 kotoha-protocol = { path = "crates/kotoha-protocol" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sherpa-onnx = "2.0.3"
 thiserror = "2.0"
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
