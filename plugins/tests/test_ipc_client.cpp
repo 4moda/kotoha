@@ -5,8 +5,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <variant>
@@ -45,6 +47,11 @@ void test_endpoint_resolution() {
     const std::string saved_xdg = old_xdg != nullptr ? old_xdg : "";
     const bool had_xdg = old_xdg != nullptr;
 
+    const char* old_tmpdir = std::getenv("TMPDIR");
+    const std::string saved_tmpdir = old_tmpdir != nullptr ? old_tmpdir : "";
+    const bool had_tmpdir = old_tmpdir != nullptr;
+    const std::string uid_str = std::to_string(static_cast<unsigned long>(::geteuid()));
+
     setenv("KOTOHA_IPC_ENDPOINT", "/tmp/env_override.sock", 1);
     setenv("XDG_RUNTIME_DIR", "/run/user/1000/", 1);
     CHECK(resolve_ipc_endpoint() == "/tmp/env_override.sock");
@@ -52,8 +59,19 @@ void test_endpoint_resolution() {
     unsetenv("KOTOHA_IPC_ENDPOINT");
     CHECK(resolve_ipc_endpoint() == "/run/user/1000/kotoha_v1.sock");
 
+    // No fallback directly inside world-writable /tmp: a per-user private dir is used instead.
     unsetenv("XDG_RUNTIME_DIR");
-    CHECK(resolve_ipc_endpoint() == "/tmp/kotoha_v1.sock");
+    unsetenv("TMPDIR");
+    CHECK(resolve_ipc_endpoint() == "/tmp/kotoha-" + uid_str + "/kotoha_v1.sock");
+
+    setenv("TMPDIR", "/var/folders/ab/cd/T/", 1);
+    CHECK(resolve_ipc_endpoint() == "/var/folders/ab/cd/T/kotoha-" + uid_str + "/kotoha_v1.sock");
+
+    if (had_tmpdir) {
+        setenv("TMPDIR", saved_tmpdir.c_str(), 1);
+    } else {
+        unsetenv("TMPDIR");
+    }
 
     if (had_ep) {
         setenv("KOTOHA_IPC_ENDPOINT", saved_ep.c_str(), 1);
@@ -71,7 +89,64 @@ void test_endpoint_resolution() {
 #endif
 }
 
+[[nodiscard]] std::vector<std::string> split_tabs(const std::string& line) {
+    std::vector<std::string> cols;
+    std::string col;
+    std::istringstream stream(line);
+    while (std::getline(stream, col, '\t')) {
+        cols.push_back(col);
+    }
+    return cols;
+}
+
+[[nodiscard]] std::string fixture_value(const std::string& col) {
+    return col == "-" ? std::string() : col;
+}
+
+/// Checks the C++ resolver against the fixture shared with the Rust resolver tests.
+void test_endpoint_resolution_parity_fixture() {
+    std::ifstream fixture(KOTOHA_ENDPOINT_FIXTURE);
+    CHECK(fixture.is_open());
+    std::string line;
+    size_t checked = 0;
+    while (std::getline(fixture, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.empty() || line.front() == '#') {
+            continue;
+        }
+        const auto cols = split_tabs(line);
+        CHECK(cols.size() == 6U);
+        PosixEndpointEnv env;
+        env.endpoint_override = fixture_value(cols[0]);
+        env.xdg_runtime_dir = fixture_value(cols[1]);
+        env.tmpdir = fixture_value(cols[2]);
+        env.euid = static_cast<uint32_t>(std::stoul(cols[3]));
+        const std::string actual = resolve_posix_ipc_endpoint(env);
+        if (actual != cols[4]) {
+            std::cerr << "parity mismatch: got '" << actual << "' expected '" << cols[4]
+                      << "' for line: " << line << '\n';
+        }
+        CHECK(actual == cols[4]);
+        ++checked;
+    }
+    CHECK(checked >= 10U);
+}
+
 #if !defined(_WIN32)
+void test_unix_peer_uid_check() {
+    std::array<int, 2> fds{-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds.data()) == 0);
+    const auto self = static_cast<uint32_t>(::geteuid());
+    CHECK(unix_peer_has_uid(fds[0], self));
+    CHECK(unix_peer_has_uid(fds[1], self));
+    CHECK(!unix_peer_has_uid(fds[0], self + 1U));
+    ::close(fds[0]);
+    ::close(fds[1]);
+    CHECK(!unix_peer_has_uid(-1, self));
+}
+
 class MockUdsServer {
 public:
     explicit MockUdsServer(std::string socket_path)
@@ -298,14 +373,83 @@ void test_ipc_client_flow_and_reconnect() {
         CHECK(audio_idx < reset_idx);
     }
 }
+/// A server listening as another uid (simulating a squatted endpoint) must never receive data:
+/// the client closes the connection after the peer-uid check and keeps reporting disconnected.
+/// Requires root (to listen() with a different effective uid); skipped otherwise.
+void test_client_rejects_server_of_other_uid() {
+    if (::geteuid() != 0) {
+        std::cout << "test_client_rejects_server_of_other_uid: skipped (requires root)\n";
+        return;
+    }
+    constexpr uid_t kOtherUid = 65534;
+    const std::string sock_path =
+        "/tmp/kotoha-test-foreign-" + std::to_string(static_cast<long>(::getpid())) + ".sock";
+    ::unlink(sock_path.c_str());
+
+    // SO_PEERCRED reports the credentials captured at listen() time, so create, bind and listen
+    // with a temporarily switched effective uid, then switch back before starting the client.
+    CHECK(::seteuid(kOtherUid) == 0);
+    const int listen_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, sock_path.data(), sock_path.size());
+    const bool bound =
+        listen_fd >= 0 &&
+        ::bind(listen_fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0 &&
+        ::listen(listen_fd, 8) == 0;
+    CHECK(::seteuid(0) == 0);
+    CHECK(bound);
+
+    IpcClientConfig cfg;
+    cfg.endpoint_override = sock_path;
+    cfg.reconnect_interval = std::chrono::milliseconds{20};
+    cfg.heartbeat_interval = std::chrono::milliseconds{20};
+    IpcClient client(cfg);
+    client.start();
+
+    size_t accepted = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{600};
+    while (std::chrono::steady_clock::now() < deadline) {
+        CHECK(!client.is_connected());
+        pollfd pfd{};
+        pfd.fd = listen_fd;
+        pfd.events = POLLIN;
+        if (::poll(&pfd, 1, 20) <= 0) {
+            continue;
+        }
+        const int conn = ::accept(listen_fd, nullptr, nullptr);
+        if (conn < 0) {
+            continue;
+        }
+        ++accepted;
+        // The client must have closed without sending anything (no Hello, no audio).
+        pollfd cpfd{};
+        cpfd.fd = conn;
+        cpfd.events = POLLIN;
+        CHECK(::poll(&cpfd, 1, 500) == 1);
+        std::array<uint8_t, 64> buf{};
+        CHECK(::recv(conn, buf.data(), buf.size(), 0) == 0);
+        ::close(conn);
+    }
+    CHECK(!client.is_connected());
+    client.stop();
+    // The worker retried on its reconnect interval rather than giving up after one attempt.
+    CHECK(accepted >= 2U);
+
+    ::close(listen_fd);
+    ::unlink(sock_path.c_str());
+}
 #endif
 
 }  // namespace
 
 int main() {
     test_endpoint_resolution();
+    test_endpoint_resolution_parity_fixture();
 #if !defined(_WIN32)
+    test_unix_peer_uid_check();
     test_ipc_client_flow_and_reconnect();
+    test_client_rejects_server_of_other_uid();
 #endif
     std::cout << "test_ipc_client: all assertions passed\n";
     return 0;
