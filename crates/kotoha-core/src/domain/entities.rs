@@ -611,6 +611,9 @@ pub enum SubtitleStage {
     FinalPendingTranslation,
     /// Phase C: translation completed and attached.
     Translated,
+    /// Phase C (failure): translation of this utterance failed; the card keeps its final STT
+    /// text and [`SubtitleEntry::failure_reason`] carries a short user-safe reason.
+    TranslationFailed,
 }
 
 /// Subtitle card payload emitted to [`crate::domain::ports::SubtitleSink`].
@@ -630,6 +633,10 @@ pub struct SubtitleEntry {
     pub translated_text: Option<String>,
     /// Current 3-stage lifecycle phase.
     pub stage: SubtitleStage,
+    /// Short user-safe reason when `stage` is [`SubtitleStage::TranslationFailed`] (never a raw
+    /// provider message). Omitted from JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
     /// Timestamp in milliseconds.
     pub timestamp_ms: u64,
 }

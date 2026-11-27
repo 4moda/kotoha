@@ -54,3 +54,85 @@ pub enum CoreError {
     #[error("pipeline channel closed: {0}")]
     ChannelClosed(&'static str),
 }
+
+/// Blast radius of a [`CoreError`] inside the streaming pipeline.
+///
+/// Variants are ordered from the narrowest to the widest scope, so `Ord` comparisons read as
+/// "is at least as severe as". The pipeline recovers from every scope except [`Self::Fatal`] by
+/// discarding only the affected unit of work and keeps processing other chunks, utterances, and
+/// speakers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ErrorScope {
+    /// Only the current audio chunk is unusable: drop it and keep the speaker's STT stream.
+    Chunk,
+    /// Only the current utterance (or a single subtitle update) failed, e.g. a translation
+    /// provider timeout or HTTP 429.
+    Utterance,
+    /// The speaker's STT stream is in an unknown state: drop it (it is recreated lazily).
+    Speaker,
+    /// The pipeline itself can no longer make progress (input transport failure or a broken
+    /// internal invariant): `PipelineService::run` stops and returns the error.
+    Fatal,
+}
+
+impl ErrorScope {
+    /// Narrows `self` so that it never exceeds `ceiling`.
+    ///
+    /// Call sites use this to bound what an adapter error may affect: for example, a failing
+    /// translator never takes down more than its own utterance, whatever variant it returns.
+    #[must_use]
+    pub fn at_most(self, ceiling: Self) -> Self {
+        self.min(ceiling)
+    }
+
+    /// Returns `true` for [`Self::Fatal`].
+    #[must_use]
+    pub const fn is_fatal(self) -> bool {
+        matches!(self, Self::Fatal)
+    }
+}
+
+impl CoreError {
+    /// Classifies the intrinsic blast radius of this error (pure, no I/O).
+    ///
+    /// The pipeline combines this with the call site through [`ErrorScope::at_most`] to pick the
+    /// recovery action.
+    #[must_use]
+    pub const fn scope(&self) -> ErrorScope {
+        match self {
+            Self::InvalidAudio(_) => ErrorScope::Chunk,
+            Self::InvalidLanguageCode(_)
+            | Self::Translation(_)
+            | Self::UnknownModelProfile(_)
+            | Self::NotConfigured(_)
+            | Self::UnsupportedInPhase1(_)
+            | Self::Glossary(_)
+            | Self::Sink(_) => ErrorScope::Utterance,
+            Self::Stt(_) => ErrorScope::Speaker,
+            Self::Protocol(_) | Self::Ipc(_) | Self::ChannelClosed(_) => ErrorScope::Fatal,
+        }
+    }
+
+    /// Short, user-safe reason for a failed translation, suitable for a subtitle card.
+    ///
+    /// Returns a fixed phrase per variant instead of the error message: adapter messages can
+    /// embed provider response bodies, so they are never forwarded to the UI.
+    #[must_use]
+    pub const fn translation_failure_reason(&self) -> &'static str {
+        match self {
+            Self::Translation(_) => "translation provider error",
+            Self::NotConfigured(_) => "translation provider not configured",
+            Self::UnknownModelProfile(_) | Self::UnsupportedInPhase1(_) => {
+                "translation provider unavailable"
+            }
+            Self::InvalidLanguageCode(_) => "language pair not supported",
+            Self::Glossary(_) => "glossary error",
+            Self::InvalidAudio(_)
+            | Self::Protocol(_)
+            | Self::Ipc(_)
+            | Self::Stt(_)
+            | Self::Sink(_)
+            | Self::ChannelClosed(_) => "internal error",
+        }
+    }
+}

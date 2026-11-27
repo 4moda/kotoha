@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, HashSet};
 
 use kotoha_core::domain::{
     default_model_catalog, GlossaryProfile, GlossarySettings, LanguageCode, MergedGlossary,
-    SpeakerKey, SttDecodingMethod, DEFAULT_HOTWORDS_SCORE,
+    SpeakerKey, SttDecodingMethod, SubtitleEntry, SubtitleStage, UtteranceId,
+    DEFAULT_HOTWORDS_SCORE,
 };
 
 #[test]
@@ -128,4 +129,33 @@ fn domain_model_catalog_contains_design_profiles() {
     assert!(ids.contains("opus-mt-en-ja-int8"));
     assert!(ids.contains("nllb-200-distilled-600m-int8"));
     assert!(ids.contains("nllb-200-1.3b-fp16"));
+}
+
+#[test]
+fn domain_subtitle_entry_serializes_translation_failed_stage_and_reason() {
+    let mut entry = SubtitleEntry {
+        utterance_id: UtteranceId(7),
+        speaker_key: SpeakerKey::new("mumble", 1),
+        speaker_name: "Alice".to_owned(),
+        speaker_color: "#112233".to_owned(),
+        src_text: "hello".to_owned(),
+        translated_text: None,
+        stage: SubtitleStage::TranslationFailed,
+        failure_reason: Some("translation provider error".to_owned()),
+        timestamp_ms: 1,
+    };
+    let json = serde_json::to_value(&entry).unwrap();
+    assert_eq!(json["stage"], "translation_failed");
+    assert_eq!(json["failure_reason"], "translation provider error");
+
+    entry.stage = SubtitleStage::Translated;
+    entry.failure_reason = None;
+    let json = serde_json::to_value(&entry).unwrap();
+    assert_eq!(json["stage"], "translated");
+    assert!(
+        json.get("failure_reason").is_none(),
+        "omitted when there is no failure"
+    );
+    let back: SubtitleEntry = serde_json::from_value(json).unwrap();
+    assert_eq!(back, entry);
 }
