@@ -60,3 +60,6 @@ models/**/*.bin
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# TypeScript incremental build info
+*.tsbuildinfo
