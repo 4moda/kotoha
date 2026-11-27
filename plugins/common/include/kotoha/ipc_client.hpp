@@ -20,7 +20,7 @@ namespace kotoha::ipc {
 struct IpcClientConfig {
     std::string app_name = "mumble";
     std::string plugin_version = "0.1.0";
-    std::string endpoint_override{};
+    std::string endpoint_override;
     std::chrono::milliseconds reconnect_interval{1000};
     std::chrono::milliseconds heartbeat_interval{1000};
     std::chrono::milliseconds idle_poll_interval{3};
@@ -93,24 +93,22 @@ private:
     bool write_encoded_frame(std::span<const uint8_t> frame_bytes,
                              std::chrono::milliseconds timeout);
 
+    SpscAudioRingBuffer<kDefaultAudioRingCapacity, kDefaultMaxAudioSlotSamples> audio_ring_;
     IpcClientConfig config_;
     std::string endpoint_;
-
-    SpscAudioRingBuffer<kDefaultAudioRingCapacity, kDefaultMaxAudioSlotSamples> audio_ring_;
-    std::array<uint8_t, kMaxFrameSize> tx_buffer_{};
-
-    std::mutex control_mutex_;
+    std::mutex lifecycle_mutex_;
+    mutable std::mutex control_mutex_;
     std::condition_variable control_cv_;
-    std::deque<ControlEvent> non_destructive_queue_;
-    std::deque<ControlEvent> destructive_queue_;
+    std::condition_variable worker_done_cv_;
+    std::deque<ControlEvent> control_queue_;
+    std::unique_ptr<Transport> transport_;
+    std::thread worker_thread_;
     bool stop_requested_ = false;
-
+    bool worker_finished_ = true;
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
     std::atomic<bool> stop_signaled_{false};
-
-    std::unique_ptr<Transport> transport_;
-    std::thread worker_thread_;
+    std::array<uint8_t, kMaxFrameSize> tx_buffer_{};
 };
 
 }  // namespace kotoha::ipc

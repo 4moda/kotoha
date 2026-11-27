@@ -55,7 +55,8 @@ struct MockApiTracker {
 
     void* alloc_copy_cstr(const char* src) {
         const size_t len = std::strlen(src);
-        auto* buf = new char[len + 1];
+        auto* buf = static_cast<char*>(std::malloc(len + 1));
+        CHECK(buf != nullptr);
         std::memcpy(buf, src, len + 1);
         std::lock_guard<std::mutex> lock(mutex);
         live_allocations.insert(buf);
@@ -64,7 +65,9 @@ struct MockApiTracker {
     }
 
     mumble_userid_t* alloc_users(std::initializer_list<mumble_userid_t> ids) {
-        auto* buf = new mumble_userid_t[ids.size()];
+        auto* buf =
+            static_cast<mumble_userid_t*>(std::malloc(sizeof(mumble_userid_t) * ids.size()));
+        CHECK(buf != nullptr);
         size_t i = 0;
         for (const mumble_userid_t id : ids) {
             buf[i++] = id;
@@ -86,7 +89,7 @@ struct MockApiTracker {
         }
         live_allocations.erase(it);
         ++total_frees;
-        delete[] static_cast<const char*>(ptr);
+        std::free(const_cast<void*>(ptr));
         return true;
     }
 };

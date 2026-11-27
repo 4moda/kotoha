@@ -219,7 +219,7 @@ struct EncodeResult {
 
 struct DecodeResult {
     ProtocolError error = ProtocolError::Ok;
-    Message message{};
+    Message message;
     size_t bytes_consumed = 0;
 };
 

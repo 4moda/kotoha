@@ -9,8 +9,8 @@ import type {
 export const MODEL_CATALOG: readonly ModelProfile[] = [
   {
     model_id: 'fugumt-en-ja-int8',
-    display_name: 'FuguMT EN→JA (int8)',
-    backend: 'ctranslate2',
+    display_name: 'FuguMT EN->JA (CPU Fast INT8)',
+    backend: 'c_translate2',
     supported_langs: ['en->ja'],
     recommended_device: 'cpu',
     supported_devices: ['auto', 'cpu', 'cuda'],
@@ -25,8 +25,8 @@ export const MODEL_CATALOG: readonly ModelProfile[] = [
   },
   {
     model_id: 'opus-mt-en-ja-int8',
-    display_name: 'OPUS-MT EN→JA (int8)',
-    backend: 'ctranslate2',
+    display_name: 'OPUS-MT EN->JA (CPU Permissive INT8)',
+    backend: 'c_translate2',
     supported_langs: ['en->ja'],
     recommended_device: 'cpu',
     supported_devices: ['auto', 'cpu', 'cuda'],
@@ -41,8 +41,8 @@ export const MODEL_CATALOG: readonly ModelProfile[] = [
   },
   {
     model_id: 'nllb-200-distilled-600m-int8',
-    display_name: 'NLLB-200 Distilled 600M (int8)',
-    backend: 'ctranslate2',
+    display_name: 'NLLB-200 Distilled 600M (Multilingual INT8, Non-Commercial)',
+    backend: 'c_translate2',
     supported_langs: ['multilingual'],
     recommended_device: 'auto',
     supported_devices: ['auto', 'cpu', 'cuda'],
@@ -57,8 +57,8 @@ export const MODEL_CATALOG: readonly ModelProfile[] = [
   },
   {
     model_id: 'nllb-200-1.3b-fp16',
-    display_name: 'NLLB-200 1.3B (fp16)',
-    backend: 'ctranslate2',
+    display_name: 'NLLB-200 1.3B (High-Accuracy GPU FP16, Non-Commercial)',
+    backend: 'c_translate2',
     supported_langs: ['multilingual'],
     recommended_device: 'cuda',
     supported_devices: ['auto', 'cuda', 'cpu'],
@@ -106,7 +106,7 @@ export const PROVIDER_METADATA: ReadonlyArray<{
     type: 'deepl',
     label: 'DeepL API',
     badge: 'Cloud API',
-    description: 'Official DeepL Free or Pro API with optional formality preference.',
+    description: 'Official DeepL Free or Pro API.',
   },
   {
     type: 'google_cloud',
@@ -143,63 +143,88 @@ export function createDefaultProviderConfig(
         type: 'local_model',
         model_id: 'fugumt-en-ja-int8',
         device: 'auto',
-        compute_type: 'int8',
-        num_threads: 0,
+        threads: null,
       };
     case 'openai_compatible':
       return {
         type: 'openai_compatible',
         base_url: 'http://localhost:11434/v1',
         model: 'qwen2.5:7b',
-        api_key: '',
-        context_window: 8,
+        api_key: null,
+        timeout_ms: 15_000,
       };
     case 'deepl':
       return {
         type: 'deepl',
-        plan: 'free',
         api_key: '',
-        formality: 'default',
+        use_free_endpoint: true,
+        timeout_ms: 10_000,
       };
     case 'google_cloud':
       return {
         type: 'google_cloud',
-        api_version: 'v2',
-        project_id: '',
         api_key: '',
+        project_id: null,
+        timeout_ms: 10_000,
       };
     case 'gas_webhook':
       return {
         type: 'gas_webhook',
         endpoint_url: '',
-        bearer_token: '',
+        bearer_token: null,
+        timeout_ms: 10_000,
       };
     case 'mock':
       return {
         type: 'mock',
-        latency_ms: 40,
+        prefix: '[ja] ',
       };
   }
 }
 
-const SPEAKER_PALETTE = [
+export const SPEAKER_COLOR_PALETTE = [
   '#38BDF8', // sky
   '#34D399', // emerald
+  '#F472B6', // pink
   '#FBBF24', // amber
+  '#A78BFA', // violet
   '#FB7185', // rose
   '#2DD4BF', // teal
-  '#F97316', // orange
   '#60A5FA', // blue
-  '#A3E635', // lime
+  '#F97316', // orange
+  '#4ADE80', // green
+  '#E879F9', // fuchsia
+  '#FACC15', // yellow
 ] as const;
 
+const FNV1A_64_OFFSET_BASIS = 0xcbf29ce484222325n;
+const FNV1A_64_PRIME = 0x0100000001b3n;
+const UINT64_MASK = 0xffffffffffffffffn;
+const utf8Encoder = new TextEncoder();
+
+/**
+ * Computes the exact deterministic speaker color (`#RRGGBB`) matching
+ * `SpeakerKey::color_hex()` in `crates/kotoha-core/src/domain/entities.rs`.
+ */
 export function getDeterministicSpeakerColor(speakerKey: SpeakerKey): string {
-  let hash = 2166136261;
-  const input = `${speakerKey.source}:${speakerKey.user_id}`;
-  for (let i = 0; i < input.length; i += 1) {
-    hash ^= input.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
+  let hash = FNV1A_64_OFFSET_BASIS;
+  const sourceBytes = utf8Encoder.encode(speakerKey.source);
+
+  for (const byte of sourceBytes) {
+    hash ^= BigInt(byte);
+    hash = (hash * FNV1A_64_PRIME) & UINT64_MASK;
   }
-  const index = (hash >>> 0) % SPEAKER_PALETTE.length;
-  return SPEAKER_PALETTE[index] ?? SPEAKER_PALETTE[0];
+
+  hash ^= 0xffn;
+  hash = (hash * FNV1A_64_PRIME) & UINT64_MASK;
+
+  const userId = speakerKey.user_id >>> 0;
+  for (let shift = 0; shift < 32; shift += 8) {
+    const byte = (userId >>> shift) & 0xff;
+    hash ^= BigInt(byte);
+    hash = (hash * FNV1A_64_PRIME) & UINT64_MASK;
+  }
+
+  const index = Number(hash % BigInt(SPEAKER_COLOR_PALETTE.length));
+  return SPEAKER_COLOR_PALETTE[index] ?? SPEAKER_COLOR_PALETTE[0];
 }

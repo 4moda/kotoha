@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::application::session::{SessionAction, SourceSessionManager};
@@ -50,6 +50,11 @@ impl PipelineConfig {
     }
 }
 
+struct SourcePipelineState {
+    epoch: u64,
+    context: Arc<Mutex<ContextWindow>>,
+}
+
 /// Coordinates end-to-end audio-to-subtitle processing across multiple sources and speakers.
 pub struct PipelineService {
     config: PipelineConfig,
@@ -60,8 +65,8 @@ pub struct PipelineService {
     pre_filter: PreFilter,
     active_glossary: MergedGlossary,
     session_manager: SourceSessionManager,
-    speaker_streams: HashMap<SpeakerKey, Box<dyn SttStream>>,
-    source_contexts: HashMap<String, Arc<Mutex<ContextWindow>>>,
+    speaker_streams: HashMap<SpeakerKey, std::sync::Mutex<Box<dyn SttStream>>>,
+    source_states: Arc<RwLock<HashMap<String, SourcePipelineState>>>,
     translation_semaphore: Arc<Semaphore>,
     clock_ms: AtomicU64,
 }
@@ -87,7 +92,7 @@ impl PipelineService {
             active_glossary: MergedGlossary::default(),
             session_manager: SourceSessionManager::new(),
             speaker_streams: HashMap::new(),
-            source_contexts: HashMap::new(),
+            source_states: Arc::new(RwLock::new(HashMap::new())),
             translation_semaphore: Arc::new(Semaphore::new(concurrency)),
             clock_ms: AtomicU64::new(0),
         }
@@ -120,7 +125,11 @@ impl PipelineService {
         let hotwords_config = merged.to_stt_hotwords_config(hotwords_score);
         self.stt_engine.update_hotwords(&hotwords_config)?;
         self.active_glossary = merged.clone();
-        for ctx in self.source_contexts.values() {
+        let contexts: Vec<Arc<Mutex<ContextWindow>>> = {
+            let states = self.source_states.read().await;
+            states.values().map(|s| Arc::clone(&s.context)).collect()
+        };
+        for ctx in contexts {
             ctx.lock().await.set_glossary(merged.clone());
         }
         Ok(())
@@ -153,10 +162,14 @@ impl PipelineService {
             self.process_event(event, &mut translation_tasks).await?;
             // Reap completed translation tasks promptly without blocking ingestion.
             while let Some(res) = translation_tasks.try_join_next() {
-                if let Err(join_err) = res {
-                    return Err(CoreError::Translation(format!(
-                        "translation task panicked or was cancelled: {join_err}"
-                    )));
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => return Err(err),
+                    Err(join_err) => {
+                        return Err(CoreError::Translation(format!(
+                            "translation task panicked or was cancelled: {join_err}"
+                        )));
+                    }
                 }
             }
         }
@@ -198,9 +211,7 @@ impl PipelineService {
                     self.flush_and_drop_speaker(&key, now_ms, translation_tasks)
                         .await?;
                 }
-                if let Some(ctx) = self.source_contexts.get(&source) {
-                    ctx.lock().await.clear_history();
-                }
+                advance_source_epoch_and_clear(&self.source_states, &source).await;
                 self.subtitle_sink.clear_source(&source).await?;
             }
             SessionAction::Connected { .. }
@@ -208,19 +219,36 @@ impl PipelineService {
             | SessionAction::AudioSequenceChecked(_) => {}
         }
 
-        if let AudioInputEvent::AudioFrame(chunk) = event {
-            let samples_16k = (self.resample_fn)(&chunk)?;
-            if !samples_16k.is_empty() {
-                let stream = self.get_or_create_stream(&chunk.speaker_key)?;
-                let events = stream.accept_audio(&samples_16k, now_ms)?;
-                self.handle_transcript_events(events, translation_tasks)
-                    .await?;
+        if let AudioInputEvent::AudioFrame { conn_id, chunk } = event {
+            if self
+                .session_manager
+                .is_owner(conn_id, &chunk.speaker_key.source)
+            {
+                let samples_16k = (self.resample_fn)(&chunk)?;
+                if !samples_16k.is_empty() {
+                    let events = {
+                        let stream = self.get_or_create_stream(&chunk.speaker_key)?;
+                        stream.accept_audio(&samples_16k, now_ms)?
+                    };
+                    self.dispatch_transcript_events(events, translation_tasks)
+                        .await?;
+                }
             }
-        } else if let AudioInputEvent::TalkingStateChanged { speaker_key, state } = event {
-            if !state.is_speaking() {
-                if let Some(stream) = self.speaker_streams.get_mut(&speaker_key) {
-                    let events = stream.flush(now_ms)?;
-                    self.handle_transcript_events(events, translation_tasks)
+        } else if let AudioInputEvent::TalkingStateChanged {
+            conn_id,
+            speaker_key,
+            state,
+        } = event
+        {
+            if self.session_manager.is_owner(conn_id, &speaker_key.source) && !state.is_speaking() {
+                if let Some(stream_cell) = self.speaker_streams.get_mut(&speaker_key) {
+                    let events = stream_cell
+                        .get_mut()
+                        .map_err(|_| {
+                            CoreError::Stt("speaker STT stream mutex poisoned".to_owned())
+                        })?
+                        .flush(now_ms)?;
+                    self.dispatch_transcript_events(events, translation_tasks)
                         .await?;
                 }
             }
@@ -235,9 +263,12 @@ impl PipelineService {
         timestamp_ms: u64,
         translation_tasks: &mut JoinSet<Result<(), CoreError>>,
     ) -> Result<(), CoreError> {
-        if let Some(mut stream) = self.speaker_streams.remove(speaker_key) {
-            let events = stream.flush(timestamp_ms)?;
-            self.handle_transcript_events(events, translation_tasks)
+        if let Some(mut stream_cell) = self.speaker_streams.remove(speaker_key) {
+            let events = stream_cell
+                .get_mut()
+                .map_err(|_| CoreError::Stt("speaker STT stream mutex poisoned".to_owned()))?
+                .flush(timestamp_ms)?;
+            self.dispatch_transcript_events(events, translation_tasks)
                 .await?;
         }
         Ok(())
@@ -248,22 +279,28 @@ impl PipelineService {
         speaker_key: &SpeakerKey,
     ) -> Result<&mut Box<dyn SttStream>, CoreError> {
         use std::collections::hash_map::Entry;
-        match self.speaker_streams.entry(speaker_key.clone()) {
-            Entry::Occupied(entry) => Ok(entry.into_mut()),
+        let cell = match self.speaker_streams.entry(speaker_key.clone()) {
+            Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
                 let stream = self
                     .stt_engine
                     .create_stream(speaker_key.clone(), &self.config.src_lang)?;
-                Ok(entry.insert(stream))
+                entry.insert(std::sync::Mutex::new(stream))
             }
-        }
+        };
+        cell.get_mut()
+            .map_err(|_| CoreError::Stt("speaker STT stream mutex poisoned".to_owned()))
     }
 
-    async fn handle_transcript_events(
-        &mut self,
+    async fn dispatch_transcript_events(
+        &self,
         events: Vec<TranscriptEvent>,
         translation_tasks: &mut JoinSet<Result<(), CoreError>>,
     ) -> Result<(), CoreError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
         for event in events {
             let speaker_name = self
                 .session_manager
@@ -304,7 +341,13 @@ impl PipelineService {
                 continue;
             }
 
-            let ctx_arc = self.source_context(&event.speaker_key.source);
+            let (source_epoch, ctx_arc) = source_state(
+                &self.source_states,
+                &event.speaker_key.source,
+                self.config.context_window_capacity,
+                &self.active_glossary,
+            )
+            .await;
             let context_snapshot = ctx_arc.lock().await.snapshot();
 
             let req = TranslationRequest {
@@ -320,6 +363,7 @@ impl PipelineService {
             let semaphore = Arc::clone(&self.translation_semaphore);
             let translator_manager = Arc::clone(&self.translator_manager);
             let sink = Arc::clone(&self.subtitle_sink);
+            let source_states = Arc::clone(&self.source_states);
             let timestamp_ms = event.timestamp_ms;
 
             translation_tasks.spawn(async move {
@@ -328,7 +372,19 @@ impl PipelineService {
                     .await
                     .map_err(|_| CoreError::ChannelClosed("translation semaphore closed"))?;
 
+                if is_source_epoch_stale(&source_states, &req.speaker_key.source, source_epoch)
+                    .await
+                {
+                    return Ok(());
+                }
+
                 let result = translator_manager.translate(req.clone()).await?;
+
+                if is_source_epoch_stale(&source_states, &req.speaker_key.source, source_epoch)
+                    .await
+                {
+                    return Ok(());
+                }
 
                 {
                     let mut guard = ctx_arc.lock().await;
@@ -356,20 +412,6 @@ impl PipelineService {
         Ok(())
     }
 
-    fn source_context(&mut self, source: &str) -> Arc<Mutex<ContextWindow>> {
-        let cap = self.config.context_window_capacity;
-        let active_glossary = &self.active_glossary;
-        Arc::clone(
-            self.source_contexts
-                .entry(source.to_owned())
-                .or_insert_with(|| {
-                    let mut window = ContextWindow::new(cap);
-                    window.set_glossary(active_glossary.clone());
-                    Arc::new(Mutex::new(window))
-                }),
-        )
-    }
-
     fn next_timestamp_ms(&self) -> u64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -379,4 +421,60 @@ impl PipelineService {
         self.clock_ms.store(next, Ordering::Relaxed);
         next
     }
+}
+
+async fn source_state(
+    source_states: &RwLock<HashMap<String, SourcePipelineState>>,
+    source: &str,
+    context_window_capacity: usize,
+    active_glossary: &MergedGlossary,
+) -> (u64, Arc<Mutex<ContextWindow>>) {
+    {
+        let states = source_states.read().await;
+        if let Some(state) = states.get(source) {
+            return (state.epoch, Arc::clone(&state.context));
+        }
+    }
+
+    let mut states = source_states.write().await;
+    let state = states.entry(source.to_owned()).or_insert_with(|| {
+        let mut window = ContextWindow::new(context_window_capacity);
+        window.set_glossary(active_glossary.clone());
+        SourcePipelineState {
+            epoch: 0,
+            context: Arc::new(Mutex::new(window)),
+        }
+    });
+    let out = (state.epoch, Arc::clone(&state.context));
+    drop(states);
+    out
+}
+
+async fn advance_source_epoch_and_clear(
+    source_states: &RwLock<HashMap<String, SourcePipelineState>>,
+    source: &str,
+) {
+    let context_to_clear = {
+        let mut states = source_states.write().await;
+        if let Some(state) = states.get_mut(source) {
+            state.epoch = state.epoch.saturating_add(1);
+            Some(Arc::clone(&state.context))
+        } else {
+            None
+        }
+    };
+    if let Some(ctx) = context_to_clear {
+        ctx.lock().await.clear_history();
+    }
+}
+
+async fn is_source_epoch_stale(
+    source_states: &RwLock<HashMap<String, SourcePipelineState>>,
+    source: &str,
+    expected_epoch: u64,
+) -> bool {
+    let states = source_states.read().await;
+    states
+        .get(source)
+        .is_some_and(|state| state.epoch != expected_epoch)
 }

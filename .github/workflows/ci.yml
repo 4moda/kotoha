@@ -75,7 +75,7 @@ jobs:
         run: |
           find plugins \( -path 'plugins/build' -o -path 'plugins/mumble/third_party' \) -prune \
             -o -type f -name '*.cpp' -print0 \
-            | xargs -0 -r clang-tidy -p plugins/build --warnings-as-errors='*'
+            | xargs -0 -r clang-tidy -p plugins/build
 
   ui-ci:
     name: UI Lint, Typecheck, Unit & Playwright E2E

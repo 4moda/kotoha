@@ -78,8 +78,8 @@ npm ci
 npm run lint
 npm run typecheck
 npm test
-npx playwright test
 npm run build
+npx playwright test
 ```
 
 ---

@@ -195,7 +195,11 @@ fn emit_event(
         AudioInputEvent::SourceReset { conn_id, source } => {
             emit_cleared("SOURCE_RESET", *conn_id, source, action, json, true);
         }
-        AudioInputEvent::UserInfoUpdated { speaker_key, name } => {
+        AudioInputEvent::UserInfoUpdated {
+            conn_id: _,
+            speaker_key,
+            name,
+        } => {
             if json {
                 print_json(&MonitorEvent::UserInfo {
                     source: &speaker_key.source,
@@ -209,7 +213,10 @@ fn emit_event(
                 );
             }
         }
-        AudioInputEvent::UserRemoved { speaker_key } => {
+        AudioInputEvent::UserRemoved {
+            conn_id: _,
+            speaker_key,
+        } => {
             if json {
                 print_json(&MonitorEvent::UserRemoved {
                     source: &speaker_key.source,
@@ -222,7 +229,11 @@ fn emit_event(
                 );
             }
         }
-        AudioInputEvent::TalkingStateChanged { speaker_key, state } => {
+        AudioInputEvent::TalkingStateChanged {
+            conn_id: _,
+            speaker_key,
+            state,
+        } => {
             let state_str = match state {
                 kotoha_core::domain::TalkingState::Passive => "passive",
                 kotoha_core::domain::TalkingState::Talking => "talking",
@@ -243,7 +254,9 @@ fn emit_event(
                 );
             }
         }
-        AudioInputEvent::AudioFrame(chunk) => emit_audio_frame(chunk, action, session, json),
+        AudioInputEvent::AudioFrame { conn_id: _, chunk } => {
+            emit_audio_frame(chunk, action, session, json);
+        }
         AudioInputEvent::Heartbeat { conn_id, source } => {
             if json {
                 print_json(&MonitorEvent::Heartbeat {

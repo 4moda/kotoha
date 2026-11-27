@@ -3,7 +3,7 @@ export interface SpeakerKey {
   user_id: number;
 }
 
-export type SubtitleStage = 'interim' | 'final_pending' | 'translated';
+export type SubtitleStage = 'interim' | 'final_pending_translation' | 'translated';
 
 export interface SubtitleEntry {
   utterance_id: number;
@@ -12,28 +12,20 @@ export interface SubtitleEntry {
   speaker_color: string;
   src_text: string;
   translated_text: string | null;
-  is_final_stt: boolean;
+  stage: SubtitleStage;
   timestamp_ms: number;
 }
 
-export function getSubtitleStage(entry: SubtitleEntry): SubtitleStage {
-  if (!entry.is_final_stt) {
-    return 'interim';
-  }
-  if (entry.translated_text === null) {
-    return 'final_pending';
-  }
-  return 'translated';
-}
-
 export type ComputeDevice = 'auto' | 'cpu' | 'cuda' | 'metal';
+
+export type ModelBackend = 'c_translate2' | 'onnx' | 'open_ai_compatible';
 
 export type ModelLicenseCaution = 'commercial_ok' | 'non_commercial';
 
 export interface ModelProfile {
   model_id: string;
   display_name: string;
-  backend: string;
+  backend: ModelBackend;
   supported_langs: string[];
   recommended_device: ComputeDevice;
   supported_devices: ComputeDevice[];
@@ -45,9 +37,6 @@ export interface ModelProfile {
   sha256: string;
   download_url: string;
 }
-
-export type DeepLPlan = 'free' | 'pro';
-export type GoogleTranslateApiVersion = 'v2' | 'v3';
 
 export type TranslationProviderType =
   | 'local_model'
@@ -61,41 +50,41 @@ export interface LocalModelProviderConfig {
   type: 'local_model';
   model_id: string;
   device: ComputeDevice;
-  compute_type: string;
-  num_threads: number;
+  threads: number | null;
 }
 
 export interface OpenAiCompatibleProviderConfig {
   type: 'openai_compatible';
   base_url: string;
   model: string;
-  api_key: string;
-  context_window: number;
+  api_key: string | null;
+  timeout_ms: number;
 }
 
 export interface DeepLProviderConfig {
   type: 'deepl';
-  plan: DeepLPlan;
   api_key: string;
-  formality: string;
+  use_free_endpoint: boolean;
+  timeout_ms: number;
 }
 
 export interface GoogleCloudProviderConfig {
   type: 'google_cloud';
-  api_version: GoogleTranslateApiVersion;
-  project_id: string;
   api_key: string;
+  project_id: string | null;
+  timeout_ms: number;
 }
 
 export interface GasWebhookProviderConfig {
   type: 'gas_webhook';
   endpoint_url: string;
-  bearer_token: string;
+  bearer_token: string | null;
+  timeout_ms: number;
 }
 
 export interface MockProviderConfig {
   type: 'mock';
-  latency_ms: number;
+  prefix: string;
 }
 
 export type TranslationProviderConfig =

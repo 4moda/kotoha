@@ -191,6 +191,8 @@ pub enum AudioInputEvent {
     },
     /// Speaker display name registration or update.
     UserInfoUpdated {
+        /// Owning connection ID of the client sending `UserInfo`.
+        conn_id: u64,
         /// Speaker identity.
         speaker_key: SpeakerKey,
         /// Display name string (may be empty if user has no display name set).
@@ -198,18 +200,27 @@ pub enum AudioInputEvent {
     },
     /// Speaker left the channel/server.
     UserRemoved {
+        /// Owning connection ID of the client sending `UserRemoved`.
+        conn_id: u64,
         /// Speaker identity.
         speaker_key: SpeakerKey,
     },
     /// Speaker talking state changed.
     TalkingStateChanged {
+        /// Owning connection ID of the client sending `TalkingState`.
+        conn_id: u64,
         /// Speaker identity.
         speaker_key: SpeakerKey,
         /// New talking state.
         state: TalkingState,
     },
     /// Audio PCM frame received for a speaker.
-    AudioFrame(AudioChunk),
+    AudioFrame {
+        /// Owning connection ID of the client sending `AudioFrame`.
+        conn_id: u64,
+        /// Audio PCM chunk payload.
+        chunk: AudioChunk,
+    },
     /// Periodic keepalive heartbeat from an active source connection.
     Heartbeat {
         /// Connection ID of the client sending `Heartbeat`.

@@ -2,7 +2,6 @@ import type {
   OverlayDisplayOptions,
   SubtitleEntry,
 } from '../types/kotoha';
-import { getSubtitleStage } from '../types/kotoha';
 import { getDeterministicSpeakerColor } from '../data/modelCatalog';
 
 export interface SubtitleOverlayProps {
@@ -59,7 +58,7 @@ export function SubtitleOverlay({
       ) : (
         <ul className="subtitle-list" data-testid="subtitle-list">
           {visibleEntries.map((entry) => {
-            const stage = getSubtitleStage(entry);
+            const { stage } = entry;
             const badgeColor =
               entry.speaker_color || getDeterministicSpeakerColor(entry.speaker_key);
 
@@ -92,7 +91,7 @@ export function SubtitleOverlay({
                   </span>
                   <span className={`stage-tag stage-tag-${stage}`}>
                     {stage === 'interim' && 'Interim STT'}
-                    {stage === 'final_pending' && 'Translating…'}
+                    {stage === 'final_pending_translation' && 'Translating…'}
                     {stage === 'translated' && 'Translated'}
                   </span>
                 </div>
@@ -103,7 +102,7 @@ export function SubtitleOverlay({
                   </p>
                 )}
 
-                {stage === 'final_pending' && (
+                {stage === 'final_pending_translation' && (
                   <p className="subtitle-primary subtitle-final-pending">
                     {entry.src_text}
                   </p>

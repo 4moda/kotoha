@@ -35,7 +35,7 @@ Checks: >
   readability-simplify-boolean-expr,
   readability-static-accessed-through-instance
 WarningsAsErrors: ''
-HeaderFilterRegex: '.*[/\\]plugins[/\\](common|mumble|ts3|tests)[/\\](?!third_party[/\\]).*\.(h|hpp)$'
+HeaderFilterRegex: '.*[/\\]plugins[/\\](common|ts3|tests|mumble[/\\]src)[/\\].*\.(h|hpp)$'
 FormatStyle: file
 CheckOptions:
   - key: modernize-use-auto.MinTypeNameLength

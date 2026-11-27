@@ -384,7 +384,7 @@ body {
   color: #cbd5e1;
 }
 
-.stage-tag-final_pending {
+.stage-tag-final_pending_translation {
   background: rgba(251, 191, 36, 0.14);
   color: var(--status-warn);
 }

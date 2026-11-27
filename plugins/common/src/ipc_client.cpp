@@ -272,7 +272,13 @@ private:
         return true;
     }
 
-    void signal_stop() noexcept { stop_signaled_.store(true, std::memory_order_release); }
+    void signal_stop() noexcept {
+        stop_signaled_.store(true, std::memory_order_release);
+        const int fd = fd_.load(std::memory_order_acquire);
+        if (fd >= 0) {
+            ::shutdown(fd, SHUT_RDWR);
+        }
+    }
 
     void reset_stop() noexcept { stop_signaled_.store(false, std::memory_order_release); }
 
@@ -326,7 +332,7 @@ private:
                 poll_rc = ::poll(&pfd, 1, 100);
             } while (poll_rc < 0 && errno == EINTR);
 
-            if (poll_rc <= 0) {
+            if (poll_rc <= 0 || stop_signaled_.load(std::memory_order_acquire)) {
                 ::close(fd);
                 return false;
             }
@@ -353,6 +359,9 @@ private:
         size_t offset = 0;
 
         while (offset < data.size()) {
+            if (stop_signaled_.load(std::memory_order_acquire)) {
+                return false;
+            }
 #if defined(MSG_NOSIGNAL)
             const int send_flags = MSG_NOSIGNAL;
 #else
@@ -427,14 +436,15 @@ IpcClient::~IpcClient() {
 }
 
 void IpcClient::start() {
-    bool expected = false;
-    if (!running_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    if (running_.load(std::memory_order_acquire) || worker_thread_.joinable()) {
         return;
     }
 
     {
         std::lock_guard<std::mutex> lock(control_mutex_);
         stop_requested_ = false;
+        worker_finished_ = false;
         endpoint_ = resolve_ipc_endpoint(config_.endpoint_override);
     }
     stop_signaled_.store(false, std::memory_order_release);
@@ -442,10 +452,12 @@ void IpcClient::start() {
     transport_->init();
     transport_->reset_stop();
 
+    running_.store(true, std::memory_order_release);
     worker_thread_ = std::thread([this]() { worker_loop(); });
 }
 
 void IpcClient::stop() {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     const bool was_running = running_.load(std::memory_order_acquire);
     if (!was_running && !worker_thread_.joinable()) {
         return;
@@ -457,6 +469,14 @@ void IpcClient::stop() {
         stop_requested_ = true;
     }
     control_cv_.notify_all();
+
+    if (connected_.load(std::memory_order_acquire)) {
+        std::unique_lock<std::mutex> lock(control_mutex_);
+        worker_done_cv_.wait_for(lock, config_.shutdown_drain_timeout,
+                                 [this]() { return worker_finished_; });
+    }
+
+    transport_->signal_stop();
 
     if (worker_thread_.joinable()) {
         worker_thread_.join();
@@ -527,18 +547,14 @@ uint32_t IpcClient::current_audio_seq() const noexcept {
 }
 
 std::string IpcClient::resolved_endpoint() const {
+    std::lock_guard<std::mutex> lock(control_mutex_);
     return endpoint_;
 }
 
 void IpcClient::enqueue_control_event(ControlEvent event) {
     {
         std::lock_guard<std::mutex> lock(control_mutex_);
-        if (event.kind == ControlEvent::Kind::UserRemoved ||
-            event.kind == ControlEvent::Kind::SourceReset) {
-            destructive_queue_.push_back(std::move(event));
-        } else {
-            non_destructive_queue_.push_back(std::move(event));
-        }
+        control_queue_.push_back(std::move(event));
     }
     control_cv_.notify_one();
 }
@@ -659,51 +675,53 @@ bool IpcClient::drain_pending_events(bool& wrote_any, bool& stop_after_drain,
     wrote_any = false;
     stop_after_drain = false;
 
-    std::deque<ControlEvent> non_destructive;
-    std::deque<ControlEvent> destructive;
-
+    std::deque<ControlEvent> pending_controls;
     {
         std::lock_guard<std::mutex> lock(control_mutex_);
-        non_destructive.swap(non_destructive_queue_);
-        destructive.swap(destructive_queue_);
+        pending_controls.swap(control_queue_);
         stop_after_drain = stop_requested_;
     }
 
-    // 1. Non-destructive control events first (UserInfo, TalkingState).
-    for (const ControlEvent& event : non_destructive) {
+    const auto is_destructive = [](const ControlEvent& ev) {
+        return ev.kind == ControlEvent::Kind::UserRemoved ||
+               ev.kind == ControlEvent::Kind::SourceReset;
+    };
+
+    // Process control events in strict chronological FIFO order. Whenever a destructive
+    // lifecycle event (UserRemoved / SourceReset) is reached, drain all pending audio frames
+    // first so preceding speech audio is never dropped before the lifecycle transition.
+    for (const ControlEvent& event : pending_controls) {
         if (deadline != std::chrono::steady_clock::time_point::max() &&
             std::chrono::steady_clock::now() >= deadline) {
             return false;
         }
-        if (!send_control_event(event)) {
-            return false;
-        }
-        wrote_any = true;
-        last_was_source_reset = false;
-    }
 
-    // 2. Drain pending audio frames before any destructive lifecycle event.
-    bool audio_wrote = false;
-    const bool drain_all = !destructive.empty() || stop_after_drain;
-    if (!drain_audio_ring(audio_wrote, drain_all, deadline)) {
-        return false;
-    }
-    if (audio_wrote) {
-        wrote_any = true;
-        last_was_source_reset = false;
-    }
-
-    // 3. Destructive lifecycle events (UserRemoved, SourceReset).
-    for (const ControlEvent& event : destructive) {
-        if (deadline != std::chrono::steady_clock::time_point::max() &&
-            std::chrono::steady_clock::now() >= deadline) {
-            return false;
+        if (is_destructive(event)) {
+            bool audio_wrote = false;
+            if (!drain_audio_ring(audio_wrote, true, deadline)) {
+                return false;
+            }
+            if (audio_wrote) {
+                wrote_any = true;
+                last_was_source_reset = false;
+            }
         }
+
         if (!send_control_event(event)) {
             return false;
         }
         wrote_any = true;
         last_was_source_reset = (event.kind == ControlEvent::Kind::SourceReset);
+    }
+
+    // Drain any remaining audio frames after all queued control events.
+    bool tail_audio_wrote = false;
+    if (!drain_audio_ring(tail_audio_wrote, stop_after_drain, deadline)) {
+        return false;
+    }
+    if (tail_audio_wrote) {
+        wrote_any = true;
+        last_was_source_reset = false;
     }
 
     return true;
@@ -714,6 +732,11 @@ void IpcClient::worker_loop() {
     const auto idle_wait = std::clamp(config_.idle_poll_interval, std::chrono::milliseconds{2},
                                       std::chrono::milliseconds{5});
     bool last_was_source_reset = false;
+    std::string active_endpoint;
+    {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        active_endpoint = endpoint_;
+    }
 
     while (true) {
         if (!connected_.load(std::memory_order_acquire)) {
@@ -724,7 +747,7 @@ void IpcClient::worker_loop() {
                 }
             }
 
-            if (transport_->connect(endpoint_)) {
+            if (transport_->connect(active_endpoint)) {
                 if (send_hello()) {
                     connected_.store(true, std::memory_order_release);
                     last_tx_time = std::chrono::steady_clock::now();
@@ -796,20 +819,22 @@ void IpcClient::worker_loop() {
         bool has_more = !audio_ring_.empty();
         if (!has_more) {
             std::lock_guard<std::mutex> lock(control_mutex_);
-            has_more =
-                !non_destructive_queue_.empty() || !destructive_queue_.empty() || stop_requested_;
+            has_more = !control_queue_.empty() || stop_requested_;
         }
 
         if (!has_more) {
             std::unique_lock<std::mutex> lock(control_mutex_);
-            control_cv_.wait_for(lock, idle_wait, [this]() {
-                return stop_requested_ || !non_destructive_queue_.empty() ||
-                       !destructive_queue_.empty();
-            });
+            control_cv_.wait_for(lock, idle_wait,
+                                 [this]() { return stop_requested_ || !control_queue_.empty(); });
         }
     }
 
     connected_.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        worker_finished_ = true;
+    }
+    worker_done_cv_.notify_all();
 }
 
 }  // namespace kotoha::ipc

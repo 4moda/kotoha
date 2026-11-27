@@ -22,7 +22,7 @@ use kotoha_core::domain::{
     ComputeDevice, ContextWindow, CoreError, GlossaryEntry, GlossaryPlaceholderGuard,
     GlossaryProfile, GlossarySettings, HistoryEntry, LanguageCode, MergedGlossary, PreFilter,
     SpeakerKey, SttDecodingMethod, SttEngine, SttHotwordsConfig, SttStream, SubtitleStage,
-    TranslationProviderConfig, TranslationRequest, TranslationResult, Translator,
+    TalkingState, TranslationProviderConfig, TranslationRequest, TranslationResult, Translator,
     TranslatorFactory, UtteranceId, DEFAULT_HOTWORDS_SCORE,
 };
 use kotoha_core::infrastructure::{
@@ -224,6 +224,29 @@ fn domain_glossary_placeholder_guard_longest_match_and_restore() {
 }
 
 #[test]
+fn domain_glossary_placeholder_guard_respects_ascii_word_boundaries() {
+    let terms = BTreeMap::from([
+        ("Logi".to_owned(), "ロジ".to_owned()),
+        ("M W D".to_owned(), "MWD".to_owned()),
+        ("シールド".to_owned(), "Shield".to_owned()),
+    ]);
+
+    // "logical", "my_Logi", "Logi2" must NOT be corrupted; standalone "Logi", "M W D", and CJK
+    // substring "シールド" MUST match.
+    let input = "This logical my_Logi Logi2 needs Logi and M W D with シールド強化";
+    let (protected, guard) = protect_terms(input, &terms);
+    assert_eq!(
+        protected,
+        "This logical my_Logi Logi2 needs __TERM_0__ and __TERM_1__ with __TERM_2__強化"
+    );
+    let restored = restore_terms(&protected, &guard);
+    assert_eq!(
+        restored,
+        "This logical my_Logi Logi2 needs ロジ and MWD with Shield強化"
+    );
+}
+
+#[test]
 fn domain_model_catalog_contains_design_profiles() {
     let catalog = default_model_catalog();
     let ids: HashSet<&str> = catalog.iter().map(|m| m.model_id.as_str()).collect();
@@ -302,6 +325,7 @@ fn session_manager_conn_id_supersede_and_seq_tracking() {
 
     let spk1 = SpeakerKey::new("mumble", 10);
     mgr.handle_event(&AudioInputEvent::UserInfoUpdated {
+        conn_id: 1,
         speaker_key: spk1.clone(),
         name: "Alice".to_owned(),
     });
@@ -322,7 +346,7 @@ fn session_manager_conn_id_supersede_and_seq_tracking() {
     );
     assert_eq!(mgr.owning_conn_id("mumble"), Some(2));
 
-    // Delayed disconnect from Conn 1 MUST NOT clear speakers owned by Conn 2
+    // Delayed events from superseded Conn 1 MUST NOT alter Conn 2 state or speakers
     assert_eq!(
         mgr.handle_event(&AudioInputEvent::SourceDisconnected {
             conn_id: 1,
@@ -330,19 +354,62 @@ fn session_manager_conn_id_supersede_and_seq_tracking() {
         }),
         SessionAction::None
     );
-    assert_eq!(mgr.owning_conn_id("mumble"), Some(2));
+    assert_eq!(
+        mgr.handle_event(&AudioInputEvent::UserInfoUpdated {
+            conn_id: 1,
+            speaker_key: spk1.clone(),
+            name: "StaleAlice".to_owned(),
+        }),
+        SessionAction::None
+    );
+    assert_eq!(mgr.speaker_display_name(&spk1), "Alice");
+    assert_eq!(
+        mgr.handle_event(&AudioInputEvent::TalkingStateChanged {
+            conn_id: 1,
+            speaker_key: spk1.clone(),
+            state: TalkingState::Shouting,
+        }),
+        SessionAction::None
+    );
+    assert_eq!(mgr.speaker_talking_state(&spk1), TalkingState::Passive);
+    assert_eq!(
+        mgr.handle_event(&AudioInputEvent::UserRemoved {
+            conn_id: 1,
+            speaker_key: spk1.clone(),
+        }),
+        SessionAction::None
+    );
     assert_eq!(mgr.active_speaker_count(), 1);
+    assert_eq!(
+        mgr.handle_event(&AudioInputEvent::AudioFrame {
+            conn_id: 1,
+            chunk: AudioChunk {
+                speaker_key: spk1.clone(),
+                seq: 999,
+                sample_rate: 16_000,
+                channels: 1,
+                is_local_user: false,
+                samples: vec![0.1; 160],
+            },
+        }),
+        SessionAction::None
+    );
+    assert_eq!(
+        mgr.source_stats("mumble").expect("stats").frames_received,
+        0
+    );
 
-    // Lazy seq init starting at u32::MAX - 1 (non-zero reconnect offset)
-    let make_chunk = |seq: u32| {
-        AudioInputEvent::AudioFrame(AudioChunk {
+    // Lazy seq init starting at u32::MAX - 1 on owning Conn 2
+    let make_chunk = |seq: u32| AudioInputEvent::AudioFrame {
+        conn_id: 2,
+        chunk: AudioChunk {
             speaker_key: spk1.clone(),
             seq,
             sample_rate: 16_000,
             channels: 1,
             is_local_user: false,
             samples: vec![0.1; 160],
-        })
+        },
     };
 
     assert_eq!(
@@ -353,7 +420,7 @@ fn session_manager_conn_id_supersede_and_seq_tracking() {
         mgr.handle_event(&make_chunk(u32::MAX)),
         SessionAction::AudioSequenceChecked(SeqStatus::InOrder)
     );
-    // Wrapping across u32::MAX -> 0 -> 1 is in order; jump to 4 drops 2 frames (2, 3)
+    // Wrapping across u32::MAX -> 0 -> 1 is in order; jump to 3 drops 2 frames (1, 2)
     assert_eq!(
         mgr.handle_event(&make_chunk(0)),
         SessionAction::AudioSequenceChecked(SeqStatus::InOrder)
@@ -640,6 +707,19 @@ async fn end_to_end_ipc_server_to_pipeline_and_three_stage_subtitles() {
         .await
         .expect("send user removed");
 
+    // Wait for both utterances to finish all 3 subtitle stages before sending SourceReset
+    // (which advances the source epoch and clears subtitles).
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if sink.entries().await.len() >= 6 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("two utterances should complete 3-stage subtitles before SourceReset");
+
     client
         .write_all(&send_msg(Message::SourceReset))
         .await
@@ -647,8 +727,17 @@ async fn end_to_end_ipc_server_to_pipeline_and_three_stage_subtitles() {
 
     drop(client);
 
-    // Wait briefly for server to ingest and close channel on shutdown
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if sink.cleared_sources().await.contains(&"mumble".to_owned()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("SourceReset should invoke clear_source");
+
     let _ = shutdown_tx.send(true);
     server_task.await.expect("server join").expect("server ok");
     pipeline_task
@@ -914,14 +1003,17 @@ async fn pipeline_passes_active_glossary_to_translation_context_and_stt_hotwords
 
     pipeline
         .process_event(
-            AudioInputEvent::AudioFrame(AudioChunk {
-                speaker_key: SpeakerKey::new("mumble", 5),
-                seq: 0,
-                sample_rate: 16_000,
-                channels: 1,
-                is_local_user: false,
-                samples: vec![0.2; 320],
-            }),
+            AudioInputEvent::AudioFrame {
+                conn_id: 1,
+                chunk: AudioChunk {
+                    speaker_key: SpeakerKey::new("mumble", 5),
+                    seq: 0,
+                    sample_rate: 16_000,
+                    channels: 1,
+                    is_local_user: false,
+                    samples: vec![0.2; 320],
+                },
+            },
             &mut tasks,
         )
         .await
@@ -934,4 +1026,191 @@ async fn pipeline_passes_active_glossary_to_translation_context_and_stt_hotwords
     let reqs = captured_requests.lock().expect("lock");
     assert_eq!(reqs.len(), 1);
     assert_eq!(&reqs[0].context.glossary, merged.terms());
+}
+
+struct DelayedFailingOrTaggedTranslator {
+    delay: Duration,
+    should_fail: bool,
+}
+
+#[async_trait]
+impl Translator for DelayedFailingOrTaggedTranslator {
+    fn provider_id(&self) -> &'static str {
+        "delayed"
+    }
+
+    async fn translate(&self, req: TranslationRequest) -> Result<TranslationResult, CoreError> {
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+        if self.should_fail {
+            return Err(CoreError::Translation("simulated failure".to_owned()));
+        }
+        Ok(TranslationResult {
+            utterance_id: req.utterance_id,
+            original_text: req.text.clone(),
+            translated_text: format!("[ja] {}", req.text),
+            provider_id: "delayed".to_owned(),
+            latency_ms: 0,
+        })
+    }
+}
+
+#[tokio::test]
+async fn pipeline_suppresses_stale_translations_after_source_reset_and_propagates_task_errors() {
+    // 1. Stale translation suppression across SourceReset (epoch increment)
+    let stt = Arc::new(MockSttEngine::new(0.01, 1));
+    let translator_mgr = Arc::new(TranslatorManager::new(
+        Arc::new(DelayedFailingOrTaggedTranslator {
+            delay: Duration::from_millis(40),
+            should_fail: false,
+        }),
+        TranslationProviderConfig::Mock {
+            prefix: "[ja] ".to_owned(),
+        },
+    ));
+    let sink = Arc::new(CollectingSubtitleSink::new());
+    let mut pipeline = PipelineService::new(
+        PipelineConfig::new(
+            LanguageCode::new("en").unwrap(),
+            LanguageCode::new("ja").unwrap(),
+        ),
+        stt,
+        translator_mgr,
+        sink.clone(),
+        Arc::new(AudioPreprocessor::process_chunk),
+    );
+
+    let (tx, rx) = mpsc::channel(16);
+    tx.send(AudioInputEvent::SourceConnected {
+        conn_id: 1,
+        source: "mumble".to_owned(),
+        plugin_version: "0.1.0".to_owned(),
+    })
+    .await
+    .unwrap();
+    tx.send(AudioInputEvent::AudioFrame {
+        conn_id: 1,
+        chunk: AudioChunk {
+            speaker_key: SpeakerKey::new("mumble", 1),
+            seq: 0,
+            sample_rate: 16_000,
+            channels: 1,
+            is_local_user: false,
+            samples: vec![0.2; 320],
+        },
+    })
+    .await
+    .unwrap();
+    // Immediately send SourceReset before the 40ms translation completes
+    tx.send(AudioInputEvent::SourceReset {
+        conn_id: 1,
+        source: "mumble".to_owned(),
+    })
+    .await
+    .unwrap();
+    drop(tx);
+
+    pipeline.run(rx).await.expect("pipeline finishes cleanly");
+
+    let entries = sink.entries().await;
+    // Phase B FinalPendingTranslation happened before SourceReset, but Phase C Translated MUST be
+    // suppressed because the source epoch incremented!
+    assert!(
+        entries.iter().all(|e| e.stage != SubtitleStage::Translated),
+        "stale post-reset translation must not be emitted"
+    );
+
+    // 2. Failing spawned translation task during run() must propagate Ok(Err(err))
+    let stt_err = Arc::new(MockSttEngine::new(0.01, 1));
+    let failing_mgr = Arc::new(TranslatorManager::new(
+        Arc::new(DelayedFailingOrTaggedTranslator {
+            delay: Duration::ZERO,
+            should_fail: true,
+        }),
+        TranslationProviderConfig::Mock {
+            prefix: String::new(),
+        },
+    ));
+    let sink_err = Arc::new(CollectingSubtitleSink::new());
+    let mut failing_pipeline = PipelineService::new(
+        PipelineConfig::new(
+            LanguageCode::new("en").unwrap(),
+            LanguageCode::new("ja").unwrap(),
+        ),
+        stt_err,
+        failing_mgr,
+        sink_err,
+        Arc::new(AudioPreprocessor::process_chunk),
+    );
+
+    let (tx2, rx2) = mpsc::channel(16);
+    tx2.send(AudioInputEvent::SourceConnected {
+        conn_id: 1,
+        source: "mumble".to_owned(),
+        plugin_version: "0.1.0".to_owned(),
+    })
+    .await
+    .unwrap();
+    tx2.send(AudioInputEvent::AudioFrame {
+        conn_id: 1,
+        chunk: AudioChunk {
+            speaker_key: SpeakerKey::new("mumble", 1),
+            seq: 0,
+            sample_rate: 16_000,
+            channels: 1,
+            is_local_user: false,
+            samples: vec![0.2; 320],
+        },
+    })
+    .await
+    .unwrap();
+    // Keep tx2 alive briefly so try_join_next in the event loop observes the task error
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(tx2);
+    });
+
+    let err = failing_pipeline
+        .run(rx2)
+        .await
+        .expect_err("translation task error must propagate");
+    assert!(matches!(err, CoreError::Translation(_)));
+}
+
+#[tokio::test]
+async fn ipc_server_handles_shutdown_signal_and_stale_symlink() {
+    let endpoint = test_endpoint("shutdown");
+
+    #[cfg(unix)]
+    {
+        // Create a dangling symlink at the socket path to verify symlink_metadata removes it cleanly
+        let _ = std::fs::remove_file(&endpoint);
+        std::os::unix::fs::symlink("/tmp/kotoha_nonexistent_target", &endpoint)
+            .expect("create dangling symlink");
+    }
+
+    let server = IpcServerAdapter::new(endpoint.clone());
+    let (event_tx, _event_rx) = mpsc::channel::<AudioInputEvent>(8);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (ready_tx, ready_rx) = oneshot::channel();
+
+    let server_task =
+        tokio::spawn(async move { server.run(event_tx, shutdown_rx, Some(ready_tx)).await });
+    ready_rx
+        .await
+        .expect("server bound cleanly over dangling symlink");
+
+    // Connect client and leave it idle, then trigger shutdown (verifying wait_for terminates
+    // handle_connection promptly without hanging)
+    let _idle_client = connect_local_socket(&endpoint)
+        .await
+        .expect("connect idle client");
+    shutdown_tx.send(true).expect("send shutdown");
+
+    tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("server shutdown must not deadlock")
+        .expect("join ok")
+        .expect("server ok");
 }

@@ -48,12 +48,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Resolve release tag
         id: meta
         shell: python
         run: |
           import os
-          from pathlib import Path
 
           tag = os.environ.get("INPUT_TAG", "").strip()
           if not tag:
@@ -66,11 +70,6 @@ jobs:
               f.write(f"tag={tag}\n")
         env:
           INPUT_TAG: ${{ inputs.tag }}
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -189,6 +188,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Resolve release tag
         id: meta

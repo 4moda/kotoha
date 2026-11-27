@@ -117,12 +117,27 @@ public:
     }
 
     std::vector<Message> read_messages_until_eof_or_count(size_t target_count,
-                                                          std::chrono::milliseconds timeout) {
+                                                          std::chrono::milliseconds timeout,
+                                                          bool ignore_heartbeats = false) {
         std::vector<Message> messages;
         std::vector<uint8_t> rx_buf;
         const auto deadline = std::chrono::steady_clock::now() + timeout;
 
-        while (messages.size() < target_count && std::chrono::steady_clock::now() < deadline) {
+        auto non_heartbeat_count = [&]() {
+            if (!ignore_heartbeats) {
+                return messages.size();
+            }
+            size_t count = 0;
+            for (const auto& m : messages) {
+                if (!std::holds_alternative<HeartbeatMessage>(m)) {
+                    ++count;
+                }
+            }
+            return count;
+        };
+
+        while (non_heartbeat_count() < target_count &&
+               std::chrono::steady_clock::now() < deadline) {
             pollfd pfd{};
             pfd.fd = client_fd_;
             pfd.events = POLLIN;
@@ -208,47 +223,50 @@ void test_ipc_client_flow_and_reconnect() {
     CHECK(hello->plugin_version == "0.1.0");
     CHECK(std::holds_alternative<HeartbeatMessage>(first_batch[1]));
 
-    // Push UserInfo, TalkingState, Audio, UserRemoved -> verify strict drain order
+    // Push UserInfo, TalkingState, Audio, UserRemoved, then a new UserInfo(43) ->
+    // verify strict chronological FIFO ordering (UserRemoved(42) must precede UserInfo(43),
+    // and AudioFrame must precede UserRemoved(42)).
     client.push_user_info(42U, "Alice");
     client.push_talking_state(42U, TalkingStateValue::Talking);
     const std::array<float, 4> pcm = {0.25f, -0.25f, 0.5f, -0.5f};
     CHECK(client.push_audio(42U, 48000U, 2U, kAudioFlagIsLocalUser, pcm) == 1U);
     client.push_user_removed(42U);
+    client.push_user_info(43U, "Bob");
 
     const auto event_batch =
-        server->read_messages_until_eof_or_count(4, std::chrono::milliseconds{1000});
-    CHECK(event_batch.size() == 4);
+        server->read_messages_until_eof_or_count(5, std::chrono::milliseconds{1000}, true);
 
-    // Note: Heartbeat could interleave if timer ticked; filter non-heartbeats if needed
     std::vector<Message> ordered;
     for (const auto& m : event_batch) {
         if (!std::holds_alternative<HeartbeatMessage>(m)) {
             ordered.push_back(m);
         }
     }
-    if (ordered.size() < 4) {
-        const auto more = server->read_messages_until_eof_or_count(4 - ordered.size(),
-                                                                   std::chrono::milliseconds{500});
-        for (const auto& m : more) {
-            if (!std::holds_alternative<HeartbeatMessage>(m)) {
-                ordered.push_back(m);
-            }
-        }
-    }
-    CHECK(ordered.size() == 4);
-    CHECK(std::holds_alternative<UserInfoMessage>(ordered[0]));
+    CHECK(ordered.size() == 5);
+    const auto* ui0 = std::get_if<UserInfoMessage>(&ordered[0]);
+    CHECK(ui0 != nullptr && ui0->user_id == 42U && ui0->name == "Alice");
     CHECK(std::holds_alternative<TalkingStateMessage>(ordered[1]));
     // AudioFrame must arrive before destructive UserRemoved
     CHECK(std::holds_alternative<AudioFrameMessage>(ordered[2]));
-    CHECK(std::holds_alternative<UserRemovedMessage>(ordered[3]));
+    const auto* ur3 = std::get_if<UserRemovedMessage>(&ordered[3]);
+    CHECK(ur3 != nullptr && ur3->user_id == 42U);
+    // Chronological UserInfo after UserRemoved must NOT be reordered ahead of UserRemoved
+    const auto* ui4 = std::get_if<UserInfoMessage>(&ordered[4]);
+    CHECK(ui4 != nullptr && ui4->user_id == 43U && ui4->name == "Bob");
 
     // Simulate full server shutdown & restart; client must reconnect and re-send Hello
     server.reset();
     {
         auto server2 = std::make_unique<MockUdsServer>(sock_path);
         CHECK(server2->accept_one(1000));
-        const auto reconnect_msgs =
-            server2->read_messages_until_eof_or_count(1, std::chrono::milliseconds{1000});
+        const auto reconnect_raw =
+            server2->read_messages_until_eof_or_count(1, std::chrono::milliseconds{1000}, true);
+        std::vector<Message> reconnect_msgs;
+        for (const auto& m : reconnect_raw) {
+            if (!std::holds_alternative<HeartbeatMessage>(m)) {
+                reconnect_msgs.push_back(m);
+            }
+        }
         CHECK(reconnect_msgs.size() == 1);
         const auto* hello2 = std::get_if<HelloMessage>(&reconnect_msgs[0]);
         CHECK(hello2 != nullptr && hello2->app_name == "mumble");

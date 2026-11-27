@@ -9,11 +9,15 @@ use crate::domain::{
     TranslationResult, Translator, TranslatorFactory,
 };
 
+struct ActiveTranslatorState {
+    translator: Arc<dyn Translator>,
+    config: TranslationProviderConfig,
+}
+
 /// Manages the active [`Translator`] behind an async lock for zero-downtime hot-swapping,
 /// alongside the selectable [`ModelProfile`] catalog.
 pub struct TranslatorManager {
-    active_translator: RwLock<Arc<dyn Translator>>,
-    active_config: RwLock<TranslationProviderConfig>,
+    state: RwLock<ActiveTranslatorState>,
     model_catalog: Vec<ModelProfile>,
 }
 
@@ -25,8 +29,10 @@ impl TranslatorManager {
         initial_config: TranslationProviderConfig,
     ) -> Self {
         Self {
-            active_translator: RwLock::new(initial_translator),
-            active_config: RwLock::new(initial_config),
+            state: RwLock::new(ActiveTranslatorState {
+                translator: initial_translator,
+                config: initial_config,
+            }),
             model_catalog: default_model_catalog(),
         }
     }
@@ -53,30 +59,26 @@ impl TranslatorManager {
         }
 
         let next_translator = factory.create(&config)?;
-        {
-            let mut guard = self.active_translator.write().await;
-            *guard = next_translator;
-        }
-        {
-            let mut cfg_guard = self.active_config.write().await;
-            *cfg_guard = config;
-        }
+        let mut guard = self.state.write().await;
+        guard.translator = next_translator;
+        guard.config = config;
+        drop(guard);
         Ok(())
     }
 
     /// Returns a cloned handle to the currently active [`Translator`].
     pub async fn current_translator(&self) -> Arc<dyn Translator> {
-        Arc::clone(&*self.active_translator.read().await)
+        Arc::clone(&self.state.read().await.translator)
     }
 
     /// Returns a clone of the currently active [`TranslationProviderConfig`].
     pub async fn current_config(&self) -> TranslationProviderConfig {
-        self.active_config.read().await.clone()
+        self.state.read().await.config.clone()
     }
 
     /// Returns the provider ID of the currently active [`Translator`].
     pub async fn current_provider_id(&self) -> String {
-        self.active_translator.read().await.provider_id().to_owned()
+        self.state.read().await.translator.provider_id().to_owned()
     }
 
     /// Translates `req` using whichever [`Translator`] is currently active.

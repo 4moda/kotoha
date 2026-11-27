@@ -1,6 +1,5 @@
 //! Asynchronous cross-platform IPC server adapter built on `tokio` + `interprocess` + `kotoha-protocol`.
 
-#[cfg(unix)]
 use std::io::ErrorKind;
 #[cfg(unix)]
 use std::path::Path;
@@ -17,6 +16,10 @@ use interprocess::local_socket::ListenerOptions;
 #[cfg(unix)]
 use interprocess::os::unix::local_socket::ListenerOptionsExt as _;
 #[cfg(windows)]
+use interprocess::os::windows::{
+    local_socket::ListenerOptionsExt as _, security_descriptor::SecurityDescriptor,
+};
+#[cfg(windows)]
 use kotoha_protocol::extract_windows_pipe_name;
 use kotoha_protocol::{
     resolve_endpoint, FrameHeader, Message, ProtocolError, TalkingStateKind,
@@ -25,6 +28,8 @@ use kotoha_protocol::{
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
+#[cfg(windows)]
+use widestring::u16cstr;
 
 use crate::domain::{AudioChunk, AudioInputEvent, CoreError, SpeakerKey, TalkingState};
 
@@ -69,41 +74,44 @@ impl IpcServerAdapter {
         mut shutdown_rx: watch::Receiver<bool>,
         ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<(), CoreError> {
-        let listener = bind_listener(&self.endpoint).await?;
+        #[cfg(unix)]
+        let listener = bind_unix_listener(&self.endpoint).await?;
+        #[cfg(windows)]
+        let listener = bind_windows_listener(&self.endpoint)?;
 
         if let Some(ready) = ready_tx {
             let _ = ready.send(());
         }
 
         let mut client_tasks = JoinSet::new();
+        let mut accept_err: Option<CoreError> = None;
 
         loop {
-            if *shutdown_rx.borrow() {
+            if *shutdown_rx.borrow_and_update() {
                 break;
             }
 
+            let client_shutdown = shutdown_rx.clone();
             tokio::select! {
                 biased;
-                changed = shutdown_rx.changed() => {
-                    if changed.is_err() || *shutdown_rx.borrow() {
-                        break;
-                    }
+                _ = shutdown_rx.wait_for(|v| *v) => {
+                    break;
                 }
                 accept_res = listener.accept() => {
                     match accept_res {
                         Ok(stream) => {
                             let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
                             let client_tx = tx.clone();
-                            let client_shutdown = shutdown_rx.clone();
                             client_tasks.spawn(async move {
                                 handle_connection(conn_id, stream, client_tx, client_shutdown).await;
                             });
                         }
                         Err(err) => {
-                            return Err(CoreError::Ipc(format!(
+                            accept_err = Some(CoreError::Ipc(format!(
                                 "IPC accept failed on '{}': {err}",
                                 self.endpoint
                             )));
+                            break;
                         }
                     }
                 }
@@ -113,23 +121,15 @@ impl IpcServerAdapter {
         }
 
         drop(listener);
+        #[cfg(unix)]
         cleanup_unix_socket_on_shutdown(&self.endpoint);
 
+        if accept_err.is_some() {
+            client_tasks.abort_all();
+        }
         while let Some(_res) = client_tasks.join_next().await {}
-        Ok(())
-    }
-}
 
-async fn bind_listener(
-    endpoint: &str,
-) -> Result<interprocess::local_socket::tokio::Listener, CoreError> {
-    #[cfg(unix)]
-    {
-        bind_unix_listener(endpoint).await
-    }
-    #[cfg(windows)]
-    {
-        bind_windows_listener(endpoint)
+        accept_err.map_or(Ok(()), Err)
     }
 }
 
@@ -149,26 +149,35 @@ async fn bind_unix_listener(
         }
     }
 
-    if path.exists() {
-        // Probe whether another live server is already listening before removing a stale socket.
-        let probe_name = path
-            .to_fs_name::<GenericFilePath>()
-            .map_err(|e| CoreError::Ipc(format!("invalid Unix socket path '{endpoint}': {e}")))?;
-        match LocalSocketStream::connect(probe_name).await {
-            Ok(_active_stream) => {
-                return Err(CoreError::Ipc(format!(
-                    "IPC endpoint '{endpoint}' is already in use by an active server"
-                )));
-            }
-            Err(_) => {
-                if let Err(err) = std::fs::remove_file(path) {
-                    if err.kind() != ErrorKind::NotFound {
-                        return Err(CoreError::Ipc(format!(
-                            "failed to remove stale socket file '{endpoint}': {err}"
-                        )));
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            // Probe whether another live server is already listening before removing a stale socket
+            // or dangling symlink.
+            let probe_name = path.to_fs_name::<GenericFilePath>().map_err(|e| {
+                CoreError::Ipc(format!("invalid Unix socket path '{endpoint}': {e}"))
+            })?;
+            match LocalSocketStream::connect(probe_name).await {
+                Ok(_active_stream) => {
+                    return Err(CoreError::Ipc(format!(
+                        "IPC endpoint '{endpoint}' is already in use by an active server"
+                    )));
+                }
+                Err(_) => {
+                    if let Err(err) = std::fs::remove_file(path) {
+                        if err.kind() != ErrorKind::NotFound {
+                            return Err(CoreError::Ipc(format!(
+                                "failed to remove stale socket file '{endpoint}': {err}"
+                            )));
+                        }
                     }
                 }
             }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(CoreError::Ipc(format!(
+                "failed to inspect Unix socket path '{endpoint}': {err}"
+            )));
         }
     }
 
@@ -184,8 +193,12 @@ async fn bind_unix_listener(
         .create_tokio()
         .map_err(|e| CoreError::Ipc(format!("failed to bind Unix socket '{endpoint}': {e}")))?;
 
-    // Enforce 0600 permissions explicitly after bind across Linux and macOS.
-    apply_unix_socket_permissions(path)?;
+    // Enforce 0600 permissions explicitly after bind across Linux and macOS; unlink on failure.
+    if let Err(err) = apply_unix_socket_permissions(path) {
+        drop(listener);
+        let _ = std::fs::remove_file(path);
+        return Err(err);
+    }
     Ok(listener)
 }
 
@@ -209,23 +222,28 @@ fn bind_windows_listener(
     let name = pipe_name
         .to_ns_name::<GenericNamespaced>()
         .map_err(|e| CoreError::Ipc(format!("invalid Windows pipe name '{pipe_name}': {e}")))?;
+
+    // Restrict Named Pipe DACL to Local System (SY), Built-in Administrators (BA), and the
+    // current user SID (OW/CO) so unprivileged local users and network clients cannot connect.
+    let sd = SecurityDescriptor::deserialize(u16cstr!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)"))
+        .map_err(|e| {
+        CoreError::Ipc(format!(
+            "failed to create Named Pipe security descriptor: {e}"
+        ))
+    })?;
+
     ListenerOptions::new()
         .name(name)
+        .security_descriptor(sd)
         .create_tokio()
         .map_err(|e| CoreError::Ipc(format!("failed to bind Named Pipe '{endpoint}': {e}")))
 }
 
+#[cfg(unix)]
 fn cleanup_unix_socket_on_shutdown(endpoint: &str) {
-    #[cfg(unix)]
-    {
-        let path = Path::new(endpoint);
-        if path.exists() {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = endpoint;
+    let path = Path::new(endpoint);
+    if std::fs::symlink_metadata(path).is_ok() {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -258,13 +276,14 @@ async fn handle_connection(
     let mut source_name: Option<String> = None;
 
     loop {
+        if *shutdown_rx.borrow_and_update() {
+            break;
+        }
+
         let msg_res = tokio::select! {
             biased;
-            changed = shutdown_rx.changed() => {
-                if changed.is_err() || *shutdown_rx.borrow() {
-                    break;
-                }
-                continue;
+            _ = shutdown_rx.wait_for(|v| *v) => {
+                break;
             }
             frame = read_next_message(&mut stream) => frame,
         };
@@ -319,19 +338,24 @@ fn message_to_event(conn_id: u64, source: &str, msg: Message) -> Option<AudioInp
             channels,
             flags,
             pcm_samples,
-        } => Some(AudioInputEvent::AudioFrame(AudioChunk {
-            speaker_key: SpeakerKey::new(source.to_owned(), user_id),
-            seq,
-            sample_rate,
-            channels,
-            is_local_user: (flags & AUDIO_FLAG_IS_LOCAL_USER) != 0,
-            samples: pcm_samples,
-        })),
+        } => Some(AudioInputEvent::AudioFrame {
+            conn_id,
+            chunk: AudioChunk {
+                speaker_key: SpeakerKey::new(source.to_owned(), user_id),
+                seq,
+                sample_rate,
+                channels,
+                is_local_user: (flags & AUDIO_FLAG_IS_LOCAL_USER) != 0,
+                samples: pcm_samples,
+            },
+        }),
         Message::TalkingState { user_id, state } => Some(AudioInputEvent::TalkingStateChanged {
+            conn_id,
             speaker_key: SpeakerKey::new(source.to_owned(), user_id),
             state: map_talking_state(state),
         }),
         Message::UserInfo { user_id, name } => Some(AudioInputEvent::UserInfoUpdated {
+            conn_id,
             speaker_key: SpeakerKey::new(source.to_owned(), user_id),
             name,
         }),
@@ -340,6 +364,7 @@ fn message_to_event(conn_id: u64, source: &str, msg: Message) -> Option<AudioInp
             source: source.to_owned(),
         }),
         Message::UserRemoved { user_id } => Some(AudioInputEvent::UserRemoved {
+            conn_id,
             speaker_key: SpeakerKey::new(source.to_owned(), user_id),
         }),
         Message::SourceReset => Some(AudioInputEvent::SourceReset {

@@ -13,6 +13,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 
 #ifndef KOTOHA_PLUGIN_VERSION
 #define KOTOHA_PLUGIN_VERSION "0.1.0"
@@ -48,9 +49,28 @@ struct PluginState {
     std::atomic<bool> has_local_user_id{false};
 
     // Stored under lifecycle_mutex; published into atomic raw pointer for
-    // wait-free, zero-lock access inside mumble_onAudioSourceFetched.
+    // wait-free, zero-lock access inside mumble_onAudioSourceFetched and
+    // deadlock-free access in control callbacks.
     std::unique_ptr<kotoha::ipc::IpcClient> ipc_client_owner;
     std::atomic<kotoha::ipc::IpcClient*> ipc_client{nullptr};
+    std::atomic<uint32_t> audio_in_flight{0};
+    std::atomic<uint32_t> control_in_flight{0};
+};
+
+class InFlightGuard {
+public:
+    explicit InFlightGuard(std::atomic<uint32_t>& counter) noexcept : counter_(counter) {
+        counter_.fetch_add(1U, std::memory_order_seq_cst);
+    }
+    ~InFlightGuard() noexcept { counter_.fetch_sub(1U, std::memory_order_release); }
+
+    InFlightGuard(const InFlightGuard&) = delete;
+    InFlightGuard& operator=(const InFlightGuard&) = delete;
+    InFlightGuard(InFlightGuard&&) = delete;
+    InFlightGuard& operator=(InFlightGuard&&) = delete;
+
+private:
+    std::atomic<uint32_t>& counter_;
 };
 
 PluginState& state() {
@@ -142,10 +162,17 @@ PLUGIN_EXPORT void PLUGIN_CALLING_CONVENTION mumble_shutdown() {
             return;
         }
         st.initialized = false;
-        st.has_local_user_id.store(false, std::memory_order_relaxed);
+        st.has_local_user_id.store(false, std::memory_order_release);
         st.local_user_id.store(0, std::memory_order_relaxed);
-        st.ipc_client.store(nullptr, std::memory_order_release);
+        st.ipc_client.store(nullptr, std::memory_order_seq_cst);
         client_to_stop = std::move(st.ipc_client_owner);
+    }
+
+    // Wait for all concurrent audio and control callbacks that loaded the old
+    // ipc_client pointer to finish before stopping and destroying the client.
+    while (st.audio_in_flight.load(std::memory_order_seq_cst) != 0U ||
+           st.control_in_flight.load(std::memory_order_seq_cst) != 0U) {
+        std::this_thread::yield();
     }
 
     if (client_to_stop != nullptr) {
@@ -202,9 +229,9 @@ PLUGIN_EXPORT uint32_t PLUGIN_CALLING_CONVENTION mumble_deactivateFeatures(uint3
 PLUGIN_EXPORT void PLUGIN_CALLING_CONVENTION
 mumble_onServerSynchronized(mumble_connection_t connection) {
     PluginState& st = state();
+    const InFlightGuard guard(st.control_in_flight);
     MumbleAPI_v_1_0_x api{};
     mumble_plugin_id_t own_id = 0;
-    kotoha::ipc::IpcClient* client = nullptr;
 
     {
         std::lock_guard<std::mutex> lock(st.lifecycle_mutex);
@@ -213,9 +240,9 @@ mumble_onServerSynchronized(mumble_connection_t connection) {
         }
         api = st.api;
         own_id = st.own_id;
-        client = st.ipc_client.load(std::memory_order_acquire);
     }
 
+    kotoha::ipc::IpcClient* client = st.ipc_client.load(std::memory_order_seq_cst);
     if (client == nullptr) {
         return;
     }
@@ -224,7 +251,7 @@ mumble_onServerSynchronized(mumble_connection_t connection) {
         mumble_userid_t local_id = 0;
         if (api.getLocalUserID(own_id, connection, &local_id) == MUMBLE_STATUS_OK) {
             st.local_user_id.store(static_cast<uint32_t>(local_id), std::memory_order_relaxed);
-            st.has_local_user_id.store(true, std::memory_order_relaxed);
+            st.has_local_user_id.store(true, std::memory_order_release);
         }
     }
 
@@ -248,10 +275,11 @@ PLUGIN_EXPORT void PLUGIN_CALLING_CONVENTION
 mumble_onServerDisconnected(mumble_connection_t connection) {
     (void)connection;
     PluginState& st = state();
-    st.has_local_user_id.store(false, std::memory_order_relaxed);
+    const InFlightGuard guard(st.control_in_flight);
+    st.has_local_user_id.store(false, std::memory_order_release);
     st.local_user_id.store(0, std::memory_order_relaxed);
 
-    kotoha::ipc::IpcClient* client = st.ipc_client.load(std::memory_order_acquire);
+    kotoha::ipc::IpcClient* client = st.ipc_client.load(std::memory_order_seq_cst);
     if (client != nullptr) {
         client->push_source_reset();
     }
@@ -260,9 +288,9 @@ mumble_onServerDisconnected(mumble_connection_t connection) {
 PLUGIN_EXPORT void PLUGIN_CALLING_CONVENTION mumble_onUserAdded(mumble_connection_t connection,
                                                                 mumble_userid_t userID) {
     PluginState& st = state();
+    const InFlightGuard guard(st.control_in_flight);
     MumbleAPI_v_1_0_x api{};
     mumble_plugin_id_t own_id = 0;
-    kotoha::ipc::IpcClient* client = nullptr;
 
     {
         std::lock_guard<std::mutex> lock(st.lifecycle_mutex);
@@ -271,9 +299,9 @@ PLUGIN_EXPORT void PLUGIN_CALLING_CONVENTION mumble_onUserAdded(mumble_connectio
         }
         api = st.api;
         own_id = st.own_id;
-        client = st.ipc_client.load(std::memory_order_acquire);
     }
 
+    kotoha::ipc::IpcClient* client = st.ipc_client.load(std::memory_order_seq_cst);
     fetch_and_push_user_info(api, own_id, connection, userID, client);
 }
 
@@ -281,7 +309,8 @@ PLUGIN_EXPORT void PLUGIN_CALLING_CONVENTION mumble_onUserRemoved(mumble_connect
                                                                   mumble_userid_t userID) {
     (void)connection;
     PluginState& st = state();
-    kotoha::ipc::IpcClient* client = st.ipc_client.load(std::memory_order_acquire);
+    const InFlightGuard guard(st.control_in_flight);
+    kotoha::ipc::IpcClient* client = st.ipc_client.load(std::memory_order_seq_cst);
     if (client != nullptr) {
         client->push_user_removed(static_cast<uint32_t>(userID));
     }
@@ -296,7 +325,8 @@ PLUGIN_EXPORT void PLUGIN_CALLING_CONVENTION mumble_onUserTalkingStateChanged(
     }
 
     PluginState& st = state();
-    kotoha::ipc::IpcClient* client = st.ipc_client.load(std::memory_order_acquire);
+    const InFlightGuard guard(st.control_in_flight);
+    kotoha::ipc::IpcClient* client = st.ipc_client.load(std::memory_order_seq_cst);
     if (client != nullptr) {
         client->push_talking_state(static_cast<uint32_t>(userID), mapped);
     }
@@ -313,7 +343,8 @@ mumble_onAudioSourceFetched(float* outputPCM, uint32_t sampleCount, uint16_t cha
     }
 
     PluginState& st = state();
-    kotoha::ipc::IpcClient* client = st.ipc_client.load(std::memory_order_acquire);
+    const InFlightGuard guard(st.audio_in_flight);
+    kotoha::ipc::IpcClient* client = st.ipc_client.load(std::memory_order_seq_cst);
     if (client == nullptr) {
         return false;
     }
@@ -329,7 +360,7 @@ mumble_onAudioSourceFetched(float* outputPCM, uint32_t sampleCount, uint16_t cha
     }
 
     uint16_t flags = 0U;
-    if (st.has_local_user_id.load(std::memory_order_relaxed) &&
+    if (st.has_local_user_id.load(std::memory_order_acquire) &&
         st.local_user_id.load(std::memory_order_relaxed) == static_cast<uint32_t>(userID)) {
         flags |= kotoha::ipc::kAudioFlagIsLocalUser;
     }

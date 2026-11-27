@@ -182,10 +182,9 @@ impl GlossaryPlaceholderGuard {
         let mut pos = 0usize;
         while pos < text.len() {
             let tail = &text[pos..];
-            if let Some(&(src_term, tgt_term)) = sorted_terms
-                .iter()
-                .find(|&&(src_term, _)| tail.starts_with(src_term))
-            {
+            if let Some(&(src_term, tgt_term)) = sorted_terms.iter().find(|&&(src_term, _)| {
+                tail.starts_with(src_term) && is_word_boundary_match(text, pos, src_term)
+            }) {
                 let placeholder = assigned
                     .entry(src_term)
                     .or_insert_with(|| {
@@ -275,4 +274,26 @@ pub fn protect_terms(
 #[must_use]
 pub fn restore_terms(translated_text: &str, guard: &GlossaryPlaceholderGuard) -> String {
     guard.restore(translated_text)
+}
+
+const fn is_ascii_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+const fn is_word_boundary_match(text: &str, pos: usize, term: &str) -> bool {
+    let term_bytes = term.as_bytes();
+    let text_bytes = text.as_bytes();
+    if let Some(&first) = term_bytes.first() {
+        if is_ascii_word_byte(first) && pos > 0 && is_ascii_word_byte(text_bytes[pos - 1]) {
+            return false;
+        }
+    }
+    let end = pos + term_bytes.len();
+    if let Some(&last) = term_bytes.last() {
+        if is_ascii_word_byte(last) && end < text_bytes.len() && is_ascii_word_byte(text_bytes[end])
+        {
+            return false;
+        }
+    }
+    true
 }

@@ -7,8 +7,6 @@ import {
 } from '../data/modelCatalog';
 import type {
   ComputeDevice,
-  DeepLPlan,
-  GoogleTranslateApiVersion,
   OverlayDisplayOptions,
   TranslationProviderConfig,
   TranslationProviderType,
@@ -132,7 +130,6 @@ export function TranslationSettings({
                     onChangeProvider({
                       ...provider,
                       model_id: nextProfile.model_id,
-                      compute_type: nextProfile.compute_type,
                     });
                   }}
                 >
@@ -165,6 +162,26 @@ export function TranslationSettings({
                 </select>
               </label>
             </div>
+
+            <label className="field">
+              <span className="field-label">Worker Threads (empty / 0 = Auto)</span>
+              <input
+                id="local-threads-input"
+                type="number"
+                min={0}
+                max={64}
+                value={provider.threads ?? ''}
+                placeholder="Auto"
+                onChange={(e) => {
+                  const raw = e.target.value.trim();
+                  const parsed = raw === '' ? null : Math.max(0, Number(raw) || 0);
+                  onChangeProvider({
+                    ...provider,
+                    threads: parsed === 0 ? null : parsed,
+                  });
+                }}
+              />
+            </label>
 
             <div className="model-meta-card" data-testid="selected-model-meta">
               <div className="model-meta-header">
@@ -249,25 +266,28 @@ export function TranslationSettings({
                 <input
                   id="openai-api-key"
                   type="password"
-                  value={provider.api_key}
+                  value={provider.api_key ?? ''}
                   placeholder="Stored in OS keychain at runtime"
                   onChange={(e) =>
-                    onChangeProvider({ ...provider, api_key: e.target.value })
+                    onChangeProvider({
+                      ...provider,
+                      api_key: e.target.value === '' ? null : e.target.value,
+                    })
                   }
                 />
               </label>
               <label className="field">
-                <span className="field-label">Context Window (5–10 turns)</span>
+                <span className="field-label">Request Timeout (ms)</span>
                 <input
-                  id="openai-context-window"
+                  id="openai-timeout-ms"
                   type="number"
-                  min={5}
-                  max={10}
-                  value={provider.context_window}
+                  min={500}
+                  max={60000}
+                  value={provider.timeout_ms}
                   onChange={(e) =>
                     onChangeProvider({
                       ...provider,
-                      context_window: Math.min(10, Math.max(5, Number(e.target.value) || 8)),
+                      timeout_ms: Math.max(500, Number(e.target.value) || 15_000),
                     })
                   }
                 />
@@ -280,14 +300,14 @@ export function TranslationSettings({
           <div className="provider-config" data-testid="config-deepl">
             <div className="field-grid two-col">
               <label className="field">
-                <span className="field-label">DeepL Plan</span>
+                <span className="field-label">DeepL Endpoint Tier</span>
                 <select
                   id="deepl-plan-select"
-                  value={provider.plan}
+                  value={provider.use_free_endpoint ? 'free' : 'pro'}
                   onChange={(e) =>
                     onChangeProvider({
                       ...provider,
-                      plan: e.target.value as DeepLPlan,
+                      use_free_endpoint: e.target.value === 'free',
                     })
                   }
                 >
@@ -296,18 +316,20 @@ export function TranslationSettings({
                 </select>
               </label>
               <label className="field">
-                <span className="field-label">Formality</span>
-                <select
-                  id="deepl-formality-select"
-                  value={provider.formality}
+                <span className="field-label">Request Timeout (ms)</span>
+                <input
+                  id="deepl-timeout-ms"
+                  type="number"
+                  min={500}
+                  max={60000}
+                  value={provider.timeout_ms}
                   onChange={(e) =>
-                    onChangeProvider({ ...provider, formality: e.target.value })
+                    onChangeProvider({
+                      ...provider,
+                      timeout_ms: Math.max(500, Number(e.target.value) || 10_000),
+                    })
                   }
-                >
-                  <option value="default">Default</option>
-                  <option value="more">More Formal</option>
-                  <option value="less">Less Formal</option>
-                </select>
+                />
               </label>
             </div>
             <label className="field">
@@ -329,31 +351,33 @@ export function TranslationSettings({
           <div className="provider-config" data-testid="config-google-cloud">
             <div className="field-grid two-col">
               <label className="field">
-                <span className="field-label">API Version</span>
-                <select
-                  id="google-api-version"
-                  value={provider.api_version}
-                  onChange={(e) =>
-                    onChangeProvider({
-                      ...provider,
-                      api_version: e.target.value as GoogleTranslateApiVersion,
-                    })
-                  }
-                >
-                  <option value="v2">v2 Basic REST</option>
-                  <option value="v3">v3 Advanced (Project ID)</option>
-                </select>
-              </label>
-              <label className="field">
-                <span className="field-label">Project ID (v3 only)</span>
+                <span className="field-label">GCP Project ID (Optional, v3 only)</span>
                 <input
                   id="google-project-id"
                   type="text"
-                  value={provider.project_id}
-                  disabled={provider.api_version !== 'v3'}
-                  placeholder="my-gcp-project"
+                  value={provider.project_id ?? ''}
+                  placeholder="my-gcp-project (leave blank for v2)"
                   onChange={(e) =>
-                    onChangeProvider({ ...provider, project_id: e.target.value })
+                    onChangeProvider({
+                      ...provider,
+                      project_id: e.target.value === '' ? null : e.target.value,
+                    })
+                  }
+                />
+              </label>
+              <label className="field">
+                <span className="field-label">Request Timeout (ms)</span>
+                <input
+                  id="google-timeout-ms"
+                  type="number"
+                  min={500}
+                  max={60000}
+                  value={provider.timeout_ms}
+                  onChange={(e) =>
+                    onChangeProvider({
+                      ...provider,
+                      timeout_ms: Math.max(500, Number(e.target.value) || 10_000),
+                    })
                   }
                 />
               </label>
@@ -387,35 +411,55 @@ export function TranslationSettings({
                 }
               />
             </label>
-            <label className="field">
-              <span className="field-label">Bearer Token (Optional)</span>
-              <input
-                id="gas-bearer-token"
-                type="password"
-                value={provider.bearer_token}
-                placeholder="Optional shared secret"
-                onChange={(e) =>
-                  onChangeProvider({ ...provider, bearer_token: e.target.value })
-                }
-              />
-            </label>
+            <div className="field-grid two-col">
+              <label className="field">
+                <span className="field-label">Bearer Token (Optional)</span>
+                <input
+                  id="gas-bearer-token"
+                  type="password"
+                  value={provider.bearer_token ?? ''}
+                  placeholder="Optional shared secret"
+                  onChange={(e) =>
+                    onChangeProvider({
+                      ...provider,
+                      bearer_token: e.target.value === '' ? null : e.target.value,
+                    })
+                  }
+                />
+              </label>
+              <label className="field">
+                <span className="field-label">Request Timeout (ms)</span>
+                <input
+                  id="gas-timeout-ms"
+                  type="number"
+                  min={500}
+                  max={60000}
+                  value={provider.timeout_ms}
+                  onChange={(e) =>
+                    onChangeProvider({
+                      ...provider,
+                      timeout_ms: Math.max(500, Number(e.target.value) || 10_000),
+                    })
+                  }
+                />
+              </label>
+            </div>
           </div>
         )}
 
         {provider.type === 'mock' && (
           <div className="provider-config" data-testid="config-mock">
             <label className="field">
-              <span className="field-label">Simulated Latency (ms)</span>
+              <span className="field-label">Output Prefix</span>
               <input
-                id="mock-latency-ms"
-                type="number"
-                min={0}
-                max={2000}
-                value={provider.latency_ms}
+                id="mock-prefix-input"
+                type="text"
+                value={provider.prefix}
+                placeholder="[ja] "
                 onChange={(e) =>
                   onChangeProvider({
                     ...provider,
-                    latency_ms: Math.max(0, Number(e.target.value) || 0),
+                    prefix: e.target.value,
                   })
                 }
               />

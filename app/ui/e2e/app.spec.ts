@@ -26,7 +26,7 @@ test.describe('Kotoha UI E2E', () => {
     );
     await expect(page.getByTestId('subtitle-entry-102')).toHaveAttribute(
       'data-stage',
-      'final_pending',
+      'final_pending_translation',
     );
     await expect(page.getByTestId('subtitle-entry-103')).toHaveAttribute(
       'data-stage',
@@ -55,7 +55,7 @@ test.describe('Kotoha UI E2E', () => {
     await page.getByTestId('compute-device-select').selectOption('metal');
     await expect(page.getByTestId('non-commercial-warning')).toBeVisible();
     await expect(page.getByTestId('active-engine-summary')).toContainText(
-      'NLLB-200 Distilled 600M (int8) · METAL',
+      'NLLB-200 Distilled 600M (Multilingual INT8, Non-Commercial) · METAL',
     );
 
     await page.getByTestId('provider-tab-openai_compatible').click();
@@ -69,6 +69,9 @@ test.describe('Kotoha UI E2E', () => {
 
     await page.getByTestId('provider-tab-gas_webhook').click();
     await expect(page.getByTestId('config-gas-webhook')).toBeVisible();
+
+    await page.getByTestId('provider-tab-mock').click();
+    await expect(page.getByTestId('config-mock')).toBeVisible();
 
     // Switch back to Overlay Preview
     await page.getByTestId('mode-overlay-btn').click();

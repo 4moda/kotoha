@@ -113,6 +113,9 @@ impl SourceSessionManager {
     }
 
     /// Processes an [`AudioInputEvent`] and returns any speaker cleanup or `seq` inspection result.
+    ///
+    /// Events originating from a superseded or non-owning `conn_id` are ignored and return
+    /// [`SessionAction::None`].
     pub fn handle_event(&mut self, event: &AudioInputEvent) -> SessionAction {
         match event {
             AudioInputEvent::SourceConnected {
@@ -126,7 +129,14 @@ impl SourceSessionManager {
             AudioInputEvent::SourceReset { conn_id, source } => {
                 self.on_source_reset(*conn_id, source)
             }
-            AudioInputEvent::UserInfoUpdated { speaker_key, name } => {
+            AudioInputEvent::UserInfoUpdated {
+                conn_id,
+                speaker_key,
+                name,
+            } => {
+                if !self.is_owner(*conn_id, &speaker_key.source) {
+                    return SessionAction::None;
+                }
                 self.register_speaker(speaker_key);
                 let meta = self.speakers.entry(speaker_key.clone()).or_default();
                 meta.display_name = if name.is_empty() {
@@ -136,20 +146,32 @@ impl SourceSessionManager {
                 };
                 SessionAction::None
             }
-            AudioInputEvent::UserRemoved { speaker_key } => {
+            AudioInputEvent::UserRemoved {
+                conn_id,
+                speaker_key,
+            } => {
+                if !self.is_owner(*conn_id, &speaker_key.source) {
+                    return SessionAction::None;
+                }
                 self.remove_speaker(speaker_key);
                 SessionAction::RemoveSpeaker(speaker_key.clone())
             }
-            AudioInputEvent::TalkingStateChanged { speaker_key, state } => {
+            AudioInputEvent::TalkingStateChanged {
+                conn_id,
+                speaker_key,
+                state,
+            } => {
+                if !self.is_owner(*conn_id, &speaker_key.source) {
+                    return SessionAction::None;
+                }
                 self.register_speaker(speaker_key);
                 let meta = self.speakers.entry(speaker_key.clone()).or_default();
                 meta.talking_state = *state;
                 SessionAction::None
             }
-            AudioInputEvent::AudioFrame(chunk) => {
-                let status = self.on_audio_frame(chunk);
-                SessionAction::AudioSequenceChecked(status)
-            }
+            AudioInputEvent::AudioFrame { conn_id, chunk } => self
+                .on_audio_frame(*conn_id, chunk)
+                .map_or(SessionAction::None, SessionAction::AudioSequenceChecked),
             AudioInputEvent::Heartbeat { conn_id, source } => {
                 if let Some(active) = self.active_sources.get_mut(source) {
                     if active.conn_id == *conn_id {
@@ -159,6 +181,14 @@ impl SourceSessionManager {
                 SessionAction::None
             }
         }
+    }
+
+    /// Returns `true` if `conn_id` is currently the active owning connection for `source`.
+    #[must_use]
+    pub fn is_owner(&self, conn_id: u64, source: &str) -> bool {
+        self.active_sources
+            .get(source)
+            .is_some_and(|c| c.conn_id == conn_id)
     }
 
     /// Returns the currently owning `conn_id` for `source`, if connected.
@@ -224,11 +254,7 @@ impl SourceSessionManager {
     }
 
     fn on_source_disconnected(&mut self, conn_id: u64, source: &str) -> SessionAction {
-        let is_owner = self
-            .active_sources
-            .get(source)
-            .is_some_and(|c| c.conn_id == conn_id);
-        if !is_owner {
+        if !self.is_owner(conn_id, source) {
             return SessionAction::None;
         }
         self.active_sources.remove(source);
@@ -243,11 +269,7 @@ impl SourceSessionManager {
         // Per DESIGN.md Section 3.2 & 3.4:
         // - Verify conn_id ownership before cleaning up speaker streams.
         // - Keep active_sources registration and expected_seq intact across SourceReset!
-        let is_owner = self
-            .active_sources
-            .get(source)
-            .is_some_and(|c| c.conn_id == conn_id);
-        if !is_owner {
+        if !self.is_owner(conn_id, source) {
             return SessionAction::None;
         }
         let removed_speakers = self.clear_speakers_for_source(source);
@@ -257,21 +279,17 @@ impl SourceSessionManager {
         }
     }
 
-    fn on_audio_frame(&mut self, chunk: &AudioChunk) -> SeqStatus {
+    fn on_audio_frame(&mut self, conn_id: u64, chunk: &AudioChunk) -> Option<SeqStatus> {
+        if !self.is_owner(conn_id, &chunk.speaker_key.source) {
+            return None;
+        }
+
         self.register_speaker(&chunk.speaker_key);
 
-        let active = self
-            .active_sources
-            .entry(chunk.speaker_key.source.clone())
-            .or_insert_with(|| ActiveConnection {
-                conn_id: 0,
-                expected_seq: None,
-                stats: SourceStats::default(),
-            });
-
+        let active = self.active_sources.get_mut(&chunk.speaker_key.source)?;
         active.stats.frames_received += 1;
 
-        match active.expected_seq {
+        let status = match active.expected_seq {
             None => {
                 active.expected_seq = Some(chunk.seq.wrapping_add(1));
                 SeqStatus::Initialized { seq: chunk.seq }
@@ -294,7 +312,9 @@ impl SourceSessionManager {
                     }
                 }
             }
-        }
+        };
+
+        Some(status)
     }
 
     fn register_speaker(&mut self, speaker_key: &SpeakerKey) {

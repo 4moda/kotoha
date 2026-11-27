@@ -23,7 +23,7 @@ const INITIAL_SUBTITLES: SubtitleEntry[] = [
     speaker_color: getDeterministicSpeakerColor({ source: 'mumble', user_id: 12 }),
     src_text: 'Push mid together in ten seconds, watch the flank.',
     translated_text: '10秒後に一緒にミッドを押し上げよう、横からの奇襲に注意して。',
-    is_final_stt: true,
+    stage: 'translated',
     timestamp_ms: 1700000001000,
   },
   {
@@ -33,7 +33,7 @@ const INITIAL_SUBTITLES: SubtitleEntry[] = [
     speaker_color: getDeterministicSpeakerColor({ source: 'mumble', user_id: 27 }),
     src_text: 'Copy that, smoking stairs now and rotating behind you.',
     translated_text: null,
-    is_final_stt: true,
+    stage: 'final_pending_translation',
     timestamp_ms: 1700000002400,
   },
   {
@@ -43,7 +43,7 @@ const INITIAL_SUBTITLES: SubtitleEntry[] = [
     speaker_color: getDeterministicSpeakerColor({ source: 'mumble', user_id: 41 }),
     src_text: 'Hold on, reloading my...',
     translated_text: null,
-    is_final_stt: false,
+    stage: 'interim',
     timestamp_ms: 1700000003100,
   },
 ];
@@ -118,15 +118,15 @@ export function App() {
       return `OpenAI-Compatible (${provider.model})`;
     }
     if (provider.type === 'deepl') {
-      return `DeepL (${provider.plan.toUpperCase()})`;
+      return `DeepL (${provider.use_free_endpoint ? 'FREE' : 'PRO'})`;
     }
     if (provider.type === 'google_cloud') {
-      return `Google Cloud (${provider.api_version})`;
+      return `Google Cloud (${provider.project_id ? 'v3' : 'v2'})`;
     }
     if (provider.type === 'gas_webhook') {
       return 'GAS / Custom HTTP Proxy';
     }
-    return `Mock Translator (${provider.latency_ms}ms)`;
+    return `Mock Translator (${provider.prefix})`;
   }, [provider]);
 
   const handleRunLifecycleDemo = () => {
@@ -151,7 +151,7 @@ export function App() {
         speaker_color: speakerColor,
         src_text: item.interim,
         translated_text: null,
-        is_final_stt: false,
+        stage: 'interim',
         timestamp_ms: now,
       },
     ]);
@@ -160,7 +160,11 @@ export function App() {
       setSubtitles((prev) =>
         prev.map((entry) =>
           entry.utterance_id === utteranceId
-            ? { ...entry, src_text: item.final, is_final_stt: true }
+            ? {
+                ...entry,
+                src_text: item.final,
+                stage: 'final_pending_translation',
+              }
             : entry,
         ),
       );
@@ -174,8 +178,9 @@ export function App() {
                 ...entry,
                 translated_text:
                   provider.type === 'mock'
-                    ? `[mock ${srcLang}->${tgtLang}] ${item.final}`
+                    ? `${provider.prefix}${item.final}`
                     : item.ja,
+                stage: 'translated',
               }
             : entry,
         ),
