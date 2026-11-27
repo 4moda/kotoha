@@ -1,0 +1,9 @@
+name = "My Profile"
+src_lang = "en"
+tgt_lang = "ja"
+
+[terms]
+"Ferox" = "Ferox"
+"Logi" = "ロジ"
+"Anchor" = "アンカー"
+"M W D" = "MWD"

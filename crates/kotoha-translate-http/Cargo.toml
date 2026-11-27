@@ -1,0 +1,21 @@
+[package]
+name = "kotoha-translate-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "HTTP translation provider adapters (OpenAI-compatible, DeepL, Google Cloud v2, GAS Webhook) for Kotoha"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+kotoha-core.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -14,20 +14,20 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kotoha_core::application::{
-    PipelineConfig, PipelineService, SeqStatus, SessionAction, SourceSessionManager,
-    TranslatorManager,
+    GlossaryManager, PipelineConfig, PipelineService, SeqStatus, SessionAction,
+    SourceSessionManager, TranslatorManager,
 };
 use kotoha_core::domain::{
     default_model_catalog, protect_terms, restore_terms, AudioChunk, AudioInputEvent,
     ComputeDevice, ContextWindow, CoreError, GlossaryEntry, GlossaryPlaceholderGuard,
-    GlossaryProfile, GlossarySettings, HistoryEntry, LanguageCode, MergedGlossary, PreFilter,
-    SpeakerKey, SttDecodingMethod, SttEngine, SttHotwordsConfig, SttStream, SubtitleStage,
-    TalkingState, TranslationProviderConfig, TranslationRequest, TranslationResult, Translator,
-    TranslatorFactory, UtteranceId, DEFAULT_HOTWORDS_SCORE,
+    GlossaryProfile, GlossaryRepository, GlossarySettings, HistoryEntry, LanguageCode,
+    MergedGlossary, PreFilter, SpeakerKey, SttDecodingMethod, SttEngine, SttHotwordsConfig,
+    SttStream, SubtitleStage, TalkingState, TranslationProviderConfig, TranslationRequest,
+    TranslationResult, Translator, TranslatorFactory, UtteranceId, DEFAULT_HOTWORDS_SCORE,
 };
 use kotoha_core::infrastructure::{
     connect_local_socket, AudioPreprocessor, CollectingSubtitleSink, DefaultTranslatorFactory,
-    IpcServerAdapter, MockSttEngine, MockTranslator, TARGET_SAMPLE_RATE,
+    IpcServerAdapter, MockSttEngine, MockTranslator, TomlGlossaryRepository, TARGET_SAMPLE_RATE,
 };
 use kotoha_protocol::{encode_frame, Message, TalkingStateKind};
 use tokio::io::AsyncWriteExt;
@@ -528,12 +528,12 @@ impl TranslatorFactory for RecordingFactory {
 
 #[tokio::test]
 async fn translator_manager_runtime_hot_swap_and_validation() {
-    let factory = RecordingFactory;
+    let factory: Arc<dyn TranslatorFactory> = Arc::new(RecordingFactory);
     let mgr = TranslatorManager::from_config(
         TranslationProviderConfig::Mock {
             prefix: "[mock] ".to_owned(),
         },
-        &factory,
+        factory.as_ref(),
     )
     .expect("create manager");
 
@@ -548,7 +548,7 @@ async fn translator_manager_runtime_hot_swap_and_validation() {
                 device: ComputeDevice::Auto,
                 threads: None,
             },
-            &factory,
+            Arc::clone(&factory),
         )
         .await
         .expect_err("unknown model profile must be rejected");
@@ -562,7 +562,7 @@ async fn translator_manager_runtime_hot_swap_and_validation() {
             device: ComputeDevice::Cpu,
             threads: Some(4),
         },
-        &factory,
+        Arc::clone(&factory),
     )
     .await
     .expect("switch to fugumt");
@@ -576,11 +576,45 @@ async fn translator_manager_runtime_hot_swap_and_validation() {
             api_key: None,
             timeout_ms: 5_000,
         },
-        &factory,
+        Arc::clone(&factory),
     )
     .await
     .expect("switch to local ollama");
     assert_eq!(mgr.current_provider_id().await, "openai:qwen2.5:7b");
+
+    // Verify Debug redacts secrets on TranslationProviderConfig
+    let deepl_dbg = format!(
+        "{:?}",
+        TranslationProviderConfig::DeepL {
+            api_key: "super-secret-deepl-key".to_owned(),
+            use_free_endpoint: true,
+            timeout_ms: 5_000,
+        }
+    );
+    assert!(!deepl_dbg.contains("super-secret-deepl-key"));
+    assert!(deepl_dbg.contains("[REDACTED]"));
+
+    let gc_dbg = format!(
+        "{:?}",
+        TranslationProviderConfig::GoogleCloud {
+            api_key: "super-secret-gc-key".to_owned(),
+            project_id: Some("proj".to_owned()),
+            timeout_ms: 5_000,
+        }
+    );
+    assert!(!gc_dbg.contains("super-secret-gc-key"));
+    assert!(gc_dbg.contains("[REDACTED]"));
+
+    let gas_dbg = format!(
+        "{:?}",
+        TranslationProviderConfig::GasWebhook {
+            endpoint_url: "https://script.google.com/macros/s/1/exec".to_owned(),
+            bearer_token: Some("super-secret-bearer".to_owned()),
+            timeout_ms: 5_000,
+        }
+    );
+    assert!(!gas_dbg.contains("super-secret-bearer"));
+    assert!(gas_dbg.contains("[REDACTED]"));
 
     // DefaultTranslatorFactory returns NotConfigured for empty DeepL key
     let empty_deepl = DefaultTranslatorFactory.create(&TranslationProviderConfig::DeepL {
@@ -1213,4 +1247,362 @@ async fn ipc_server_handles_shutdown_signal_and_stale_symlink() {
         .expect("server shutdown must not deadlock")
         .expect("join ok")
         .expect("server ok");
+}
+
+#[test]
+fn toml_glossary_repository_loads_sample_validates_fields_and_sorts_dir() {
+    let repo = TomlGlossaryRepository::new();
+
+    // 1. Load repository sample glossary (glossaries/sample.toml)
+    let sample_path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../glossaries/sample.toml");
+    let sample = repo
+        .load_file(&sample_path)
+        .expect("sample.toml should load cleanly");
+    assert_eq!(sample.name, "My Profile");
+    assert_eq!(sample.src_lang.as_str(), "en");
+    assert_eq!(sample.tgt_lang.as_str(), "ja");
+    assert_eq!(sample.terms.get("Ferox").map(String::as_str), Some("Ferox"));
+    assert_eq!(sample.terms.get("Logi").map(String::as_str), Some("ロジ"));
+    assert_eq!(
+        sample.terms.get("Anchor").map(String::as_str),
+        Some("アンカー")
+    );
+    assert_eq!(sample.terms.get("M W D").map(String::as_str), Some("MWD"));
+
+    // 2. Reject invalid inputs (empty name, invalid language code, blank term key/value, bad TOML)
+    assert!(matches!(
+        TomlGlossaryRepository::parse_str("name = \"   \"\nsrc_lang = \"en\"\ntgt_lang = \"ja\""),
+        Err(CoreError::Glossary(_))
+    ));
+    assert!(matches!(
+        TomlGlossaryRepository::parse_str(
+            "name = \"ok\"\nsrc_lang = \"invalid_lang\"\ntgt_lang = \"ja\""
+        ),
+        Err(CoreError::InvalidLanguageCode(_))
+    ));
+    assert!(matches!(
+        TomlGlossaryRepository::parse_str(
+            "name = \"ok\"\nsrc_lang = \"en\"\ntgt_lang = \"ja\"\n[terms]\n\"   \" = \"val\""
+        ),
+        Err(CoreError::Glossary(_))
+    ));
+    assert!(matches!(
+        TomlGlossaryRepository::parse_str(
+            "name = \"ok\"\nsrc_lang = \"en\"\ntgt_lang = \"ja\"\n[terms]\n\"Key\" = \"  \""
+        ),
+        Err(CoreError::Glossary(_))
+    ));
+    assert!(matches!(
+        TomlGlossaryRepository::parse_str("not = [valid toml"),
+        Err(CoreError::Glossary(_))
+    ));
+
+    // 3. load_dir loads *.toml in deterministic sorted filename order and ignores non-.toml files
+    let temp_dir = std::env::temp_dir().join(format!("kotoha_toml_dir_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    std::fs::write(
+        temp_dir.join("20_override.toml"),
+        "name = \"Override\"\nsrc_lang = \"en\"\ntgt_lang = \"ja\"\n[terms]\n\"GG\" = \"お疲れ様\"\n\"M W D\" = \"MWD\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp_dir.join("10_base.toml"),
+        "name = \"Base\"\nsrc_lang = \"en\"\ntgt_lang = \"ja\"\n[terms]\n\"GG\" = \"ナイスゲーム\"\n\"Logi\" = \"ロジ\"\n",
+    )
+    .unwrap();
+    std::fs::write(temp_dir.join("notes.txt"), "not a glossary").unwrap();
+    std::fs::write(temp_dir.join("README.md"), "# ignore me").unwrap();
+
+    let loaded = repo.load_dir(&temp_dir).expect("load_dir");
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded[0].name, "Base");
+    assert_eq!(loaded[1].name, "Override");
+    assert_eq!(
+        loaded[1].terms.get("M W D").map(String::as_str),
+        Some("MWD")
+    );
+
+    // 4. Reject control characters in name / term key / term value, oversized payloads (>1 MiB),
+    // and verify case-insensitive .TOML extension support
+    assert!(matches!(
+        TomlGlossaryRepository::parse_str(
+            "name = \"Bad\\nName\"\nsrc_lang = \"en\"\ntgt_lang = \"ja\""
+        ),
+        Err(CoreError::Glossary(_))
+    ));
+    assert!(matches!(
+        TomlGlossaryRepository::parse_str(
+            "name = \"ok\"\nsrc_lang = \"en\"\ntgt_lang = \"ja\"\n[terms]\n\"Key\\nInject\" = \"val\""
+        ),
+        Err(CoreError::Glossary(_))
+    ));
+    assert!(matches!(
+        TomlGlossaryRepository::parse_str(
+            "name = \"ok\"\nsrc_lang = \"en\"\ntgt_lang = \"ja\"\n[terms]\n\"Key\" = \"val\\u0000null\""
+        ),
+        Err(CoreError::Glossary(_))
+    ));
+    let oversized_path = temp_dir.join("30_huge.TOML");
+    std::fs::write(&oversized_path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+    assert!(matches!(
+        repo.load_file(&oversized_path),
+        Err(CoreError::Glossary(_))
+    ));
+    std::fs::write(
+        &oversized_path,
+        "name = \"UpperExt\"\nsrc_lang = \"en\"\ntgt_lang = \"ja\"\n[terms]\n\"Cap\" = \"キャップ\"\n",
+    )
+    .unwrap();
+    let loaded_upper = repo.load_dir(&temp_dir).expect("load_dir with .TOML");
+    assert_eq!(loaded_upper.len(), 3);
+    assert_eq!(loaded_upper[2].name, "UpperExt");
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+struct FailingHotwordSttEngine;
+
+impl SttEngine for FailingHotwordSttEngine {
+    fn name(&self) -> &'static str {
+        "failing-hw"
+    }
+
+    fn hotwords_supported(&self) -> bool {
+        true
+    }
+
+    fn update_hotwords(&self, _config: &SttHotwordsConfig) -> Result<(), CoreError> {
+        Err(CoreError::Stt("simulated hotwords error".to_owned()))
+    }
+
+    fn create_stream(
+        &self,
+        speaker_key: SpeakerKey,
+        src_lang: &LanguageCode,
+    ) -> Result<Box<dyn SttStream>, CoreError> {
+        MockSttEngine::default().create_stream(speaker_key, src_lang)
+    }
+}
+
+#[tokio::test]
+async fn glossary_manager_priority_merge_and_hot_reload_syncs_pipeline_and_stt() {
+    let temp_dir = std::env::temp_dir().join(format!("kotoha_glossary_mgr_{}", std::process::id()));
+    let custom_dir =
+        std::env::temp_dir().join(format!("kotoha_glossary_custom_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let _ = std::fs::remove_dir_all(&custom_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    std::fs::create_dir_all(&custom_dir).unwrap();
+
+    std::fs::write(
+        temp_dir.join("01_base.toml"),
+        "name = \"Base\"\nsrc_lang = \"en\"\ntgt_lang = \"ja\"\n[terms]\n\"GG\" = \"ナイス\"\n\"M W D\" = \"MWD\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp_dir.join("02_squad.toml"),
+        "name = \"Squad\"\nsrc_lang = \"en\"\ntgt_lang = \"ja\"\n[terms]\n\"GG\" = \"お疲れ様\"\n\"Logi\" = \"ロジ\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp_dir.join("03_ko.toml"),
+        "name = \"Korean\"\nsrc_lang = \"en\"\ntgt_lang = \"ko\"\n[terms]\n\"Logi\" = \"로지\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        custom_dir.join("01_custom.toml"),
+        "name = \"Custom\"\nsrc_lang = \"en\"\ntgt_lang = \"ja\"\n[terms]\n\"Anchor\" = \"アンカー\"\n",
+    )
+    .unwrap();
+
+    let repo = TomlGlossaryRepository::new();
+    let en = LanguageCode::new("en").unwrap();
+    let ja = LanguageCode::new("ja").unwrap();
+    let mut mgr = GlossaryManager::from_dir(&repo, &temp_dir, en.clone(), ja.clone())
+        .expect("GlossaryManager::from_dir");
+
+    // Default priority order follows sorted files: Base -> Squad ("GG" overridden by Squad)
+    assert_eq!(
+        mgr.active_merged().terms().get("GG").map(String::as_str),
+        Some("お疲れ様")
+    );
+    assert_eq!(
+        mgr.active_merged().terms().get("M W D").map(String::as_str),
+        Some("MWD")
+    );
+    assert_eq!(
+        mgr.active_merged().terms().get("Logi").map(String::as_str),
+        Some("ロジ")
+    );
+    assert_eq!(mgr.active_merged().len(), 3);
+
+    let stt = Arc::new(HotwordTrackingSttEngine::new());
+    let captured_requests = Arc::new(StdMutex::new(Vec::new()));
+    let translator = Arc::new(CapturingTranslator {
+        captured_requests: Arc::clone(&captured_requests),
+    });
+    let translator_mgr = Arc::new(TranslatorManager::new(
+        translator,
+        TranslationProviderConfig::Mock {
+            prefix: "[ja] ".to_owned(),
+        },
+    ));
+    let sink = Arc::new(CollectingSubtitleSink::new());
+    let mut pipeline = PipelineService::new(
+        PipelineConfig::new(en.clone(), ja.clone()),
+        stt.clone(),
+        translator_mgr,
+        sink,
+        Arc::new(AudioPreprocessor::process_chunk),
+    );
+
+    mgr.set_hotwords_score(2.25).expect("valid hotwords score");
+    mgr.sync_pipeline(&mut pipeline)
+        .await
+        .expect("sync_pipeline");
+
+    // Reorder priority so Base overrides Squad, and hot-reload into pipeline + STT
+    mgr.update_enabled_and_sync_pipeline(
+        vec!["Squad".to_owned(), "Base".to_owned()],
+        &mut pipeline,
+    )
+    .await
+    .expect("update_enabled_and_sync_pipeline");
+
+    assert_eq!(
+        pipeline
+            .active_glossary()
+            .terms()
+            .get("GG")
+            .map(String::as_str),
+        Some("ナイス")
+    );
+
+    // Add a new file on disk and hot-reload directory -> STT & pipeline update immediately
+    std::fs::write(
+        temp_dir.join("04_fleet.toml"),
+        "name = \"Fleet\"\nsrc_lang = \"en\"\ntgt_lang = \"ja\"\n[terms]\n\"Ferox\" = \"フェロックス\"\n",
+    )
+    .unwrap();
+    mgr.set_enabled_profiles(vec![
+        "Base".to_owned(),
+        "Squad".to_owned(),
+        "Fleet".to_owned(),
+    ]);
+    mgr.reload_dir_and_sync_pipeline(&repo, &temp_dir, &mut pipeline)
+        .await
+        .expect("reload_dir_and_sync_pipeline");
+
+    assert_eq!(
+        pipeline
+            .active_glossary()
+            .terms()
+            .get("Ferox")
+            .map(String::as_str),
+        Some("フェロックス")
+    );
+
+    // Intentional empty selection (disabling all profiles) stays empty across load_from_dir
+    mgr.set_enabled_profiles(Vec::new());
+    assert!(mgr.has_explicit_selection());
+    assert!(mgr.active_merged().is_empty());
+    mgr.load_from_dir(&repo, &temp_dir)
+        .expect("reload with explicit empty selection");
+    assert!(
+        mgr.active_merged().is_empty(),
+        "explicit empty selection must stay disabled after reload"
+    );
+
+    // apply_settings switching to custom_dir and back to None reloads default_dir cleanly
+    mgr.apply_settings(
+        &GlossarySettings {
+            enabled_profiles: vec!["Custom".to_owned()],
+            glossary_dir: Some(custom_dir.to_string_lossy().into_owned()),
+        },
+        Some(&repo),
+        Some(&temp_dir),
+    )
+    .expect("apply custom glossary_dir");
+    assert_eq!(
+        mgr.active_merged()
+            .terms()
+            .get("Anchor")
+            .map(String::as_str),
+        Some("アンカー")
+    );
+    mgr.apply_settings(
+        &GlossarySettings {
+            enabled_profiles: vec!["Base".to_owned()],
+            glossary_dir: None,
+        },
+        Some(&repo),
+        Some(&temp_dir),
+    )
+    .expect("revert glossary_dir to default_dir");
+    assert!(mgr.active_merged().terms().get("Anchor").is_none());
+    assert_eq!(
+        mgr.active_merged().terms().get("GG").map(String::as_str),
+        Some("ナイス")
+    );
+
+    // Transactional rollback on pipeline sync error: state remains unchanged
+    let mut failing_pipeline = PipelineService::new(
+        PipelineConfig::new(en.clone(), ja.clone()),
+        Arc::new(FailingHotwordSttEngine),
+        Arc::new(TranslatorManager::new(
+            Arc::new(MockTranslator::default()),
+            TranslationProviderConfig::Mock {
+                prefix: "[ja] ".to_owned(),
+            },
+        )),
+        Arc::new(CollectingSubtitleSink::new()),
+        Arc::new(AudioPreprocessor::process_chunk),
+    );
+    let err = mgr
+        .update_enabled_and_sync_pipeline(vec!["Fleet".to_owned()], &mut failing_pipeline)
+        .await
+        .expect_err("failing pipeline must return error");
+    assert!(matches!(err, CoreError::Stt(_)));
+    assert_eq!(mgr.enabled_profiles(), &["Base".to_owned()]);
+    assert!(mgr.active_merged().terms().get("Ferox").is_none());
+
+    // Duplicate profile names rejected in set_profiles and load_dir
+    let dup_err = mgr
+        .set_profiles(vec![
+            GlossaryProfile::new("Dup", en.clone(), ja.clone(), BTreeMap::new()),
+            GlossaryProfile::new("Dup", en, ja, BTreeMap::new()),
+        ])
+        .expect_err("duplicate profile names must fail");
+    assert!(matches!(dup_err, CoreError::Glossary(_)));
+
+    std::fs::write(
+        temp_dir.join("99_dup.toml"),
+        "name = \"Base\"\nsrc_lang = \"en\"\ntgt_lang = \"ja\"\n[terms]\n\"X\" = \"Y\"\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        mgr.load_from_dir(&repo, &temp_dir),
+        Err(CoreError::Glossary(_))
+    ));
+
+    {
+        let updates = stt.hotword_updates.lock().expect("lock");
+        assert_eq!(updates.len(), 3);
+        assert!((updates[0].hotwords_score - 2.25).abs() < f32::EPSILON);
+        assert_eq!(
+            updates[2].hotwords,
+            vec![
+                "Ferox".to_owned(),
+                "GG".to_owned(),
+                "Logi".to_owned(),
+                "M W D".to_owned()
+            ]
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let _ = std::fs::remove_dir_all(&custom_dir);
 }

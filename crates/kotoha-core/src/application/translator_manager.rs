@@ -46,11 +46,13 @@ impl TranslatorManager {
         Ok(Self::new(translator, initial_config))
     }
 
-    /// Hot-swaps the active translation provider or local model profile without interrupting IPC/STT.
+    /// Hot-swaps the active translation provider or local model profile without interrupting
+    /// IPC/STT, offloading synchronous model initialization and SHA-256 verification onto
+    /// Tokio's blocking pool so executor worker threads never stall.
     pub async fn switch_provider(
         &self,
         config: TranslationProviderConfig,
-        factory: &dyn TranslatorFactory,
+        factory: Arc<dyn TranslatorFactory>,
     ) -> Result<(), CoreError> {
         if let TranslationProviderConfig::LocalModel { model_id, .. } = &config {
             if self.find_model_profile(model_id).is_none() {
@@ -58,7 +60,13 @@ impl TranslatorManager {
             }
         }
 
-        let next_translator = factory.create(&config)?;
+        let cfg_for_build = config.clone();
+        let next_translator = tokio::task::spawn_blocking(move || factory.create(&cfg_for_build))
+            .await
+            .map_err(|err| {
+                CoreError::Translation(format!("provider initialization task failed: {err}"))
+            })??;
+
         let mut guard = self.state.write().await;
         guard.translator = next_translator;
         guard.config = config;

@@ -42,6 +42,10 @@ pub enum CoreError {
     #[error("provider unsupported in Phase 1 core: {0}")]
     UnsupportedInPhase1(String),
 
+    /// Glossary loading, validation, or management error.
+    #[error("glossary error: {0}")]
+    Glossary(String),
+
     /// Subtitle sink emission failed.
     #[error("subtitle sink error: {0}")]
     Sink(String),

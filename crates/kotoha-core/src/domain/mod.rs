@@ -20,4 +20,6 @@ pub use logic::{
     protect_terms, restore_terms, ContextWindow, GlossaryPlaceholderGuard, PreFilter,
     DEFAULT_CONTEXT_WINDOW_CAPACITY,
 };
-pub use ports::{SttEngine, SttStream, SubtitleSink, Translator, TranslatorFactory};
+pub use ports::{
+    GlossaryRepository, SttEngine, SttStream, SubtitleSink, Translator, TranslatorFactory,
+};
