@@ -1,0 +1,26 @@
+[package]
+name = "kotoha-stt-sherpa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Streaming sherpa-onnx STT engine adapter with hotwords biasing and stream lifecycle management for Kotoha"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+native-sherpa = ["dep:sherpa-onnx"]
+
+[dependencies]
+kotoha-core.workspace = true
+serde.workspace = true
+sherpa-onnx = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+kotoha-protocol.workspace = true
+tokio.workspace = true
