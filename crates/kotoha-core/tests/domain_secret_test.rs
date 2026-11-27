@@ -210,6 +210,13 @@ fn openai_key_is_invalidated_unless_the_origin_is_unchanged() {
         "http://api.openai.com/v1",
         "https://api.openai.com:8443/v1",
         "https://api.openai.com@evil.example/v1",
+        // WHATWG treats `\` as a path separator, so this connects to evil.example.
+        "https://evil.example\\@api.openai.com/v1",
+        "https://evil.example\\.api.openai.com/v1",
+        "https://user:pw@api.openai.com/v1",
+        "https://api.openai.com%2f@evil.example/v1",
+        "https://api.openai.com /v1",
+        "not a url",
     ] {
         assert_eq!(
             openai(next).secrets_invalidated_by_change_from(&base),
@@ -231,5 +238,92 @@ fn openai_key_is_invalidated_unless_the_origin_is_unchanged() {
         if !matches!(config, TranslationProviderConfig::OpenAiCompatible { .. }) {
             assert!(config.secrets_invalidated_by_change_from(&base).is_empty());
         }
+    }
+}
+
+#[test]
+fn url_origin_fails_closed_on_ambiguous_authorities() {
+    use kotoha_core::domain::url_origin;
+
+    assert_eq!(
+        url_origin("HTTPS://API.OpenAI.com:8443/v1?x#y").as_deref(),
+        Some("https://api.openai.com:8443")
+    );
+    assert_eq!(
+        url_origin("http://[::1]:11434/v1").as_deref(),
+        Some("http://[::1]:11434")
+    );
+    for ambiguous in [
+        "https://evil.example\\@api.openai.com/v1",
+        "https://a@b/",
+        "https://a%40b/",
+        "https://a b/",
+        "https://a\tb/",
+        "https:///path",
+        "localhost:11434/v1",
+        "",
+    ] {
+        assert_eq!(url_origin(ambiguous), None, "{ambiguous:?}");
+    }
+}
+
+#[test]
+fn unchanged_but_unparseable_base_url_keeps_the_key() {
+    // Nothing changed, so there is no new destination to protect against.
+    let same = "http://localhost:11434\\v1";
+    assert!(openai(same)
+        .secrets_invalidated_by_change_from(&openai(same))
+        .is_empty());
+}
+
+#[test]
+fn provider_and_secret_kind_wire_tags_match_the_ui() {
+    // Keep in sync with app/ui/src/types/kotoha.ts (and its contract test).
+    let tags = [
+        (
+            r#"{"type":"local_model","model_id":"m","device":"auto","threads":null}"#,
+            "local_model",
+        ),
+        (
+            r#"{"type":"openai_compatible","base_url":"u","model":"m","timeout_ms":1}"#,
+            "openai_compatible",
+        ),
+        (
+            r#"{"type":"deepl","use_free_endpoint":true,"timeout_ms":1}"#,
+            "deepl",
+        ),
+        (
+            r#"{"type":"google_cloud","project_id":null,"timeout_ms":1}"#,
+            "google_cloud",
+        ),
+        (r#"{"type":"gas_webhook","timeout_ms":1}"#, "gas_webhook"),
+        (r#"{"type":"mock","prefix":"p"}"#, "mock"),
+    ];
+    for (json, tag) in tags {
+        let config: TranslationProviderConfig = serde_json::from_str(json).expect(json);
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(value["type"], tag);
+    }
+    // Legacy tags written by earlier builds still load.
+    for legacy in [
+        r#"{"type":"open_ai_compatible","base_url":"u","model":"m","timeout_ms":1}"#,
+        r#"{"type":"deep_l","use_free_endpoint":true,"timeout_ms":1}"#,
+    ] {
+        serde_json::from_str::<TranslationProviderConfig>(legacy).expect(legacy);
+    }
+
+    let kinds = [
+        (ProviderSecretKind::OpenAiApiKey, "open_ai_api_key"),
+        (ProviderSecretKind::DeepLApiKey, "deep_l_api_key"),
+        (
+            ProviderSecretKind::GoogleCloudApiKey,
+            "google_cloud_api_key",
+        ),
+        (ProviderSecretKind::GasEndpointUrl, "gas_endpoint_url"),
+        (ProviderSecretKind::GasBearerToken, "gas_bearer_token"),
+    ];
+    assert_eq!(kinds.len(), ProviderSecretKind::ALL.len());
+    for (kind, tag) in kinds {
+        assert_eq!(serde_json::to_value(kind).unwrap(), tag);
     }
 }

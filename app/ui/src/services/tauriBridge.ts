@@ -135,17 +135,29 @@ function secretKindAppliesTo(
   }
 }
 
-/** Lower-cased `scheme://host[:port]`, mirroring Rust `url_origin`. */
-function urlOrigin(url: string): string {
-  const trimmed = url.trim().toLowerCase();
-  const sep = trimmed.indexOf('://');
-  if (sep < 0) {
-    return trimmed;
+/**
+ * Lower-cased `scheme://host[:port]`, mirroring Rust `url_origin`. Fail-closed: returns `null`
+ * when the authority contains anything outside `[A-Za-z0-9.\-:\[\]]` (userinfo `@`, `\\`, `%`,
+ * whitespace, ...), because the real HTTP client may resolve such URLs to a different host.
+ */
+export function urlOrigin(url: string): string | null {
+  const match = /^([a-z0-9+.-]+):\/\/([^/?#]*)/.exec(url.trim().toLowerCase());
+  if (!match) {
+    return null;
   }
-  const scheme = trimmed.slice(0, sep);
-  const authority = trimmed.slice(sep + 3).split(/[/?#]/)[0] ?? '';
-  const hostPort = authority.slice(authority.lastIndexOf('@') + 1);
-  return `${scheme}://${hostPort}`;
+  const [, scheme, authority] = match;
+  if (!authority || !/^[a-z0-9.\-:[\]]+$/.test(authority)) {
+    return null;
+  }
+  return `${scheme}://${authority}`;
+}
+
+function sameOrigin(previous: string, next: string): boolean {
+  if (previous === next) {
+    return true;
+  }
+  const a = urlOrigin(previous);
+  return a !== null && a === urlOrigin(next);
 }
 
 export interface KotohaEventHandlers {
@@ -414,7 +426,7 @@ export function createMockBridge(
         config.type === 'openai_compatible' &&
         !(
           state.provider.type === 'openai_compatible' &&
-          urlOrigin(state.provider.base_url) === urlOrigin(config.base_url)
+          sameOrigin(state.provider.base_url, config.base_url)
         )
       ) {
         secrets.openai_api_key = false;

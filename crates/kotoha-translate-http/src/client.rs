@@ -125,6 +125,13 @@ pub fn validate_http_url(
             "{label} must not be empty"
         )));
     }
+    // `\` is a path separator for http(s) in the WHATWG parser the client uses, and `@` starts
+    // userinfo: both let a URL look like it targets one host while connecting to another.
+    if trimmed.contains(['\\', '@']) {
+        return Err(CoreError::NotConfigured(format!(
+            "{label} must not contain '\\' or '@'"
+        )));
+    }
     let parsed = Url::parse(trimmed)
         .map_err(|err| CoreError::NotConfigured(format!("{label} is not a valid URL: {err}")))?;
 

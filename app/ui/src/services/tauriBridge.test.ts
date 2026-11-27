@@ -1,13 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { emit } from '@tauri-apps/api/event';
+import { createDefaultProviderConfig } from '../data/modelCatalog';
 import {
+  SECRET_STATUS_FIELD,
   TAURI_EVENTS,
   createMockBridge,
   createTauriBridge,
   getKotohaBridge,
   isTauriRuntime,
   resetDefaultMockBridgeForTesting,
+  urlOrigin,
 } from './tauriBridge';
 import type {
   ConnectionStatus,
@@ -387,6 +390,35 @@ describe('tauriBridge', () => {
       expect(state.secrets.openai_api_key).toBe(false);
     });
 
+    it('fails closed on ambiguous base URLs (backslash, userinfo, escapes)', async () => {
+      expect(urlOrigin('HTTPS://API.OpenAI.com:8443/v1?x#y')).toBe('https://api.openai.com:8443');
+      for (const bad of [
+        'https://evil.example\\@api.openai.com/v1',
+        'https://api.openai.com@evil.example/v1',
+        'https://a%40b/',
+        'https://a b/',
+        'localhost:11434/v1',
+      ]) {
+        expect(urlOrigin(bad)).toBeNull();
+      }
+
+      const bridge = createMockBridge();
+      await bridge.switchTranslationProvider(openAi('https://api.openai.com/v1'));
+      await bridge.setProviderSecret('open_ai_api_key', 'k');
+      const state = await bridge.switchTranslationProvider(
+        openAi('https://evil.example\\@api.openai.com/v1'),
+      );
+      expect(state.secrets.openai_api_key).toBe(false);
+    });
+
+    it('keeps the key when nothing changed, even for an unparseable URL', async () => {
+      const bridge = createMockBridge();
+      await bridge.switchTranslationProvider(openAi('http://localhost:11434\\v1'));
+      await bridge.setProviderSecret('open_ai_api_key', 'k');
+      const state = await bridge.switchTranslationProvider(openAi('http://localhost:11434\\v1'));
+      expect(state.secrets.openai_api_key).toBe(true);
+    });
+
     it('clears the GAS bearer token when the endpoint is replaced', async () => {
       const bridge = createMockBridge();
       await bridge.switchTranslationProvider({
@@ -400,5 +432,28 @@ describe('tauriBridge', () => {
       expect(status.gas_endpoint_url).toBe(true);
       expect(status.gas_bearer_token).toBe(false);
     });
+  });
+
+  it('uses the same provider and secret-kind wire tags as the Rust serde format', async () => {
+    // Keep in sync with provider_and_secret_kind_wire_tags_match_the_ui (domain_secret_test.rs).
+    const providerTags = [
+      'local_model',
+      'openai_compatible',
+      'deepl',
+      'google_cloud',
+      'gas_webhook',
+      'mock',
+    ] as const;
+    for (const tag of providerTags) {
+      expect(createDefaultProviderConfig(tag).type).toBe(tag);
+    }
+    const kindTags = [
+      'open_ai_api_key',
+      'deep_l_api_key',
+      'google_cloud_api_key',
+      'gas_endpoint_url',
+      'gas_bearer_token',
+    ] as const;
+    expect(Object.keys(SECRET_STATUS_FIELD)).toEqual([...kindTags]);
   });
 });

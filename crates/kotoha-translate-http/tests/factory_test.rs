@@ -189,3 +189,34 @@ async fn gas_transport_errors_never_contain_the_endpoint_url_path() {
         .expect_err("connection must fail");
     assert_no_secrets(&err.to_string());
 }
+
+#[tokio::test]
+async fn ambiguous_urls_never_reach_a_host_with_the_stored_key() {
+    // `\` ends the authority for the WHATWG parser the HTTP client uses, so these URLs would
+    // connect to the local mock server while naming another host after the `@`. They are
+    // rejected at construction, so the stored key can never be sent.
+    let server = MockHttpServer::start(|_req| {
+        ScriptedHttpResponse::json_ok(r#"{"choices":[{"message":{"content":"x"}}]}"#)
+    })
+    .await;
+    let store = Arc::new(
+        InMemorySecretStore::new().with(&SecretRef::openai_api_key(), "sk-openai-never-leak"),
+    );
+    let factory = HttpTranslatorFactory::with_secret_store(store);
+    for base_url in [
+        format!("{}\\@api.openai.com/v1", server.base_url),
+        format!(
+            "{}@api.openai.com/v1",
+            server.base_url.replace("http://", "http://user:pw")
+        ),
+        format!("{}/v1/@x", server.base_url),
+    ] {
+        let result = factory.create(&TranslationProviderConfig::OpenAiCompatible {
+            base_url: base_url.clone(),
+            model: "m".to_owned(),
+            timeout_ms: 2_000,
+        });
+        assert!(result.is_err(), "{base_url}");
+    }
+    assert!(server.requests().is_empty());
+}

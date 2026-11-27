@@ -23,6 +23,12 @@ fn domain_error_scope_classifies_each_variant() {
         ),
         (CoreError::Glossary("x".into()), ErrorScope::Utterance),
         (CoreError::Sink("x".into()), ErrorScope::Utterance),
+        (
+            CoreError::InvalidSecretRef("x".into()),
+            ErrorScope::Utterance,
+        ),
+        (CoreError::SecretStore("x".into()), ErrorScope::Utterance),
+        (CoreError::SecretMissing("x".into()), ErrorScope::Utterance),
         (CoreError::Stt("x".into()), ErrorScope::Speaker),
         (CoreError::Ipc("x".into()), ErrorScope::Fatal),
         (
@@ -70,14 +76,31 @@ fn domain_error_translation_failure_reason_never_leaks_message() {
         CoreError::Stt(secret.into()),
         CoreError::Sink(secret.into()),
         CoreError::Ipc(secret.into()),
+        CoreError::InvalidSecretRef(secret.into()),
+        CoreError::SecretStore(secret.into()),
+        CoreError::SecretMissing(secret.into()),
     ];
     for err in errors {
         let reason = err.translation_failure_reason();
         assert!(!reason.is_empty());
-        assert!(!reason.contains("secret"), "{reason}");
+        assert!(!reason.contains("sk-very"), "{reason}");
     }
     assert_eq!(
         CoreError::Translation(secret.into()).translation_failure_reason(),
         "translation provider error"
     );
+}
+
+#[test]
+fn domain_error_secret_variants_map_to_fixed_reasons() {
+    assert_eq!(
+        CoreError::SecretMissing("translation.deepl.api_key".into()).translation_failure_reason(),
+        "translation provider not configured"
+    );
+    for err in [
+        CoreError::InvalidSecretRef("x".into()),
+        CoreError::SecretStore("x".into()),
+    ] {
+        assert_eq!(err.translation_failure_reason(), "secret store error");
+    }
 }

@@ -766,6 +766,7 @@ pub enum TranslationProviderConfig {
     /// OpenAI-compatible chat completions endpoint (cloud LLM or local Ollama / LM Studio).
     ///
     /// Optional secret: `translation.openai_compatible.api_key`.
+    #[serde(rename = "openai_compatible", alias = "open_ai_compatible")]
     OpenAiCompatible {
         /// Base URL such as `"https://api.openai.com/v1"` or `"http://localhost:11434/v1"`.
         base_url: String,
@@ -777,6 +778,7 @@ pub enum TranslationProviderConfig {
     /// Official `DeepL` API (Free or Pro endpoint).
     ///
     /// Required secret: `translation.deepl.api_key`.
+    #[serde(rename = "deepl", alias = "deep_l")]
     DeepL {
         /// Whether to target `api-free.deepl.com` (`true`) or `api.deepl.com` (`false`).
         use_free_endpoint: bool,
@@ -857,7 +859,8 @@ impl TranslationProviderConfig {
         let same_origin = matches!(
             previous,
             Self::OpenAiCompatible { base_url: prev_url, .. }
-                if url_origin(prev_url) == url_origin(base_url)
+                if prev_url == base_url
+                    || matches!((url_origin(prev_url), url_origin(base_url)), (Some(a), Some(b)) if a == b)
         );
         if same_origin {
             Vec::new()
@@ -867,15 +870,34 @@ impl TranslationProviderConfig {
     }
 }
 
-/// Returns the lower-cased `scheme://authority` of `url` (credentials stripped), or the whole
-/// trimmed lower-cased string if it has no scheme.
+/// Returns the lower-cased `scheme://host[:port]` of `url`, or `None` when the URL cannot be
+/// reliably attributed to a single host.
+///
+/// This is deliberately strict and fail-closed: it is used to decide whether a stored credential
+/// may keep being sent to a (possibly changed) endpoint. The real HTTP client follows the WHATWG
+/// URL rules (for example `\` ends the authority in http/https URLs), so a hand-written parser
+/// that disagrees could be tricked into reporting the wrong host. Any authority containing a
+/// character outside `[A-Za-z0-9.\-:\[\]]` (userinfo `@`, `\`, `%`, whitespace, control
+/// characters, ...) is therefore treated as unparseable.
 #[must_use]
-pub fn url_origin(url: &str) -> String {
+pub fn url_origin(url: &str) -> Option<String> {
     let trimmed = url.trim().to_ascii_lowercase();
-    let Some((scheme, rest)) = trimmed.split_once("://") else {
-        return trimmed;
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let host_port = authority.rsplit('@').next().unwrap_or_default();
-    format!("{scheme}://{host_port}")
+    let (scheme, rest) = trimmed.split_once("://")?;
+    if scheme.is_empty()
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return None;
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty()
+        || !authority
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+    {
+        return None;
+    }
+    Some(format!("{scheme}://{authority}"))
 }

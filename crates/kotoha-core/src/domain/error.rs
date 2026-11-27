@@ -121,7 +121,10 @@ impl CoreError {
             | Self::NotConfigured(_)
             | Self::UnsupportedInPhase1(_)
             | Self::Glossary(_)
-            | Self::Sink(_) => ErrorScope::Utterance,
+            | Self::Sink(_)
+            | Self::InvalidSecretRef(_)
+            | Self::SecretStore(_)
+            | Self::SecretMissing(_) => ErrorScope::Utterance,
             Self::Stt(_) => ErrorScope::Speaker,
             Self::Protocol(_) | Self::Ipc(_) | Self::ChannelClosed(_) => ErrorScope::Fatal,
         }
@@ -135,7 +138,10 @@ impl CoreError {
     pub const fn translation_failure_reason(&self) -> &'static str {
         match self {
             Self::Translation(_) => "translation provider error",
-            Self::NotConfigured(_) => "translation provider not configured",
+            Self::NotConfigured(_) | Self::SecretMissing(_) => {
+                "translation provider not configured"
+            }
+            Self::InvalidSecretRef(_) | Self::SecretStore(_) => "secret store error",
             Self::UnknownModelProfile(_) | Self::UnsupportedInPhase1(_) => {
                 "translation provider unavailable"
             }
