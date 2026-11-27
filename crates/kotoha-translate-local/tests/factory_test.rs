@@ -10,9 +10,10 @@ use std::sync::Arc;
 use common::{create_model_dir, unique_temp_dir, MockLocalLoader};
 use kotoha_core::application::TranslatorManager;
 use kotoha_core::domain::{
-    default_model_catalog, ComputeDevice, ModelBackend, TranslationProviderConfig,
+    default_model_catalog, ComputeDevice, ModelBackend, SecretRef, TranslationProviderConfig,
     TranslatorFactory,
 };
+use kotoha_core::infrastructure::InMemorySecretStore;
 use kotoha_translate_http::HttpTranslatorFactory;
 use kotoha_translate_local::{CompositeTranslatorFactory, LocalNmtTranslatorFactory};
 
@@ -33,7 +34,14 @@ async fn composite_factory_switches_across_all_six_providers_in_translator_manag
     let loader = Arc::new(MockLocalLoader::new());
     let local_factory =
         LocalNmtTranslatorFactory::with_loader(&root, loader).with_custom_profiles(custom);
-    let http_factory = HttpTranslatorFactory::new()
+    let secrets = Arc::new(
+        InMemorySecretStore::new()
+            .with(&SecretRef::deepl_api_key(), "test-deepl-key")
+            .with(&SecretRef::google_cloud_api_key(), "test-gc-key")
+            .with(&SecretRef::gas_endpoint_url(), "http://127.0.0.1:8080/exec")
+            .with(&SecretRef::gas_bearer_token(), "tok"),
+    );
+    let http_factory = HttpTranslatorFactory::with_secret_store(secrets)
         .with_deepl_base_url("http://127.0.0.1:9999")
         .with_google_cloud_base_url("http://127.0.0.1:9999");
     let composite: Arc<dyn TranslatorFactory> =
@@ -64,7 +72,6 @@ async fn composite_factory_switches_across_all_six_providers_in_translator_manag
         TranslationProviderConfig::OpenAiCompatible {
             base_url: "http://127.0.0.1:11434/v1".to_owned(),
             model: "qwen2.5:7b".to_owned(),
-            api_key: None,
             timeout_ms: 5_000,
         },
         Arc::clone(&composite),
@@ -75,7 +82,6 @@ async fn composite_factory_switches_across_all_six_providers_in_translator_manag
 
     mgr.switch_provider(
         TranslationProviderConfig::DeepL {
-            api_key: "test-deepl-key".to_owned(),
             use_free_endpoint: true,
             timeout_ms: 5_000,
         },
@@ -87,7 +93,6 @@ async fn composite_factory_switches_across_all_six_providers_in_translator_manag
 
     mgr.switch_provider(
         TranslationProviderConfig::GoogleCloud {
-            api_key: "test-gc-key".to_owned(),
             project_id: Some("proj".to_owned()),
             timeout_ms: 5_000,
         },
@@ -98,11 +103,7 @@ async fn composite_factory_switches_across_all_six_providers_in_translator_manag
     assert_eq!(mgr.current_provider_id().await, "google-cloud");
 
     mgr.switch_provider(
-        TranslationProviderConfig::GasWebhook {
-            endpoint_url: "http://127.0.0.1:8080/exec".to_owned(),
-            bearer_token: Some("tok".to_owned()),
-            timeout_ms: 5_000,
-        },
+        TranslationProviderConfig::GasWebhook { timeout_ms: 5_000 },
         Arc::clone(&composite),
     )
     .await

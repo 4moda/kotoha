@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use kotoha_core::domain::{
-    CoreError, GlossaryPlaceholderGuard, LanguageCode, TranslationRequest, TranslationResult,
-    Translator,
+    CoreError, GlossaryPlaceholderGuard, LanguageCode, Secret, TranslationRequest,
+    TranslationResult, Translator,
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
@@ -24,10 +24,10 @@ pub const DEEPL_FREE_ENDPOINT: &str = "https://api-free.deepl.com/v2/translate";
 pub const DEEPL_PRO_ENDPOINT: &str = "https://api.deepl.com/v2/translate";
 
 /// Configuration for [`DeepLTranslator`].
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct DeepLConfig {
     /// `DeepL` API authentication key.
-    pub api_key: String,
+    pub api_key: Secret,
     /// When `true` uses Free endpoint (`api-free.deepl.com`), else Pro (`api.deepl.com`).
     pub use_free_endpoint: bool,
     /// Optional custom endpoint override (e.g. local mock server URL for testing).
@@ -36,21 +36,10 @@ pub struct DeepLConfig {
     pub timeout_ms: u64,
 }
 
-impl std::fmt::Debug for DeepLConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeepLConfig")
-            .field("api_key", &"[REDACTED]")
-            .field("use_free_endpoint", &self.use_free_endpoint)
-            .field("base_url", &self.base_url)
-            .field("timeout_ms", &self.timeout_ms)
-            .finish()
-    }
-}
-
 impl DeepLConfig {
     /// Creates a [`DeepLConfig`] with [`DEFAULT_HTTP_TIMEOUT_MS`] and default Free/Pro endpoint.
     #[must_use]
-    pub fn new(api_key: impl Into<String>, use_free_endpoint: bool) -> Self {
+    pub fn new(api_key: impl Into<Secret>, use_free_endpoint: bool) -> Self {
         Self {
             api_key: api_key.into(),
             use_free_endpoint,
@@ -101,7 +90,7 @@ impl DeepLTranslator {
 
     /// Constructs a validated [`DeepLTranslator`] with redirects disabled (`Policy::none`).
     pub fn new(config: &DeepLConfig) -> Result<Self, CoreError> {
-        let api_key = config.api_key.trim();
+        let api_key = config.api_key.expose().trim();
         if api_key.is_empty() {
             return Err(CoreError::NotConfigured(
                 "DeepL requires a non-empty api_key".to_owned(),

@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use kotoha_core::domain::{
-    CoreError, GlossaryPlaceholderGuard, TranslationRequest, TranslationResult, Translator,
+    CoreError, GlossaryPlaceholderGuard, Secret, TranslationRequest, TranslationResult, Translator,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use reqwest::Client;
@@ -27,10 +27,10 @@ const HEADER_GOOG_API_KEY: HeaderName = HeaderName::from_static("x-goog-api-key"
 const HEADER_GOOG_USER_PROJECT: HeaderName = HeaderName::from_static("x-goog-user-project");
 
 /// Configuration for [`GoogleCloudTranslator`].
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct GoogleCloudConfig {
     /// Google Cloud API key sent exclusively in `X-Goog-Api-Key` header (never URL query string).
-    pub api_key: String,
+    pub api_key: Secret,
     /// Optional GCP project ID sent in `X-Goog-User-Project`.
     pub project_id: Option<String>,
     /// Optional custom endpoint override (e.g. local mock server URL for testing).
@@ -39,21 +39,10 @@ pub struct GoogleCloudConfig {
     pub timeout_ms: u64,
 }
 
-impl std::fmt::Debug for GoogleCloudConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GoogleCloudConfig")
-            .field("api_key", &"[REDACTED]")
-            .field("project_id", &self.project_id)
-            .field("base_url", &self.base_url)
-            .field("timeout_ms", &self.timeout_ms)
-            .finish()
-    }
-}
-
 impl GoogleCloudConfig {
     /// Creates a [`GoogleCloudConfig`] with [`DEFAULT_HTTP_TIMEOUT_MS`].
     #[must_use]
-    pub fn new(api_key: impl Into<String>, project_id: Option<String>) -> Self {
+    pub fn new(api_key: impl Into<Secret>, project_id: Option<String>) -> Self {
         Self {
             api_key: api_key.into(),
             project_id,
@@ -113,7 +102,7 @@ impl GoogleCloudTranslator {
 
     /// Constructs a validated [`GoogleCloudTranslator`] with redirects disabled (`Policy::none`).
     pub fn new(config: &GoogleCloudConfig) -> Result<Self, CoreError> {
-        let api_key = config.api_key.trim();
+        let api_key = config.api_key.expose().trim();
         if api_key.is_empty() {
             return Err(CoreError::NotConfigured(
                 "GoogleCloud Translation requires a non-empty api_key".to_owned(),

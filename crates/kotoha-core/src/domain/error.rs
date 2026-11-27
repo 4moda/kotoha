@@ -38,6 +38,20 @@ pub enum CoreError {
     #[error("provider not configured: {0}")]
     NotConfigured(String),
 
+    /// A secret reference name is malformed.
+    #[error("invalid secret reference: {0}")]
+    InvalidSecretRef(String),
+
+    /// The secret store could not be read or written.
+    #[error("secret store error: {0}")]
+    SecretStore(String),
+
+    /// A referenced secret (API key, token, capability URL) is not available in the secret store.
+    ///
+    /// Carries only the non-secret reference name, never a secret value.
+    #[error("secret '{0}' is not configured in the secret store")]
+    SecretMissing(String),
+
     /// Provider backend requires Phase 2 engine crates not yet attached.
     #[error("provider unsupported in Phase 1 core: {0}")]
     UnsupportedInPhase1(String),

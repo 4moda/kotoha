@@ -1,5 +1,5 @@
 //! Auto-setup utilities for Kotoha: Mumble plugin installer, HTTPS/SHA-256 model downloader,
-//! and sanitized persistent settings store.
+//! and persistent settings store.
 
 pub mod error;
 pub mod model_downloader;
@@ -19,8 +19,8 @@ pub use plugin_installer::{
     MumblePluginDirCandidate, MumblePluginDirKind, PluginInstallOutcome, TargetPlatform,
 };
 pub use settings_store::{
-    AppSettings, FileSettingsStore, InMemorySecretStore, OverlayStyleSettings, SecretStore,
-    DEFAULT_OVERLAY_FADE_OUT_SECONDS, DEFAULT_OVERLAY_FONT_SIZE_PX, DEFAULT_OVERLAY_HEIGHT,
-    DEFAULT_OVERLAY_MAX_LINES, DEFAULT_OVERLAY_OPACITY, DEFAULT_OVERLAY_POSITION_X,
-    DEFAULT_OVERLAY_POSITION_Y, DEFAULT_OVERLAY_WIDTH, SECRET_STORE_SENTINEL, SETTINGS_FILENAME,
+    AppSettings, FileSettingsStore, OverlayStyleSettings, DEFAULT_OVERLAY_FADE_OUT_SECONDS,
+    DEFAULT_OVERLAY_FONT_SIZE_PX, DEFAULT_OVERLAY_HEIGHT, DEFAULT_OVERLAY_MAX_LINES,
+    DEFAULT_OVERLAY_OPACITY, DEFAULT_OVERLAY_POSITION_X, DEFAULT_OVERLAY_POSITION_Y,
+    DEFAULT_OVERLAY_WIDTH, SETTINGS_FILENAME,
 };

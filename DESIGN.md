@@ -369,9 +369,9 @@ Rust コアは **Clean / Hexagonal (Onion) Architecture** に基づき、依存�
 
 | レイヤー | パス / クレート | 依存許可範囲 | 主な責務・構成要素 |
 | :--- | :--- | :--- | :--- |
-| **Domain (最内層)** | `kotoha-core/src/domain/` | 純粋 Rust (`serde`, `thiserror` 等のみ。`tokio`/`reqwest`/`interprocess`/`tauri` 禁止) | **Entities / Value Objects**: `SpeakerKey`, `LanguageCode`, `AudioChunk`, `UtteranceId`, `TranscriptEvent`, `TranslationRequest`, `TranslationResult`, `TranslateContext`, `SubtitleEntry`, `GlossaryProfile`, `HotwordsConfig`, `ModelProfile`, `ComputeDevice`, `TranslationProviderConfig`<br>**Ports (Traits)**: `SttEngine`, `SttStream`, `Translator`, `AudioInputSource`, `SubtitleSink`, `SettingsRepository`, `GlossaryRepository`<br>**Pure Logic**: Pre-filter 判定、話者カラーハッシュ、Context Window 管理、用語辞書最長一致プレースホルダ保護/復元 |
+| **Domain (最内層)** | `kotoha-core/src/domain/` | 純粋 Rust (`serde`, `thiserror` 等のみ。`tokio`/`reqwest`/`interprocess`/`tauri` 禁止) | **Entities / Value Objects**: `SpeakerKey`, `LanguageCode`, `AudioChunk`, `UtteranceId`, `TranscriptEvent`, `TranslationRequest`, `TranslationResult`, `TranslateContext`, `SubtitleEntry`, `GlossaryProfile`, `HotwordsConfig`, `ModelProfile`, `ComputeDevice`, `TranslationProviderConfig`, `Secret`, `SecretRef`<br>**Ports (Traits)**: `SttEngine`, `SttStream`, `Translator`, `AudioInputSource`, `SubtitleSink`, `SettingsRepository`, `GlossaryRepository`, `SecretStore`<br>**Pure Logic**: Pre-filter 判定、話者カラーハッシュ、Context Window 管理、用語辞書最長一致プレースホルダ保護/復元 |
 | **Application** | `kotoha-core/src/application/` | `domain` のみ | `PipelineService`（前処理・話者別 STT ストリーム制御・Pre-filter・文脈/用語辞書注入・Semaphore 並列翻訳・`utterance_id` 順序保証・`SubtitleSink` 通知）<br>`SourceSessionManager`（`conn_id` 所有権管理と切断クリーンアップ）<br>`TranslatorManager`（設定変更時の翻訳プロバイダ／モデルプロファイル実行時ホットスワップ）<br>`GlossaryManager`（複数 TOML 用語辞書の読込・優先マージ・STT Hotwords / 翻訳辞書同期） |
-| **Infrastructure** | `kotoha-core/src/infrastructure/`<br>`kotoha-protocol`<br>`kotoha-stt-sherpa` (P2)<br>`kotoha-translate-local` (P2)<br>`kotoha-translate-http` (P2) | `domain`, `application`, 外部 I/O クレート | `IpcServerAdapter`（`tokio` + `interprocess` + `kotoha-protocol`、`AudioInputSource` 実装）<br>`AudioPreprocessor`（任意 ch → モノラル平均ダウンミックス、8k..192kHz → 16 kHz `f32` リサンプラ）<br>`MockSttAdapter` / `MockTranslatorAdapter`（Phase 1 検証用）<br>`TomlGlossaryRepository`（`glossaries/*.toml` 読込）<br>Phase 2 外部アダプタ群（`sherpa-onnx`, `ct2rs` + モデルダウンローダ, HTTP API 群）<br>`JsonSettingsRepository` / OS キーチェーン連携 |
+| **Infrastructure** | `kotoha-core/src/infrastructure/`<br>`kotoha-protocol`<br>`kotoha-stt-sherpa` (P2)<br>`kotoha-translate-local` (P2)<br>`kotoha-translate-http` (P2) | `domain`, `application`, 外部 I/O クレート | `IpcServerAdapter`（`tokio` + `interprocess` + `kotoha-protocol`、`AudioInputSource` 実装）<br>`AudioPreprocessor`（任意 ch → モノラル平均ダウンミックス、8k..192kHz → 16 kHz `f32` リサンプラ）<br>`MockSttAdapter` / `MockTranslatorAdapter`（Phase 1 検証用）<br>`TomlGlossaryRepository`（`glossaries/*.toml` 読込）<br>Phase 2 外部アダプタ群（`sherpa-onnx`, `ct2rs` + モデルダウンローダ, HTTP API 群）<br>`JsonSettingsRepository` / `InMemorySecretStore`・`EnvSecretStore`（OS キーチェーン連携は後続） |
 | **Presentation (最外層)** | `kotoha-core/src/bin/kotoha_ipc_monitor.rs` (P1)<br>`app/src-tauri` (P3) + `app/ui` | 全内側レイヤー（DI 組み立て担当） | `kotoha-ipc-monitor` CLI（受信統計・RMS・ドロップ数・パイプライン出力）<br>Tauri v2 Commands / Event Bridge (`SubtitleSink` 実装) / System Tray / Overlay UI |
 
 #### Workspace クレート構成
@@ -640,38 +640,57 @@ pub struct ModelProfile {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TranslationProviderConfig {
     /// Engine 1 (Recommended Default): 無料・完全オフライン・モデルプロファイル選択式 Local NMT
-    LocalNmt {
+    LocalModel {
         model_id: String,        // 例: "fugumt-en-ja-int8", "opus-mt-en-ja-int8", "nllb-200-distilled-600m-int8"
         device: ComputeDevice,   // Auto | Cpu | Cuda | Metal
-        compute_type: String,    // 例: "int8" / "float16" / "default"
-        num_threads: usize,      // 0 = auto
+        threads: Option<usize>,  // None / Some(0) = auto
     },
     /// Engine 2: OpenAI 互換 LLM API (クラウド LLM / ローカル Ollama・LM Studio + GPU/Apple Silicon)
     OpenAiCompatible {
         base_url: String,        // 例: "https://api.openai.com/v1" / "http://localhost:11434/v1"
         model: String,           // 例: "gpt-4o-mini" / "gemini-2.5-flash" / "qwen2.5:7b"
-        api_key_ref: String,     // OS キーチェーン参照 (ローカル Ollama 等は空許容)
-        context_window: usize,   // 5..=10 (default 8)
+        timeout_ms: u64,         // API キー (任意) は SecretStore: translation.openai_compatible.api_key
     },
     /// Engine 3a: DeepL API (Free / Pro)
     DeepL {
-        plan: DeepLPlan,         // Free | Pro
-        api_key_ref: String,
-        formality: Option<String>,
+        use_free_endpoint: bool, // API キー (必須) は SecretStore: translation.deepl.api_key
+        timeout_ms: u64,
     },
-    /// Engine 3b: Google Cloud Translation API (公式 v2 / v3, 月間無料枠あり)
+    /// Engine 3b: Google Cloud Translation API (公式 v2, 月間無料枠あり)
     GoogleCloud {
-        project_id: Option<String>, // v3 で使用
-        api_version: GoogleTranslateApiVersion, // V2 | V3
-        api_key_ref: String,
+        project_id: Option<String>, // API キー (必須) は SecretStore: translation.google_cloud.api_key
+        timeout_ms: u64,
     },
     /// Engine 3c: GAS (Google Apps Script) / カスタム HTTP プロキシ
     GasWebhook {
-        endpoint_url: String,           // ユーザー自身がデプロイした GAS Web App URL
-        bearer_token_ref: Option<String>,
+        timeout_ms: u64,         // デプロイ URL (必須) は translation.gas_webhook.endpoint_url、Bearer (任意) は ...bearer_token
     },
+    /// Phase 1 検証・E2E 用の決定的モック
+    Mock { prefix: String },
 }
 ```
+
+#### シークレット（API キー・トークン・GAS URL）の取り扱い
+
+`TranslationProviderConfig` は**秘密値もその参照名も保持しない**。どのプロバイダがどの秘密値を使うかは**バリアントから決まる固定キー**で、設定・ログ・IPC/UI のいずれにも秘密値は載らない。
+
+| プロバイダ | 必須 | 任意 |
+| :--- | :--- | :--- |
+| `OpenAiCompatible` | — | `translation.openai_compatible.api_key` |
+| `DeepL` | `translation.deepl.api_key` | — |
+| `GoogleCloud` | `translation.google_cloud.api_key` | — |
+| `GasWebhook` | `translation.gas_webhook.endpoint_url` | `translation.gas_webhook.bearer_token` |
+
+- **`Secret`**（`domain/secret.rs`）: 秘密値の newtype。`Debug` は `Secret(***)`、`Display` は `***`。`Serialize` / `Deserialize` / `PartialEq` を実装しない。生の値は `expose()` でのみ取り出し、HTTP ヘッダ／URL を組み立てる箇所に限定する。Drop 時のゼロ化は `unsafe_code = forbid` のため未実装（`zeroize` 導入はキーチェーン連携と合わせた後続課題）。
+- **`SecretRef`**: ストアのキー名。文法は `[a-z0-9]+(_[a-z0-9]+)*` を `.` で連結（最大 64 文字、空は不可）で、`Deserialize` 時にも検証する。固定キーは `SecretRef::deepl_api_key()` 等のコンストラクタと `ProviderSecretKind`（UI が指定できる閉じた列挙: `open_ai_api_key` / `deep_l_api_key` / `google_cloud_api_key` / `gas_endpoint_url` / `gas_bearer_token`）で定義する。
+- **混同代理（confused deputy）の防止**: 参照名をユーザーが選べると、`OpenAiCompatible { base_url: 任意ホスト }` に DeepL のキーを送らせることができてしまう。そのため設定から参照フィールドを廃し、ファクトリはバリアントごとの固定キーだけを解決する。さらにキーは入力時のホストに紐づく: `OpenAiCompatible` の `base_url` の origin（`scheme://host[:port]`）が変わる、または他プロバイダから切り替えると保存済みキーは削除され再入力が必要（`TranslationProviderConfig::secrets_invalidated_by_change_from`）。GAS のエンドポイント URL を差し替えると Bearer トークンも削除される（`ProviderSecretKind::dependent_refs_to_clear`）。
+- **`SecretStore` / `SecretWriter` ポート**（`domain/ports.rs`）: 読み出し `resolve` / `is_configured` / `resolve_if_set` と、書き込み `set` / `delete`（`SecretWriter`）。未設定は `CoreError::SecretMissing`（参照名のみを含み、値は含まない）。`kotoha-setup` は独自のストアを持たず、この 1 つのポートを使う。
+- **解決タイミング**: `TranslatorFactory` 実装（`HttpTranslatorFactory::with_secret_store`）が**翻訳アダプタ生成の直前**にだけ解決する。`TranslatorManager::switch_provider` はシークレットを含まない設定を渡す。
+- **実装**: `InMemorySecretStore`（アプリ実行時・テスト。プロセス内のみで永続化しない）と、読み取り専用の `EnvSecretStore`（`translation.google_cloud.api_key` → `KOTOHA_SECRET_TRANSLATION__GOOGLE_CLOUD__API_KEY`。`.` は `__`、`_` は `_`、英数字は大文字化。この写像は `SecretRef` の文法と合わせて単射で、プレフィクスは大文字・`_` 終端が必須のため任意の環境変数は読めない。CLI と E2E 用）。**OS キーチェーン実装（`keyring` 等）は後続課題**で、同じポートを実装して Presentation 層の DI で差し替える。
+- **GAS `endpoint_url`**: GAS デプロイ URL は「知っていれば誰でも呼べる」ためベアラ権限と同等とみなし、API キーと同じシークレット（`translation.gas_webhook.endpoint_url`）として保存する。アダプタ内では `Secret` で保持し、`Debug`・エラーメッセージに URL を含めない（トランスポートエラーは `scheme://host/...` に短縮、URL 検証エラーは URL を引用しない）。
+- **設定ファイルと移行**: `kotoha-settings.json`（`AppSettings`）は秘密値を含まないのでそのままシリアライズする。旧形式（`api_key` / `bearer_token` / 平文の `endpoint_url` を持つファイル）は読み込み時に値をシークレットストアへ移し（空・プレースホルダは破棄）、新形式で書き直す（失敗しない）。
+- **Tauri コマンド（書き込み専用）**: `set_provider_secret(kind, value)` / `clear_provider_secret(kind)` / `secret_status()`。値は返さず、`get_app_state` の `secrets` も真偽値のみ。`kind` は有効なプロバイダに属するものだけ受け付け、検証に失敗した値は元の値へ戻す。キーが設定済みになった時点でホットスワップする。
+- **UI の扱い**: 設定画面はキーを**書き込み専用**とし、受け取るのは「設定済みか」の真偽値だけにする。
 
 #### ローカル翻訳モデルプロファイル選択設計（CPU / GPU 環境別カタログ）
 

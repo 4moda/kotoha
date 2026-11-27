@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use kotoha_core::domain::TranslationProviderConfig;
+use kotoha_core::domain::{ProviderSecretKind, TranslationProviderConfig};
 use kotoha_setup::{install_plugin, ModelDownloader, SetupError};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -12,7 +12,7 @@ use crate::state::{
     map_plugin_install_outcome, resolve_mumble_plugin_bytes, AppRuntimeStateDto, AppState,
     DownloadProgressEventDto, GlossarySettingsStateDto, HostOsPlatform, ModelDownloadStatus,
     OverlayDisplayOptionsDto, OverlayStyleUpdateInput, PluginInstallResultDto, PluginInstallStatus,
-    EVENT_DOWNLOAD_PROGRESS, EVENT_OVERLAY_LOCK_CHANGED,
+    SecretStatusDto, EVENT_DOWNLOAD_PROGRESS, EVENT_OVERLAY_LOCK_CHANGED,
 };
 
 /// Returns the complete runtime snapshot for the React UI.
@@ -196,6 +196,31 @@ pub async fn switch_translation_provider(
     state
         .switch_translation_provider(config, src_lang, tgt_lang)
         .await
+}
+
+/// Stores a provider secret (API key / token / GAS URL). Write-only: the value is never returned.
+#[tauri::command]
+pub async fn set_provider_secret(
+    state: State<'_, Arc<AppState>>,
+    kind: ProviderSecretKind,
+    value: String,
+) -> Result<SecretStatusDto, String> {
+    state.set_provider_secret(kind, value).await
+}
+
+/// Deletes a provider secret.
+#[tauri::command]
+pub async fn clear_provider_secret(
+    state: State<'_, Arc<AppState>>,
+    kind: ProviderSecretKind,
+) -> Result<SecretStatusDto, String> {
+    state.clear_provider_secret(kind).await
+}
+
+/// Returns which provider secrets are configured (booleans only).
+#[tauri::command]
+pub async fn secret_status(state: State<'_, Arc<AppState>>) -> Result<SecretStatusDto, String> {
+    Ok(state.secret_status())
 }
 
 /// Updates enabled glossary profiles, `hotwords_score`, and optional custom glossary directory.
