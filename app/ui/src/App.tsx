@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { SetupWizard } from './components/SetupWizard';
 import { SubtitleOverlay } from './components/SubtitleOverlay';
 import { TranslationSettings } from './components/TranslationSettings';
 import {
@@ -6,47 +7,32 @@ import {
   findModelProfile,
   getDeterministicSpeakerColor,
 } from './data/modelCatalog';
+import {
+  DEFAULT_GLOSSARY_PROFILES,
+  DEFAULT_OVERLAY_OPTIONS,
+  INITIAL_SUBTITLES,
+  getKotohaBridge,
+  isTauriRuntime,
+  type KotohaBridge,
+} from './services/tauriBridge';
 import type {
   ConnectionStatus,
+  DownloadProgressEvent,
+  GlossarySettingsState,
+  HostOsPlatform,
   OverlayDisplayOptions,
   SubtitleEntry,
   TranslationProviderConfig,
 } from './types/kotoha';
 
-type AppViewMode = 'overlay' | 'settings';
+export type AppViewMode = 'overlay' | 'wizard' | 'settings';
+export type WindowKind = 'overlay' | 'settings';
 
-const INITIAL_SUBTITLES: SubtitleEntry[] = [
-  {
-    utterance_id: 101,
-    speaker_key: { source: 'mumble', user_id: 12 },
-    speaker_name: 'Alex',
-    speaker_color: getDeterministicSpeakerColor({ source: 'mumble', user_id: 12 }),
-    src_text: 'Push mid together in ten seconds, watch the flank.',
-    translated_text: '10秒後に一緒にミッドを押し上げよう、横からの奇襲に注意して。',
-    stage: 'translated',
-    timestamp_ms: 1700000001000,
-  },
-  {
-    utterance_id: 102,
-    speaker_key: { source: 'mumble', user_id: 27 },
-    speaker_name: 'Mina',
-    speaker_color: getDeterministicSpeakerColor({ source: 'mumble', user_id: 27 }),
-    src_text: 'Copy that, smoking stairs now and rotating behind you.',
-    translated_text: null,
-    stage: 'final_pending_translation',
-    timestamp_ms: 1700000002400,
-  },
-  {
-    utterance_id: 103,
-    speaker_key: { source: 'mumble', user_id: 41 },
-    speaker_name: 'Ren',
-    speaker_color: getDeterministicSpeakerColor({ source: 'mumble', user_id: 41 }),
-    src_text: 'Hold on, reloading my...',
-    translated_text: null,
-    stage: 'interim',
-    timestamp_ms: 1700000003100,
-  },
-];
+export interface AppProps {
+  bridge?: KotohaBridge;
+}
+
+const SETTINGS_DEBOUNCE_MS = 250;
 
 const DEMO_SEQUENCE: ReadonlyArray<{
   speaker_id: number;
@@ -71,34 +57,202 @@ const DEMO_SEQUENCE: ReadonlyArray<{
   },
 ];
 
-export function App() {
+function resolveWindowKind(): WindowKind {
+  if (typeof window === 'undefined') {
+    return 'settings';
+  }
+  const param = new URLSearchParams(window.location.search).get('window');
+  return param === 'overlay' ? 'overlay' : 'settings';
+}
+
+function upsertSubtitle(entries: SubtitleEntry[], incoming: SubtitleEntry): SubtitleEntry[] {
+  const idx = entries.findIndex((item) => item.utterance_id === incoming.utterance_id);
+  if (idx === -1) {
+    return [...entries, incoming];
+  }
+  const next = [...entries];
+  next[idx] = incoming;
+  return next;
+}
+
+function formatErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message.trim().length > 0) {
+    return error.message;
+  }
+  if (typeof error === 'string' && error.trim().length > 0) {
+    return error;
+  }
+  return fallback;
+}
+
+export function App({ bridge: providedBridge }: AppProps = {}) {
+  const bridge = useMemo(() => providedBridge ?? getKotohaBridge(), [providedBridge]);
+  const windowKind = resolveWindowKind();
+  const isPureOverlayWindow = windowKind === 'overlay';
+  const defaultPreviewSubtitles = useMemo(
+    () => (isPureOverlayWindow || isTauriRuntime() ? [] : INITIAL_SUBTITLES),
+    [isPureOverlayWindow],
+  );
+
   const [mode, setMode] = useState<AppViewMode>('overlay');
   const [srcLang, setSrcLang] = useState('en');
   const [tgtLang, setTgtLang] = useState('ja');
   const [provider, setProvider] = useState<TranslationProviderConfig>(() =>
     createDefaultProviderConfig('local_model'),
   );
-  const [overlayOptions, setOverlayOptions] = useState<OverlayDisplayOptions>({
-    max_lines: 4,
-    show_source_text: true,
-    locked: true,
-    font_size_px: 18,
-    background_opacity: 0.78,
+  const [overlayOptions, setOverlayOptions] = useState<OverlayDisplayOptions>(
+    DEFAULT_OVERLAY_OPTIONS,
+  );
+  const [glossarySettings, setGlossarySettings] = useState<GlossarySettingsState>({
+    profiles: DEFAULT_GLOSSARY_PROFILES,
+    enabled_profiles: DEFAULT_GLOSSARY_PROFILES.filter((p) => p.enabled).map((p) => p.name),
+    hotwords_score: 1.5,
+    glossary_dir: 'glossaries',
   });
-  const [subtitles, setSubtitles] = useState<SubtitleEntry[]>(INITIAL_SUBTITLES);
-  const [connection] = useState<ConnectionStatus>({
+  const [subtitles, setSubtitles] = useState<SubtitleEntry[]>(() => defaultPreviewSubtitles);
+  const [connection, setConnection] = useState<ConnectionStatus>({
     state: 'connected',
     source: 'mumble',
+    plugin_version: '0.1.0',
     endpoint: '$XDG_RUNTIME_DIR/kotoha_v1.sock',
     active_speakers: 3,
     dropped_frames: 0,
     last_heartbeat_ms: 120,
   });
+  const [wizardCompleted, setWizardCompleted] = useState(false);
+  const [platform, setPlatform] = useState<HostOsPlatform>('linux');
+  const [detectedMumblePaths, setDetectedMumblePaths] = useState<string[]>([
+    '~/.local/share/Mumble/Mumble/Plugins',
+    '~/.var/app/info.mumble.Mumble/data/Mumble/Mumble/Plugins',
+  ]);
+  const [isFlatpakMumble, setIsFlatpakMumble] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgressEvent | null>(null);
   const [demoRunning, setDemoRunning] = useState(false);
+  const [statusError, setStatusError] = useState<string | null>(null);
 
   const nextUtteranceRef = useRef(104);
   const demoStepRef = useRef(0);
   const timersRef = useRef<number[]>([]);
+  const userNavigatedRef = useRef(false);
+  const isMountedRef = useRef(true);
+  const providerDebounceTimerRef = useRef<number | null>(null);
+  const overlayStyleDebounceTimerRef = useRef<number | null>(null);
+  const glossaryDebounceTimerRef = useRef<number | null>(null);
+  const latestProviderRequestRef = useRef(0);
+  const latestOverlayStyleRequestRef = useRef(0);
+  const latestGlossaryRequestRef = useRef(0);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  const reportIpcError = useCallback((error: unknown, fallback: string) => {
+    if (!isMountedRef.current) return;
+    setStatusError(formatErrorMessage(error, fallback));
+  }, []);
+
+  const navigateMode = useCallback((nextMode: AppViewMode) => {
+    userNavigatedRef.current = true;
+    setMode(nextMode);
+  }, []);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') {
+      return;
+    }
+    if (isPureOverlayWindow) {
+      document.documentElement.classList.add('overlay-window-root');
+      document.body.classList.add('overlay-window-root');
+    } else {
+      document.documentElement.classList.remove('overlay-window-root');
+      document.body.classList.remove('overlay-window-root');
+    }
+    return () => {
+      document.documentElement.classList.remove('overlay-window-root');
+      document.body.classList.remove('overlay-window-root');
+    };
+  }, [isPureOverlayWindow]);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | null = null;
+
+    void bridge
+      .getAppState()
+      .then((state) => {
+        if (!active) return;
+        setSrcLang(state.src_lang);
+        setTgtLang(state.tgt_lang);
+        setProvider(state.provider);
+        setOverlayOptions(state.overlay_options);
+        setGlossarySettings(state.glossary);
+        setConnection(state.connection);
+        setSubtitles(
+          isPureOverlayWindow
+            ? bridge.isTauri
+              ? state.subtitles
+              : state.subtitles.filter(
+                  (entry) => !INITIAL_SUBTITLES.some((demo) => demo.utterance_id === entry.utterance_id),
+                )
+            : !bridge.isTauri && !isTauriRuntime() && state.subtitles.length === 0
+              ? INITIAL_SUBTITLES
+              : state.subtitles,
+        );
+        setWizardCompleted(state.wizard_completed);
+        setPlatform(state.platform);
+        setDetectedMumblePaths(state.detected_mumble_paths);
+        setIsFlatpakMumble(state.is_flatpak_mumble);
+
+        if (!isPureOverlayWindow && state.wizard_completed === false && !userNavigatedRef.current) {
+          setMode('wizard');
+        }
+      })
+      .catch((error: unknown) => {
+        reportIpcError(error, 'アプリ状態の読み込みに失敗しました。');
+      });
+
+    void bridge
+      .subscribeEvents({
+        onSubtitle: (entry) => {
+          if (!active) return;
+          setSubtitles((prev) => upsertSubtitle(prev, entry));
+        },
+        onConnectionStatus: (status) => {
+          if (!active) return;
+          setConnection(status);
+        },
+        onDownloadProgress: (progress) => {
+          if (!active) return;
+          setDownloadProgress(progress);
+        },
+        onOverlayLockChanged: (locked) => {
+          if (!active) return;
+          setOverlayOptions((prev) => ({ ...prev, locked }));
+        },
+        onOverlayStyleChanged: (style) => {
+          if (!active) return;
+          setOverlayOptions(style);
+        },
+      })
+      .then((fn) => {
+        if (!active) {
+          fn();
+          return;
+        }
+        unlisten = fn;
+      })
+      .catch((error: unknown) => {
+        reportIpcError(error, 'リアルタイムイベントの購読に失敗しました。');
+      });
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [bridge, isPureOverlayWindow, reportIpcError]);
 
   useEffect(() => {
     return () => {
@@ -106,8 +260,109 @@ export function App() {
         window.clearTimeout(id);
       }
       timersRef.current = [];
+
+      if (providerDebounceTimerRef.current !== null) {
+        window.clearTimeout(providerDebounceTimerRef.current);
+        providerDebounceTimerRef.current = null;
+      }
+      if (overlayStyleDebounceTimerRef.current !== null) {
+        window.clearTimeout(overlayStyleDebounceTimerRef.current);
+        overlayStyleDebounceTimerRef.current = null;
+      }
+      if (glossaryDebounceTimerRef.current !== null) {
+        window.clearTimeout(glossaryDebounceTimerRef.current);
+        glossaryDebounceTimerRef.current = null;
+      }
     };
   }, []);
+
+  const commitTranslationProvider = useCallback(
+    (nextConfig: TranslationProviderConfig, nextSrc: string, nextTgt: string) => {
+      const requestId = ++latestProviderRequestRef.current;
+      void bridge
+        .switchTranslationProvider(nextConfig, nextSrc, nextTgt)
+        .then(() => {
+          if (isMountedRef.current && latestProviderRequestRef.current === requestId) {
+            setStatusError(null);
+          }
+        })
+        .catch((error: unknown) => {
+          if (latestProviderRequestRef.current === requestId) {
+            reportIpcError(error, '翻訳エンジン設定の保存に失敗しました。');
+          }
+        });
+    },
+    [bridge, reportIpcError],
+  );
+
+  const scheduleTranslationProviderSync = useCallback(
+    (
+      nextConfig: TranslationProviderConfig,
+      nextSrc: string,
+      nextTgt: string,
+      immediate: boolean,
+    ) => {
+      if (providerDebounceTimerRef.current !== null) {
+        window.clearTimeout(providerDebounceTimerRef.current);
+        providerDebounceTimerRef.current = null;
+      }
+      if (immediate) {
+        commitTranslationProvider(nextConfig, nextSrc, nextTgt);
+        return;
+      }
+      providerDebounceTimerRef.current = window.setTimeout(() => {
+        providerDebounceTimerRef.current = null;
+        commitTranslationProvider(nextConfig, nextSrc, nextTgt);
+      }, SETTINGS_DEBOUNCE_MS);
+    },
+    [commitTranslationProvider],
+  );
+
+  const commitOverlayStyle = useCallback(
+    (nextOptions: OverlayDisplayOptions) => {
+      const requestId = ++latestOverlayStyleRequestRef.current;
+      void bridge
+        .updateOverlayStyle(nextOptions)
+        .then((updated) => {
+          if (!isMountedRef.current || latestOverlayStyleRequestRef.current !== requestId) {
+            return;
+          }
+          setOverlayOptions(updated);
+          setStatusError(null);
+        })
+        .catch((error: unknown) => {
+          if (latestOverlayStyleRequestRef.current === requestId) {
+            reportIpcError(error, 'オーバーレイ表示設定の更新に失敗しました。');
+          }
+        });
+    },
+    [bridge, reportIpcError],
+  );
+
+  const commitGlossarySettings = useCallback(
+    (next: { enabled_profiles: string[]; hotwords_score: number }, glossaryDir: string | null) => {
+      const requestId = ++latestGlossaryRequestRef.current;
+      void bridge
+        .updateGlossarySettings({
+          enabled_profiles: next.enabled_profiles,
+          hotwords_score: next.hotwords_score,
+          glossary_dir: glossaryDir,
+        })
+        .then((updated) => {
+          if (!isMountedRef.current || latestGlossaryRequestRef.current !== requestId) {
+            return;
+          }
+          setGlossarySettings(updated);
+          setStatusError(null);
+        })
+        .catch((error: unknown) => {
+          if (latestGlossaryRequestRef.current === requestId) {
+            reportIpcError(error, 'カスタム辞書 / Hotwords 設定の更新に失敗しました。');
+          }
+        });
+    },
+    [bridge, reportIpcError],
+  );
 
   const activeEngineSummary = useMemo(() => {
     if (provider.type === 'local_model') {
@@ -128,6 +383,127 @@ export function App() {
     }
     return `Mock Translator (${provider.prefix})`;
   }, [provider]);
+
+  const handleToggleLock = () => {
+    const nextLocked = !overlayOptions.locked;
+    setOverlayOptions((prev) => ({ ...prev, locked: nextLocked }));
+    void bridge
+      .setOverlayLocked(nextLocked)
+      .then((updated) => {
+        if (!isMountedRef.current) return;
+        setOverlayOptions(updated);
+        setStatusError(null);
+      })
+      .catch((error: unknown) => {
+        reportIpcError(error, 'オーバーレイのロック切り替えに失敗しました。');
+      });
+  };
+
+  const handleUpdateLanguages = (nextSrc: string, nextTgt: string) => {
+    setSrcLang(nextSrc);
+    setTgtLang(nextTgt);
+    scheduleTranslationProviderSync(provider, nextSrc, nextTgt, true);
+  };
+
+  const handleUpdateProvider = (nextConfig: TranslationProviderConfig) => {
+    const isDiscreteSwitch = nextConfig.type !== provider.type;
+    const isLocalDiscreteChange =
+      nextConfig.type === 'local_model' &&
+      provider.type === 'local_model' &&
+      (nextConfig.model_id !== provider.model_id || nextConfig.device !== provider.device);
+    const isDeeplTierChange =
+      nextConfig.type === 'deepl' &&
+      provider.type === 'deepl' &&
+      nextConfig.use_free_endpoint !== provider.use_free_endpoint;
+    const immediate = isDiscreteSwitch || isLocalDiscreteChange || isDeeplTierChange;
+
+    setProvider(nextConfig);
+    scheduleTranslationProviderSync(nextConfig, srcLang, tgtLang, immediate);
+  };
+
+  const handleUpdateOverlayOptions = (nextOptions: OverlayDisplayOptions) => {
+    const isDiscreteToggle =
+      nextOptions.locked !== overlayOptions.locked ||
+      nextOptions.show_source_text !== overlayOptions.show_source_text;
+
+    setOverlayOptions(nextOptions);
+    if (overlayStyleDebounceTimerRef.current !== null) {
+      window.clearTimeout(overlayStyleDebounceTimerRef.current);
+      overlayStyleDebounceTimerRef.current = null;
+    }
+    if (isDiscreteToggle) {
+      commitOverlayStyle(nextOptions);
+      return;
+    }
+    overlayStyleDebounceTimerRef.current = window.setTimeout(() => {
+      overlayStyleDebounceTimerRef.current = null;
+      commitOverlayStyle(nextOptions);
+    }, SETTINGS_DEBOUNCE_MS);
+  };
+
+  const handleUpdateGlossarySettings = (next: {
+    enabled_profiles: string[];
+    hotwords_score: number;
+  }) => {
+    const profilesChanged =
+      next.enabled_profiles.length !== glossarySettings.enabled_profiles.length ||
+      next.enabled_profiles.some(
+        (profile, index) => profile !== glossarySettings.enabled_profiles[index],
+      );
+    const enabledSet = new Set(next.enabled_profiles);
+
+    setGlossarySettings((prev) => ({
+      ...prev,
+      enabled_profiles: next.enabled_profiles,
+      hotwords_score: next.hotwords_score,
+      profiles: prev.profiles.map((p) => ({
+        ...p,
+        enabled: enabledSet.has(p.name) || enabledSet.has(p.id),
+      })),
+    }));
+
+    if (glossaryDebounceTimerRef.current !== null) {
+      window.clearTimeout(glossaryDebounceTimerRef.current);
+      glossaryDebounceTimerRef.current = null;
+    }
+    if (profilesChanged) {
+      commitGlossarySettings(next, glossarySettings.glossary_dir);
+      return;
+    }
+    glossaryDebounceTimerRef.current = window.setTimeout(() => {
+      glossaryDebounceTimerRef.current = null;
+      commitGlossarySettings(next, glossarySettings.glossary_dir);
+    }, SETTINGS_DEBOUNCE_MS);
+  };
+
+  const handleDownloadModel = async (modelId: string) => {
+    const result = await bridge.downloadModelProfile(modelId);
+    setDownloadProgress(result);
+    if (provider.type === 'local_model') {
+      const nextConfig: TranslationProviderConfig = {
+        ...provider,
+        model_id: modelId,
+      };
+      setProvider(nextConfig);
+      await bridge.switchTranslationProvider(nextConfig, srcLang, tgtLang);
+    }
+    return result;
+  };
+
+  const handleSkipToApiTranslation = (config?: TranslationProviderConfig) => {
+    const nextConfig = config ?? createDefaultProviderConfig('openai_compatible');
+    setProvider(nextConfig);
+    scheduleTranslationProviderSync(nextConfig, srcLang, tgtLang, true);
+  };
+
+  const handleCompleteWizard = async () => {
+    const updated = await bridge.completeFirstRunWizard();
+    setWizardCompleted(updated.wizard_completed);
+    setConnection(updated.connection);
+    setStatusError(null);
+    userNavigatedRef.current = true;
+    setMode('overlay');
+  };
 
   const handleRunLifecycleDemo = () => {
     if (demoRunning) return;
@@ -197,8 +573,20 @@ export function App() {
     }
     timersRef.current = [];
     setDemoRunning(false);
-    setSubtitles(INITIAL_SUBTITLES);
+    setSubtitles(defaultPreviewSubtitles);
   };
+
+  if (isPureOverlayWindow) {
+    return (
+      <main className="pure-overlay-shell" data-testid="pure-overlay-window">
+        <SubtitleOverlay
+          entries={subtitles}
+          options={overlayOptions}
+          frameless={true}
+        />
+      </main>
+    );
+  }
 
   return (
     <div className="app-shell">
@@ -232,24 +620,51 @@ export function App() {
               id="mode-overlay-btn"
               data-testid="mode-overlay-btn"
               className={`mode-btn ${mode === 'overlay' ? 'is-active' : ''}`}
-              onClick={() => setMode('overlay')}
+              onClick={() => navigateMode('overlay')}
             >
               Overlay Preview
+            </button>
+            <button
+              type="button"
+              id="mode-wizard-btn"
+              data-testid="mode-wizard-btn"
+              className={`mode-btn ${mode === 'wizard' ? 'is-active' : ''}`}
+              onClick={() => navigateMode('wizard')}
+            >
+              Setup Wizard
             </button>
             <button
               type="button"
               id="mode-settings-btn"
               data-testid="mode-settings-btn"
               className={`mode-btn ${mode === 'settings' ? 'is-active' : ''}`}
-              onClick={() => setMode('settings')}
+              onClick={() => navigateMode('settings')}
             >
-              Settings &amp; Setup
+              Settings
             </button>
           </nav>
         </div>
       </header>
 
       <main className="app-main">
+        {statusError && (
+          <div
+            className="app-error-banner"
+            data-testid="app-error-banner"
+            role="alert"
+          >
+            <span className="app-error-message">{statusError}</span>
+            <button
+              type="button"
+              className="btn btn-subtle btn-compact"
+              data-testid="dismiss-error-banner-btn"
+              onClick={() => setStatusError(null)}
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
         <div className="status-strip">
           <span>
             Pipeline: <strong>{srcLang.toUpperCase()} → {tgtLang.toUpperCase()}</strong>
@@ -280,32 +695,49 @@ export function App() {
           </div>
         </div>
 
-        {mode === 'overlay' ? (
+        {mode === 'overlay' && (
           <div className="overlay-stage" data-testid="overlay-preview-stage">
             <div className="overlay-backdrop-caption">
-              Simulated Game / Voice Chat Surface (Phase 1 Browser Preview — Tauri click-through
-              host integrates in Phase 3)
+              Simulated Game / Voice Chat Surface (Tauri v2 Overlay Preview —{' '}
+              {bridge.isTauri ? 'Tauri IPC Connected' : 'Browser Preview Mode'})
             </div>
             <SubtitleOverlay
               entries={subtitles}
               options={overlayOptions}
-              onToggleLock={() =>
-                setOverlayOptions((prev) => ({ ...prev, locked: !prev.locked }))
-              }
+              onToggleLock={handleToggleLock}
             />
           </div>
-        ) : (
+        )}
+
+        {mode === 'wizard' && (
+          <SetupWizard
+            platform={platform}
+            detectedMumblePaths={detectedMumblePaths}
+            isFlatpakMumble={isFlatpakMumble}
+            connection={connection}
+            selectedModelId={
+              provider.type === 'local_model' ? provider.model_id : 'fugumt-en-ja-int8'
+            }
+            downloadProgress={downloadProgress}
+            wizardCompleted={wizardCompleted}
+            onInstallPlugin={(customDir) => bridge.installMumblePlugin(customDir)}
+            onDownloadModel={handleDownloadModel}
+            onSkipToApiTranslation={handleSkipToApiTranslation}
+            onCompleteWizard={handleCompleteWizard}
+          />
+        )}
+
+        {mode === 'settings' && (
           <TranslationSettings
             srcLang={srcLang}
             tgtLang={tgtLang}
             provider={provider}
             overlayOptions={overlayOptions}
-            onChangeLanguages={(nextSrc, nextTgt) => {
-              setSrcLang(nextSrc);
-              setTgtLang(nextTgt);
-            }}
-            onChangeProvider={setProvider}
-            onChangeOverlayOptions={setOverlayOptions}
+            glossarySettings={glossarySettings}
+            onChangeLanguages={handleUpdateLanguages}
+            onChangeProvider={handleUpdateProvider}
+            onChangeOverlayOptions={handleUpdateOverlayOptions}
+            onChangeGlossarySettings={handleUpdateGlossarySettings}
           />
         )}
       </main>
