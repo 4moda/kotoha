@@ -395,7 +395,7 @@ fn print_json<T: Serialize>(value: &T) {
     }
 }
 
-/// Stable snake_case identifier for a disconnect reason (used in JSON output).
+/// Stable `snake_case` identifier for a disconnect reason (used in JSON output).
 fn reason_slug(reason: &kotoha_core::domain::DisconnectReason) -> String {
     use kotoha_core::domain::DisconnectReason as R;
     match reason {

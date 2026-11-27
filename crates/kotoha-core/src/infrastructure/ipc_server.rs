@@ -411,6 +411,7 @@ async fn handle_connection(
                     source: app_name,
                     plugin_version,
                 });
+                drop(map);
             }
             deadline = Instant::now() + config.idle_timeout;
         } else {
