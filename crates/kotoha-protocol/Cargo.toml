@@ -1,0 +1,14 @@
+[package]
+name = "kotoha-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Binary IPC v1 protocol codec, frame validation, and cross-platform endpoint resolution for Kotoha"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
