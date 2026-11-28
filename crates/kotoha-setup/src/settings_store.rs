@@ -439,32 +439,29 @@ const LEGACY_SECRET_FIELDS: [&str; 3] = ["api_key", "bearer_token", "endpoint_ur
 /// Returns `raw` with secret fields removed (valid JSON) or, for text that is not valid JSON,
 /// with the value of every line mentioning a secret field redacted.
 fn scrub_secrets_for_backup(raw: &str) -> String {
+    // Fail closed: only content that parses as JSON with an object-shaped
+    // `translation_provider` (or none at all) is kept, minus the secret fields.
+    // Anything else (non-JSON, hand-edited, unexpected shapes) could hide a secret
+    // in a form a line-based filter would miss, so its body is not copied.
     if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) {
-        if let Some(provider) = value
-            .get_mut("translation_provider")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            for field in LEGACY_SECRET_FIELDS {
-                provider.remove(field);
+        if let Some(root) = value.as_object_mut() {
+            match root.get_mut("translation_provider") {
+                Some(serde_json::Value::Object(provider)) => {
+                    for field in LEGACY_SECRET_FIELDS {
+                        provider.remove(field);
+                    }
+                }
+                Some(_) => {
+                    root.remove("translation_provider");
+                }
+                None => {}
             }
-        }
-        if let Ok(text) = serde_json::to_string_pretty(&value) {
-            return text;
+            if let Ok(text) = serde_json::to_string_pretty(&value) {
+                return text;
+            }
         }
     }
-    raw.lines()
-        .map(|line| {
-            if LEGACY_SECRET_FIELDS
-                .iter()
-                .any(|field| line.contains(&format!("\"{field}\"")))
-            {
-                "\"<redacted>\"".to_owned()
-            } else {
-                line.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    "{\"_kotoha_backup_note\": \"original settings file was not valid JSON; its content was omitted from this backup so that no secret is copied\"}".to_owned()
 }
 
 /// Moves legacy plaintext secret fields out of `translation_provider` into `secrets`.

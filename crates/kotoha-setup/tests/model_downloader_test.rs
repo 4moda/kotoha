@@ -390,8 +390,9 @@ async fn aborts_mid_stream_when_body_exceeds_limit_without_a_content_length() {
     let full: Vec<u8> = chunks.iter().flatten().copied().collect();
     let sha = sha256_hex(&full);
     let chunks_for_server = chunks.clone();
-    let server = LocalDownloadServer::start(move |_| {
-        ScriptedResponse::ok_chunked(chunks_for_server.clone())
+    let server = LocalDownloadServer::start(move |_| ScriptedResponse {
+        omit_content_length: true,
+        ..ScriptedResponse::ok_chunked(chunks_for_server.clone())
     })
     .await;
 

@@ -426,12 +426,39 @@ fn backups_never_contain_legacy_plaintext_secrets() {
     let outcome = store.load_or_recover(&secrets);
     assert!(!outcome.save_blocked);
 
+    // Not valid JSON: the value sits on the line after the key.
+    fs::write(
+        store.path(),
+        "{\n  \"api_key\":\n    \"PLAINTEXT-LEGACY-KEY-3\",\n  oops\n",
+    )
+    .unwrap();
+    let outcome = store.load_or_recover(&secrets);
+    assert!(!outcome.save_blocked);
+
+    // Not valid JSON: a hand-edited, unquoted key.
+    fs::write(store.path(), "api_key: \"PLAINTEXT-LEGACY-KEY-4\"\n").unwrap();
+    let outcome = store.load_or_recover(&secrets);
+    assert!(!outcome.save_blocked);
+
+    // Valid JSON, but `translation_provider` has an unexpected shape.
+    let mut odd = serde_json::to_value(AppSettings::default()).unwrap();
+    odd["translation_provider"] = serde_json::json!([{ "api_key": "PLAINTEXT-LEGACY-KEY-5" }]);
+    fs::write(store.path(), odd.to_string()).unwrap();
+    let outcome = store.load_or_recover(&secrets);
+    assert!(!outcome.save_blocked);
+
     let backups = backups_in(&root);
-    assert_eq!(backups.len(), 2);
+    assert_eq!(backups.len(), 5);
     for backup in backups {
         let text = fs::read_to_string(&backup).unwrap();
-        assert!(!text.contains("PLAINTEXT-LEGACY-KEY"), "{text}");
-        assert!(!text.contains("secret.example"), "{text}");
+        assert!(
+            !text.contains("PLAINTEXT-LEGACY-KEY"),
+            "a backup still contains a legacy plaintext key"
+        );
+        assert!(
+            !text.contains("secret.example"),
+            "a backup still contains the legacy endpoint URL"
+        );
     }
 
     let _ = fs::remove_dir_all(&root);
