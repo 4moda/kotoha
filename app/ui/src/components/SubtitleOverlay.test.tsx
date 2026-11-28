@@ -90,6 +90,52 @@ describe('SubtitleOverlay', () => {
     expect(renBadge).toHaveStyle({ borderColor: expectedRenColor });
   });
 
+  it('renders translation_failed cards with source text and 翻訳失敗 label', () => {
+    const failedEntry: SubtitleEntry = {
+      utterance_id: 104,
+      speaker_key: { source: 'mumble', user_id: 55 },
+      speaker_name: 'Sora',
+      speaker_color: '',
+      src_text: 'Pull back to the tower, they have numbers.',
+      translated_text: null,
+      stage: 'translation_failed',
+      timestamp_ms: 1700000004000,
+      failure_reason: 'translation provider error',
+    };
+
+    render(<SubtitleOverlay entries={[failedEntry]} options={baseOptions} />);
+
+    const card = screen.getByTestId('subtitle-entry-104');
+    expect(card).toHaveAttribute('data-stage', 'translation_failed');
+    expect(within(card).getByText('翻訳失敗')).toHaveClass('stage-tag');
+    expect(
+      within(card).getByText('Pull back to the tower, they have numbers.'),
+    ).toBeInTheDocument();
+    expect(
+      within(card).getByText('翻訳失敗: translation provider error'),
+    ).toBeInTheDocument();
+  });
+
+  it('renders translation_failed cards without a reason label suffix when reason is absent', () => {
+    const failedEntry: SubtitleEntry = {
+      utterance_id: 105,
+      speaker_key: { source: 'mumble', user_id: 56 },
+      speaker_name: 'Kai',
+      speaker_color: '',
+      src_text: 'Regroup at spawn.',
+      translated_text: null,
+      stage: 'translation_failed',
+      timestamp_ms: 1700000005000,
+    };
+
+    render(<SubtitleOverlay entries={[failedEntry]} options={baseOptions} />);
+
+    const card = screen.getByTestId('subtitle-entry-105');
+    expect(within(card).getByText('Regroup at spawn.')).toBeInTheDocument();
+    expect(within(card).getAllByText('翻訳失敗').length).toBeGreaterThan(0);
+    expect(within(card).queryByText(/翻訳失敗:/)).not.toBeInTheDocument();
+  });
+
   it('hides source text beneath translated subtitle when show_source_text is false', () => {
     render(
       <SubtitleOverlay

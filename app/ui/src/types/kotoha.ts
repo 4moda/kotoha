@@ -3,7 +3,11 @@ export interface SpeakerKey {
   user_id: number;
 }
 
-export type SubtitleStage = 'interim' | 'final_pending_translation' | 'translated';
+export type SubtitleStage =
+  | 'interim'
+  | 'final_pending_translation'
+  | 'translated'
+  | 'translation_failed';
 
 export interface SubtitleEntry {
   utterance_id: number;
@@ -14,6 +18,7 @@ export interface SubtitleEntry {
   translated_text: string | null;
   stage: SubtitleStage;
   timestamp_ms: number;
+  failure_reason?: string;
 }
 
 export type ComputeDevice = 'auto' | 'cpu' | 'cuda' | 'metal';

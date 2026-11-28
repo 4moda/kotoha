@@ -107,6 +107,7 @@ export function SubtitleOverlay({
                     {stage === 'interim' && 'Interim STT'}
                     {stage === 'final_pending_translation' && 'Translating…'}
                     {stage === 'translated' && 'Translated'}
+                    {stage === 'translation_failed' && '翻訳失敗'}
                   </span>
                 </div>
 
@@ -130,6 +131,18 @@ export function SubtitleOverlay({
                     {options.show_source_text && (
                       <p className="subtitle-secondary">{entry.src_text}</p>
                     )}
+                  </>
+                )}
+
+                {stage === 'translation_failed' && (
+                  <>
+                    <p className="subtitle-primary subtitle-failed">
+                      {entry.src_text}
+                    </p>
+                    <p className="subtitle-failed-reason">
+                      翻訳失敗
+                      {entry.failure_reason ? `: ${entry.failure_reason}` : ''}
+                    </p>
                   </>
                 )}
               </li>
