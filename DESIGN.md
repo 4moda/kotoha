@@ -374,7 +374,7 @@ Rust コアは **Clean / Hexagonal (Onion) Architecture** に基づき、依存�
 | レイヤー | パス / クレート | 依存許可範囲 | 主な責務・構成要素 |
 | :--- | :--- | :--- | :--- |
 | **Domain (最内層)** | `kotoha-core/src/domain/` | 純粋 Rust (`serde`, `thiserror` 等のみ。`tokio`/`reqwest`/`interprocess`/`tauri` 禁止) | **Entities / Value Objects**: `SpeakerKey`, `LanguageCode`, `AudioChunk`, `UtteranceId`, `TranscriptEvent`, `TranslationRequest`, `TranslationResult`, `TranslateContext`, `SubtitleEntry`, `GlossaryProfile`, `HotwordsConfig`, `ModelProfile`, `ComputeDevice`, `TranslationProviderConfig`, `Secret`, `SecretRef`<br>**Ports (Traits)**: `SttEngine`, `SttStream`, `Translator`, `AudioInputSource`, `SubtitleSink`, `SettingsRepository`, `GlossaryRepository`, `SecretStore`<br>**Pure Logic**: Pre-filter 判定、話者カラーハッシュ、Context Window 管理、用語辞書最長一致プレースホルダ保護/復元 |
-| **Application** | `kotoha-core/src/application/` | `domain` のみ | `PipelineService`（前処理・話者別 STT ストリーム制御・Pre-filter・文脈/用語辞書注入・Semaphore 並列翻訳・`utterance_id` 順序保証・`SubtitleSink` 通知）<br>`SourceSessionManager`（`conn_id` 所有権管理と切断クリーンアップ）<br>`TranslatorManager`（設定変更時の翻訳プロバイダ／モデルプロファイル実行時ホットスワップ）<br>`GlossaryManager`（複数 TOML 用語辞書の読込・優先マージ・STT Hotwords / 翻訳辞書同期） |
+| **Application** | `kotoha-core/src/application/` | `domain` のみ | `PipelineService`（イベント振り分けと話者別 STT ワーカーのライフサイクル管理・前処理・Pre-filter・文脈/用語辞書注入・上限付き/締め切り付き翻訳キュー・`utterance_id` 順序保証・`SubtitleSink` 通知）<br>`SourceSessionManager`（`conn_id` 所有権管理と切断クリーンアップ）<br>`TranslatorManager`（設定変更時の翻訳プロバイダ／モデルプロファイル実行時ホットスワップ）<br>`GlossaryManager`（複数 TOML 用語辞書の読込・優先マージ・STT Hotwords / 翻訳辞書同期） |
 | **Infrastructure** | `kotoha-core/src/infrastructure/`<br>`kotoha-protocol`<br>`kotoha-stt-sherpa` (P2)<br>`kotoha-translate-local` (P2)<br>`kotoha-translate-http` (P2) | `domain`, `application`, 外部 I/O クレート | `IpcServerAdapter`（`tokio` + `interprocess` + `kotoha-protocol`、`AudioInputSource` 実装）<br>`AudioPreprocessor`（任意 ch → モノラル平均ダウンミックス、8k..192kHz → 16 kHz `f32` リサンプラ）<br>`MockSttAdapter` / `MockTranslatorAdapter`（Phase 1 検証用）<br>`TomlGlossaryRepository`（`glossaries/*.toml` 読込）<br>Phase 2 外部アダプタ群（`sherpa-onnx`, `ct2rs` + モデルダウンローダ, HTTP API 群）<br>`JsonSettingsRepository` / `InMemorySecretStore`・`EnvSecretStore`（OS キーチェーン連携は後続） |
 | **Presentation (最外層)** | `kotoha-core/src/bin/kotoha_ipc_monitor.rs` (P1)<br>`app/src-tauri` (P3) + `app/ui` | 全内側レイヤー（DI 組み立て担当） | `kotoha-ipc-monitor` CLI（受信統計・RMS・ドロップ数・パイプライン出力）<br>Tauri v2 Commands / Event Bridge (`SubtitleSink` 実装) / System Tray / Overlay UI |
 
@@ -386,7 +386,7 @@ Rust コアは **Clean / Hexagonal (Onion) Architecture** に基づき、依存�
 - `crates/kotoha-stt-sherpa`（Phase 2）:
   - `sherpa-onnx`（CPU 軽量ストリーミングモデル、例: Zipformer / Paraformer 等）を用いた `SttEngine` / `SttStream` アダプタ。
   - **Hotwords (Context Biasing)** による用語ブースト（Transducer では `decoding_method = "modified_beam_search"` 使用、`hotwords_score` 設定対応）。
-  - 話者（`SpeakerKey`）ごとに独立したストリームを保持し、無音タイムアウト・`UserRemoved`・`SourceReset` で確実に解放する。
+  - 話者（`SpeakerKey`）ごとに独立したストリームを提供する。ストリームの解放（無音タイムアウト・`UserRemoved`・`SourceReset`）は `PipelineService` の話者ワーカーが担い、エンジン側でのアイドル回収（旧 `reap_idle_streams`）は持たない（§4.2「実行モデル」参照）。
 - `crates/kotoha-translate-local`（Phase 2）:
   - `ct2rs` (CTranslate2) ベースの `Translator` アダプタ、ハードウェア判定・モデルカタログ管理・SHA-256 検証付きダウンローダ。
 - `crates/kotoha-translate-http`（Phase 2）:
@@ -519,24 +519,57 @@ pub trait GlossaryRepository: Send + Sync {
 2. **Context Manager（`TranslateContext`）**:
    - チャンネル/セッション単位で直近 **5〜10 発話**（設定可能、デフォルト 8 発話）の「話者名 + 原文 + 訳文」をリング履歴として保持。
    - `GlossaryManager` が優先順位順にマージした汎用カスタム用語辞書（`glossary`）を `TranslateContext` 経由で翻訳層へ注入する。
-3. **並列翻訳・順序保証 (`PipelineService`)**:
-   - 翻訳処理は `tokio::sync::Semaphore` で同時実行数上限（例: 4）を制御しつつ非同期並列実行する。
-   - UI への翻訳結果反映は `utterance_id` をキーとして紐付けるため、翻訳完了順が前後しても対応する字幕カードが正確に更新され、表示順序の破綻を防ぐ。
+3. **実行モデル・バックプレッシャー・順序保証 (`PipelineService`, #27)**:
+   - **スレッドモデル**:
+
+     ```text
+     AudioInputEvent ─▶ ルーター（run() ループ）─try_send─▶ [話者ごとの上限付きキュー] ─▶ 話者ワーカー（async タスク）
+                         セッション所有権・                                              │ spawn_blocking でリサンプル + STT
+                         ワーカーの生成/停止/破棄                                         │ （話者ごとに逐次、話者間は並列）
+                                                                                         ▼
+                                          [上限付きジョブチャンネル] ─▶ 翻訳ディスパッチャ（1 タスク）
+                                                                        待ち行列 max_pending_translations
+                                                                        同時実行 max_concurrent_translations
+                                                                        締め切り translation_deadline
+     ```
+
+     - **ルーター**（`PipelineService::run`）は `SourceSessionManager` で所有権を判定し、音声を話者ワーカーへ**ノンブロッキング**（`try_send`）で振り分け、ワーカーのライフサイクル（初回音声で生成、`UserRemoved` で停止、`SourceReset` / 切断で破棄）だけを管理する。STT を実行せず、ワーカーを待たないため、`TalkingState` / `UserRemoved` などの制御イベントは STT 処理中でも即座に処理される。
+     - **話者ワーカー**は話者ごとの async タスクで、その話者の `SttStream` を所有する（`std::sync::Mutex` によるラップは不要）。CPU 処理（リサンプルとデコード）は `spawn_blocking` で blocking プール上で実行し、同一話者内では逐次、話者間では並列に進む。キューに溜まった入力は最大 32 件ずつまとめて 1 回の blocking 呼び出しで処理する。
+     - **翻訳ディスパッチャ**は確定字幕を FIFO の待ち行列に保持し、同時に最大 `max_concurrent_translations` 件の翻訳を実行する。実行中タスク数・待ち件数ともに上限があり、`JoinSet` が際限なく伸びることはない。
+     - 将来の音声→LLM 直接パス（#46）では、話者ワーカーが `SttStream` + ディスパッチャの組の代わりに `SpeechTranslator` を保持する形に差し替えられるよう、ルーター・キュー・ゲート・エラー方針は共通とする。
+   - **バックプレッシャー方針**（リアルタイム性を優先し、溢れたら古いものから捨てる）:
+
+     | キュー | 上限（既定値） | 溢れたとき |
+     |---|---|---|
+     | 話者ごとの音声キュー | `speaker_queue_capacity`（256 チャンク ≒ 20 ms フレームで約 5 秒） | そのチャンクを破棄（`stt_queue_drops`）。1 人の遅い話者が他の話者を止めない |
+     | 発話終了通知（`TalkingState` の非発話化） | 同上 | 通知を破棄し、無音タイムアウトで確定させる |
+     | 翻訳待ち行列 | `max_pending_translations`（16） | 最も古い待ちを「翻訳省略」にする |
+     | 翻訳の同時実行 | `max_concurrent_translations`（4） | 待ち行列で待つ |
+
+   - **翻訳の締め切り**: 各確定字幕は確定から `translation_deadline`（既定 10 秒）以内に必ず結果（`Translated` または `TranslationFailed`）が出る。待ち行列で締め切りを過ぎたもの、待ち行列から溢れたもの、実行中に締め切りを過ぎたもの（翻訳呼び出しは中断する）は、`SubtitleStage::TranslationFailed` + `failure_reason = "translation skipped (too late)"` として UI に通知し、`PipelineStats::translations_skipped` に計上する（`translation_failures` には含めない）。
+   - **無音タイムアウト（パイプラインの責務）**: 話者ワーカーは `speaker_idle_timeout`（既定 5 秒）入力がなければ flush → 確定 → ストリーム破棄を行って終了し（`idle_flushes`）、次の音声で新しいワーカー・ストリームが作られる。エンジン側の `SherpaSttEngine::reap_idle_streams` と `SherpaSttConfig::idle_timeout` は廃止した。
+   - **Interim カードを残さない**: 発話途中でストリームを破棄する場合（無音タイムアウト・STT エラー・panic）や、flush が何も返さなかった場合は、直近の Interim テキストをその発話の確定字幕として送出し（`synthesized_finals`）、通常どおり翻訳する。`SourceReset` / 切断ではキューに残った音声を捨て、`clear_source` でカードごと消去する。パイプライン終了時（入力チャンネルの close）は全ワーカーが残りの音声を処理して flush・確定し、待ち行列の翻訳も締め切りまで処理してから `run()` が戻る。
+   - **`create_stream` のバックオフ**: 生成に失敗し続ける場合は 100 ms から倍々で最大 5 秒まで再試行を遅らせ、その間のチャンクは破棄する（チャンクごとに再試行しない）。
+   - **順序保証とゲート**: ソースごとに「ゲート」（非同期 Mutex。epoch と `ContextWindow` を保持）を持つ。字幕の送出・epoch の判定・文脈への追加はすべてゲートを保持したまま行い、`SourceReset` は同じゲートの下で epoch を進めて `clear_source` を呼ぶ。このため epoch 判定と `push_turn` / `emit` の間に `SourceReset` が割り込む競合はない。確定字幕は送出時にソース内の連番を受け取り、翻訳の完了順が前後しても `ContextWindow` へは確定順に追加する（成功した発話のみ）。
+   - UI への翻訳結果反映は `utterance_id` をキーとして紐付けるため、翻訳完了順が前後しても対応する字幕カードが正確に更新され、表示順序の破綻を防ぐ。`Translated` / `TranslationFailed` はどちらもリクエストの `utterance_id`（アダプタの返り値ではない）を使う。
    - **エラー方針（単一障害でパイプラインを止めない）**: Domain の純粋関数 `CoreError::scope() -> ErrorScope`（`Chunk < Utterance < Speaker < Fatal`）でエラーの影響範囲を分類し、呼び出し箇所ごとの上限（`ErrorScope::at_most`）で丸めた範囲だけを破棄して処理を継続する。`run()` を終了させるのは `Fatal`（パイプライン自身の不変条件違反。例: 翻訳 Semaphore の close）のみで、入力チャンネルの close は `Ok(())` での正常終了とする。
 
      | 発生箇所 | 上限スコープ | 回復動作 |
      |---|---|---|
-     | `ResampleFn`（不正チャンク） | `Chunk` | 当該チャンクを破棄 |
-     | `SttEngine::create_stream` / `SttStream::accept_audio` | `Speaker` | `Chunk` ならチャンクのみ破棄、それ以外は当該話者ストリームを破棄し次チャンクで再生成 |
-     | `SttStream::flush` | `Speaker` | 当該話者ストリームを破棄 |
+     | `ResampleFn`（不正チャンク・panic） | `Chunk` | 当該チャンクを破棄 |
+     | `SttEngine::create_stream`（エラー・panic） | `Speaker` | チャンクを破棄し、バックオフ後に再試行 |
+     | `SttStream::accept_audio` | `Speaker` | `Chunk` ならチャンクのみ破棄、それ以外（panic を含む）は当該話者ストリームを破棄し次チャンクで再生成 |
+     | `SttStream::flush`（エラー・panic） | `Speaker` | 当該話者ストリームを破棄 |
      | `Translator::translate`（エラー・panic とも） | `Utterance` | `SubtitleStage::TranslationFailed`（JSON: `"translation_failed"`、`failure_reason` に固定文言）を通知。Context Window には記録しない |
      | `SubtitleSink::emit` / `clear_source` | `Utterance` | 当該更新のみ欠落（UI 未接続でも継続） |
-     | 翻訳タスクの `JoinError` | `Utterance` | 計上して継続 |
+     | 話者ワーカー / 翻訳タスクの panic（`JoinError`） | `Speaker` / `Utterance` | 計上して継続（ワーカーは次チャンクで再生成） |
 
      - `failure_reason` はアダプタのエラーメッセージ（プロバイダ応答本文を含み得る）を転送せず、`CoreError::translation_failure_reason()` の固定文言（例: `"translation provider error"`、panic 時は `"translation engine crashed"`）のみを UI へ渡す。
-     - ロギング依存（`tracing` / `log`）は現時点で導入せず、非致命エラーは `PipelineStats`（`translation_failures` / `stt_errors` / `stt_stream_resets` / `dropped_chunks` / `sink_errors` / `task_panics`）に計上する。`PipelineService::stats_handle()` で `run()` 実行中もロックフリーに参照できる。
+     - STT・リサンプル・`create_stream`・`flush` の panic は話者ワーカー内で `catch_unwind` により捕捉し、`SubtitleSink` の panic はワーカー / 翻訳タスク / `spawn` で隔離するため、どの adapter の panic でも `run()` は終了しない。
+     - 非致命エラーは `PipelineStats`（`translation_failures` / `translations_skipped` / `stt_errors` / `stt_stream_resets` / `dropped_chunks` / `stt_queue_drops` / `idle_flushes` / `synthesized_finals` / `sink_errors` / `task_panics`、ゲージ `pending_translations` / `peak_pending_translations` / `active_speaker_workers`）に計上する。`PipelineService::stats_handle()` で `run()` 実行中もロックフリーに参照できる。
+     - **ロギング**: `kotoha-core` は `tracing`（ファサードのみ、`default-features = false`）でログを出す。メッセージは固定文言とし、フィールドはエラー種別（`CoreError::kind()` の固定名）・`failure_reason` の固定文言・`source` / `user_id` / `utterance_id` などの識別子に限る。アダプタのエラーメッセージ（`Display`）はプロバイダ応答本文や秘密情報を含み得るため、ログにも出さない。subscriber の設定（出力先・レベル）は Presentation 層（`app/src-tauri` / CLI）の責務とする。
      - **リトライ / バックオフ**: パイプラインは翻訳を再試行しない（リアルタイム字幕では遅延した再試行より次の発話を優先する）。再試行が必要な場合は翻訳アダプタ（`kotoha-translate-http`）側の責務とする。
-     - 話者別 STT ワーカー・上限付き翻訳キューへの再構成（#27）後も、同じ `ErrorScope` 分類と `PipelineStatsHandle`（`Clone` 可能）を各ワーカーで共有する前提とする。
+     - 話者ワーカー・翻訳ディスパッチャは同じ `ErrorScope` 分類と `PipelineStatsHandle`（`Clone` 可能）を共有する。
 4. **実行時ホットスワップ (`TranslatorManager` / `GlossaryManager`)**:
    - `TranslatorManager` は現在の `Arc<dyn Translator>` を `tokio::sync::RwLock`（または `arc_swap`）で保持し、ユーザーが設定画面でプロバイダや `ModelProfile` を切り替えても、進行中の IPC 接続や話者 STT ストリームを切断せずに即座に後続発話から新エンジンへ切り替えられる。
    - 用語辞書プロファイルや `hotwords_score` が更新された場合は、`GlossaryManager` がマージ済み `[terms]` を再計算し、以後の翻訳リクエストおよび STT ストリームへ即時反映する。

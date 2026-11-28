@@ -1,7 +1,6 @@
 //! Configuration types and validation for the `sherpa-onnx` streaming STT adapter.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use kotoha_core::domain::{ComputeDevice, CoreError, SttDecodingMethod, DEFAULT_HOTWORDS_SCORE};
 use serde::{Deserialize, Serialize};
@@ -17,9 +16,6 @@ pub const DEFAULT_NUM_THREADS: i32 = 2;
 
 /// Default beam width when `modified_beam_search` decoding is active (`4`).
 pub const DEFAULT_MAX_ACTIVE_PATHS: i32 = 4;
-
-/// Default idle duration after which inactive speaker STT streams are reaped (`60` seconds).
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Default endpointing rule 1 trailing silence threshold in seconds.
 pub const DEFAULT_RULE1_MIN_TRAILING_SILENCE: f32 = 2.4;
@@ -227,8 +223,6 @@ pub struct SherpaSttConfig {
     pub hotwords_score: f32,
     /// Endpointing rules for utterance segmentation.
     pub endpoint: SherpaEndpointConfig,
-    /// Inactivity timeout after which idle speaker streams can be reaped.
-    pub idle_timeout: Duration,
     /// Audio sample rate in Hz (default `16000`).
     pub sample_rate: i32,
     /// Fbank feature dimension (default `80`).
@@ -249,7 +243,6 @@ impl SherpaSttConfig {
             decoding_method: SttDecodingMethod::GreedySearch,
             hotwords_score: DEFAULT_HOTWORDS_SCORE,
             endpoint: SherpaEndpointConfig::default(),
-            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             sample_rate: DEFAULT_SAMPLE_RATE,
             feature_dim: DEFAULT_FEATURE_DIM,
             debug: false,
@@ -317,11 +310,6 @@ impl SherpaSttConfig {
                 "sherpa feature_dim must be >= 1, got {}",
                 self.feature_dim
             )));
-        }
-        if self.idle_timeout.is_zero() {
-            return Err(CoreError::Stt(
-                "sherpa idle_timeout must be greater than zero".to_owned(),
-            ));
         }
         Ok(())
     }

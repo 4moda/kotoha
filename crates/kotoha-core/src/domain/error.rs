@@ -130,6 +130,29 @@ impl CoreError {
         }
     }
 
+    /// Stable variant name, safe to log: unlike the `Display` message it never contains adapter
+    /// messages (which may embed provider response bodies or other sensitive details).
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidLanguageCode(_) => "invalid_language_code",
+            Self::InvalidAudio(_) => "invalid_audio",
+            Self::Protocol(_) => "protocol",
+            Self::Ipc(_) => "ipc",
+            Self::Stt(_) => "stt",
+            Self::Translation(_) => "translation",
+            Self::UnknownModelProfile(_) => "unknown_model_profile",
+            Self::NotConfigured(_) => "not_configured",
+            Self::InvalidSecretRef(_) => "invalid_secret_ref",
+            Self::SecretStore(_) => "secret_store",
+            Self::SecretMissing(_) => "secret_missing",
+            Self::UnsupportedInPhase1(_) => "unsupported_in_phase1",
+            Self::Glossary(_) => "glossary",
+            Self::Sink(_) => "sink",
+            Self::ChannelClosed(_) => "channel_closed",
+        }
+    }
+
     /// Short, user-safe reason for a failed translation, suitable for a subtitle card.
     ///
     /// Returns a fixed phrase per variant instead of the error message: adapter messages can
