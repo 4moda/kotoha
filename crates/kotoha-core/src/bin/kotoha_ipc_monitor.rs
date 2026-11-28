@@ -297,6 +297,7 @@ fn emit_event(
             conn_id: _,
             speaker_key,
         } => {
+            resamplers.remove(speaker_key);
             if json {
                 print_json(&MonitorEvent::UserRemoved {
                     source: &speaker_key.source,

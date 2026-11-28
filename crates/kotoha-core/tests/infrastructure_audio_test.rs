@@ -1,13 +1,6 @@
 //! Unit tests for `kotoha-core` audio preprocessor (`src/infrastructure/audio.rs`).
 
-#![allow(
-    clippy::expect_used,
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::suboptimal_flops,
-    clippy::many_single_char_names,
-    clippy::suspicious_operation_groupings
-)]
+#![allow(clippy::expect_used, clippy::cast_precision_loss)]
 
 use std::f32::consts::PI;
 
@@ -238,6 +231,12 @@ fn resampler_recreates_filter_on_format_change() {
 
 /// Fits `a*sin + b*cos` at `freq` (least squares over whole output) and returns the residual
 /// power relative to the fitted signal power, in dB.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::suboptimal_flops,
+    clippy::many_single_char_names,
+    clippy::suspicious_operation_groupings
+)]
 fn sinad_db(out: &[f32], freq: f64, out_rate: f64) -> f64 {
     let (mut ss, mut cc, mut sc, mut ys, mut yc) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let w = 2.0 * std::f64::consts::PI * freq / out_rate;
@@ -265,6 +264,12 @@ fn sinad_db(out: &[f32], freq: f64, out_rate: f64) -> f64 {
 }
 
 #[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::suboptimal_flops,
+    clippy::many_single_char_names,
+    clippy::suspicious_operation_groupings
+)]
 fn resampler_tone_fit_residual_is_below_minus_60_db() {
     // (input rate, tone Hz); output is always 16 kHz.
     for (rate, freq) in [(44_100u32, 1_000.0f64), (44_100, 6_000.0), (8_000, 1_000.0)] {
