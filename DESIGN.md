@@ -154,9 +154,9 @@ C++ クライアント（`resolve_ipc_endpoint` / `resolve_posix_ipc_endpoint`�
   - クライアントは送信する他メッセージがない場合を含め、原則 **1000 ms (1 秒) ごと** に `Heartbeat` (`0x04`) を送信する。
   - サーバーは生存監視と UI の接続ステータス表示（「接続中 / 未接続」）に `Heartbeat` を利用する。実装済みのタイムアウト（`IpcServerConfig`、`IpcServerAdapter::with_config` で調整可）:
   - **`hello_timeout`（既定 2 秒）**: 接続受理から有効な `Hello` が届くまでの上限。超過した接続は切断する（`HelloTimeout`、`Hello` 未完了のため `SourceDisconnected` は発行しない）。
-  - **`idle_timeout`（既定 5 秒）**: `Hello` 後、**任意の種別のフレーム**（`Heartbeat` 含む）が届かない時間の上限。超過した接続は切断し `SourceDisconnected { reason: IdleTimeout }` を発行する。
+  - **`idle_timeout`（既定 5 秒）**: `Hello` 後、**任意の種別のフレーム**（`Heartbeat` 含む）が届かない時間の上限。超過した接続は切断し `SourceDisconnected { reason: IdleTimeout }` を発行する。下限は C++ プラグインの heartbeat 間隔（1000 ms）の 2 倍＝**2000 ms**（これ未満だと heartbeat が 1 回遅れただけで正常なプラグインが切断されるため拒否する）。
   - **`max_connections`（既定 16）**: 同時接続数の上限。超過分の新規接続は即座に破棄する。
-  - 3 つの上限は環境変数 `KOTOHA_IPC_HELLO_TIMEOUT_MS` / `KOTOHA_IPC_IDLE_TIMEOUT_MS`（ミリ秒）/ `KOTOHA_IPC_MAX_CONNECTIONS` と `kotoha-ipc-monitor` の `--hello-timeout-ms` / `--idle-timeout-ms` / `--max-connections` で変更できる（優先順位: フラグ > 環境変数 > 既定値。空文字列は未設定扱い）。検証範囲はタイムアウト 1〜3,600,000 ms、接続数 1〜4096 で、範囲外・数値以外はエラー終了（終了コード 2）する。
+  - 3 つの上限は環境変数 `KOTOHA_IPC_HELLO_TIMEOUT_MS` / `KOTOHA_IPC_IDLE_TIMEOUT_MS`（ミリ秒）/ `KOTOHA_IPC_MAX_CONNECTIONS` と `kotoha-ipc-monitor` の `--hello-timeout-ms` / `--idle-timeout-ms` / `--max-connections` で変更できる（優先順位: フラグ > 環境変数 > 既定値。空文字列は未設定扱い）。検証範囲は `hello_timeout` 1〜3,600,000 ms、`idle_timeout` 2000〜3,600,000 ms、接続数 1〜4096 で、範囲外・数値以外はエラー終了（終了コード 2）する。`IpcServerAdapter::with_config` / `from_env_with_config` も同じ検証を行い、範囲外なら `Result::Err` を返す。設定用の `KOTOHA_IPC_*` 環境変数の値が UTF-8 でない場合はエラー終了とする（エンドポイント系の変数は未設定扱い、上記「UTF-8 でない環境変数」参照）。診断フック（`with_diagnostics`）は切断の後始末（owner 登録の解除・`SourceDisconnected` 送信）の後に呼び出され、panic は捕捉して無視する（フックは block / panic してはならない）。
   - 切断理由と接続数超過による拒否は、`IpcServerAdapter::with_diagnostics` で登録するコールバック（`IpcDiagnostic`）で通知する。ワークスペースにはログフレームワーク（`tracing` 等）が無く、このためだけに依存を追加しないための設計で、`kotoha-ipc-monitor` は stderr に出力する（将来 `tracing` を導入する場合はこのコールバックから橋渡しする）。
   - 切断理由は `AudioInputEvent::SourceDisconnected.reason`（`DisconnectReason`: `Eof` / `IoError` / `Protocol` / `HelloTimeout` / `IdleTimeout` / `Superseded` / `Shutdown`）で通知され、`kotoha-ipc-monitor` が表示する。
 - **切断クリーンアップ (`SourceReset` / EOF)**:

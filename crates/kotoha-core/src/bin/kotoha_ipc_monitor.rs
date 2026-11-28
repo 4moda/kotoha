@@ -26,7 +26,8 @@ const USAGE: &str = "Usage: kotoha-ipc-monitor [--endpoint <path>] [--max-events
     \n\
     Server limits default to 2000 ms / 5000 ms / 16 connections and can also be set with the\n\
     environment variables KOTOHA_IPC_HELLO_TIMEOUT_MS, KOTOHA_IPC_IDLE_TIMEOUT_MS and\n\
-    KOTOHA_IPC_MAX_CONNECTIONS (command-line flags win over environment variables).";
+    KOTOHA_IPC_MAX_CONNECTIONS (command-line flags win over environment variables).\n\
+    The idle timeout must be at least 2000 ms (twice the plugin heartbeat interval).";
 
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -177,15 +178,18 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let server = cli
-        .endpoint
-        .clone()
-        .map_or_else(
-            || IpcServerAdapter::from_env_with_config(config),
-            |endpoint| IpcServerAdapter::with_config(endpoint, config),
-        )
-        // Disconnect reasons and over-limit refusals go to stderr so stdout stays machine-readable.
-        .with_diagnostics(|diagnostic| eprintln!("kotoha-ipc-monitor: {diagnostic}"));
+    let server = match cli.endpoint.clone().map_or_else(
+        || IpcServerAdapter::from_env_with_config(config),
+        |endpoint| IpcServerAdapter::with_config(endpoint, config),
+    ) {
+        Ok(server) => server,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(2);
+        }
+    }
+    // Disconnect reasons and over-limit refusals go to stderr so stdout stays machine-readable.
+    .with_diagnostics(|diagnostic| eprintln!("kotoha-ipc-monitor: {diagnostic}"));
     let listening_on = server.endpoint().to_owned();
     let (event_tx, mut event_rx) = mpsc::channel::<AudioInputEvent>(256);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
