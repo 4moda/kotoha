@@ -287,3 +287,179 @@ fn settings_store_handles_missing_file_defaults_corrupt_json_and_validation() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn load_or_recover_backs_up_corrupt_or_out_of_range_files_and_uses_defaults() {
+    let root = unique_temp_dir("kotoha_settings_recover");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let store = FileSettingsStore::in_dir(&root);
+    let secrets = InMemorySecretStore::new();
+
+    // Missing file: defaults, no notice.
+    let outcome = store.load_or_recover(&secrets);
+    assert_eq!(outcome.settings, AppSettings::default());
+    assert!(outcome.notice.is_none());
+
+    // Corrupt JSON is backed up and replaced by defaults with a notice.
+    fs::write(store.path(), "{ not json").unwrap();
+    let outcome = store.load_or_recover(&secrets);
+    assert_eq!(outcome.settings, AppSettings::default());
+    assert!(outcome.notice.is_some());
+    assert!(!store.path().exists());
+    let backups = || {
+        fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("kotoha-settings.json.bak-")
+            })
+            .count()
+    };
+    assert_eq!(backups(), 1);
+
+    // Out-of-range values (valid JSON) take the same path.
+    let mut bad = serde_json::to_value(AppSettings::default()).unwrap();
+    bad["overlay"]["font_size_px"] = serde_json::json!(500);
+    fs::write(store.path(), bad.to_string()).unwrap();
+    let outcome = store.load_or_recover(&secrets);
+    assert_eq!(outcome.settings, AppSettings::default());
+    assert!(!outcome.notice.unwrap().contains("500"));
+
+    // A valid file still loads untouched.
+    store.save(&AppSettings::default()).unwrap();
+    assert!(store.load_or_recover(&secrets).notice.is_none());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn backups_in(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found: Vec<_> = fs::read_dir(root)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("kotoha-settings.json.bak-")
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn unreadable_settings_file_is_left_untouched_and_saving_is_blocked() {
+    let root = unique_temp_dir("kotoha_settings_unreadable");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let store = FileSettingsStore::in_dir(&root);
+    // A directory at the settings path makes the read fail with a non-NotFound I/O error.
+    fs::create_dir_all(store.path()).unwrap();
+
+    let outcome = store.load_or_recover(&InMemorySecretStore::new());
+    assert_eq!(outcome.settings, AppSettings::default());
+    assert!(outcome.save_blocked);
+    assert!(outcome.notice.is_some());
+    assert!(
+        store.path().is_dir(),
+        "the unreadable entry must not be renamed or removed"
+    );
+    assert!(backups_in(&root).is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recoveries_in_the_same_second_get_unique_backup_names() {
+    let root = unique_temp_dir("kotoha_settings_unique_bak");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let store = FileSettingsStore::in_dir(&root);
+    let secrets = InMemorySecretStore::new();
+
+    for round in 0..3 {
+        fs::write(store.path(), format!("{{ broken {round}")).unwrap();
+        let outcome = store.load_or_recover(&secrets);
+        assert!(!outcome.save_blocked);
+        assert!(outcome.notice.is_some());
+    }
+    let backups = backups_in(&root);
+    assert_eq!(
+        backups.len(),
+        3,
+        "no backup may overwrite another: {backups:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn backups_never_contain_legacy_plaintext_secrets() {
+    let root = unique_temp_dir("kotoha_settings_scrub");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let store = FileSettingsStore::in_dir(&root);
+    let secrets = InMemorySecretStore::new();
+
+    // Legacy file with a plaintext key whose overlay values fail validation.
+    let mut legacy = serde_json::to_value(AppSettings::default()).unwrap();
+    legacy["translation_provider"] = serde_json::json!({
+        "type": "deep_l",
+        "api_key": "PLAINTEXT-LEGACY-KEY-1",
+        "endpoint_url": "https://secret.example/hook",
+    });
+    legacy["overlay"]["font_size_px"] = serde_json::json!(500);
+    fs::write(store.path(), legacy.to_string()).unwrap();
+    let outcome = store.load_or_recover(&secrets);
+    assert!(!outcome.save_blocked);
+
+    // Not valid JSON, but a line still mentions the key.
+    fs::write(
+        store.path(),
+        "{\n  \"api_key\": \"PLAINTEXT-LEGACY-KEY-2\",\n  oops\n",
+    )
+    .unwrap();
+    let outcome = store.load_or_recover(&secrets);
+    assert!(!outcome.save_blocked);
+
+    // Not valid JSON: the value sits on the line after the key.
+    fs::write(
+        store.path(),
+        "{\n  \"api_key\":\n    \"PLAINTEXT-LEGACY-KEY-3\",\n  oops\n",
+    )
+    .unwrap();
+    let outcome = store.load_or_recover(&secrets);
+    assert!(!outcome.save_blocked);
+
+    // Not valid JSON: a hand-edited, unquoted key.
+    fs::write(store.path(), "api_key: \"PLAINTEXT-LEGACY-KEY-4\"\n").unwrap();
+    let outcome = store.load_or_recover(&secrets);
+    assert!(!outcome.save_blocked);
+
+    // Valid JSON, but `translation_provider` has an unexpected shape.
+    let mut odd = serde_json::to_value(AppSettings::default()).unwrap();
+    odd["translation_provider"] = serde_json::json!([{ "api_key": "PLAINTEXT-LEGACY-KEY-5" }]);
+    fs::write(store.path(), odd.to_string()).unwrap();
+    let outcome = store.load_or_recover(&secrets);
+    assert!(!outcome.save_blocked);
+
+    let backups = backups_in(&root);
+    assert_eq!(backups.len(), 5);
+    for backup in backups {
+        let text = fs::read_to_string(&backup).unwrap();
+        assert!(
+            !text.contains("PLAINTEXT-LEGACY-KEY"),
+            "a backup still contains a legacy plaintext key"
+        );
+        assert!(
+            !text.contains("secret.example"),
+            "a backup still contains the legacy endpoint URL"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}

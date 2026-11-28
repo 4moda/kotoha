@@ -131,7 +131,7 @@ jobs:
         run: cargo nextest run --workspace
 
       - name: Install Tauri CLI
-        run: npm --prefix app/ui exec --yes -- @tauri-apps/cli@2 --version
+        run: npm --prefix app/ui exec --yes -- @tauri-apps/cli@2.12.6 --version
 
       - name: Build Tauri v2 desktop bundle (with embedded Mumble plugin)
         shell: bash
@@ -145,7 +145,7 @@ jobs:
           echo "Embedding Mumble plugin from ${KOTOHA_MUMBLE_PLUGIN_PATH}"
           test -f "${KOTOHA_MUMBLE_PLUGIN_PATH}"
           cd app/src-tauri
-          npx --yes @tauri-apps/cli@2 build
+          npx --yes @tauri-apps/cli@2.12.6 build
 
       - name: Package release archive, Tauri bundles, and SHA-256 checksums
         shell: python

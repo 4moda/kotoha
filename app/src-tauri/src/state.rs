@@ -10,21 +10,19 @@ use kotoha_core::application::{GlossaryManager, TranslatorManager};
 use kotoha_core::domain::{
     default_model_catalog, GlossaryProfile, GlossaryRepository, GlossarySettings, LanguageCode,
     ModelProfile, ProviderSecretKind, Secret, SecretStore, SecretWriter, SubtitleEntry,
-    TranslationProviderConfig, TranslatorFactory,
+    TranslationProviderConfig, Translator, TranslatorFactory,
 };
-use kotoha_core::infrastructure::{
-    DefaultTranslatorFactory, InMemorySecretStore, MockTranslator, TomlGlossaryRepository,
-};
+use kotoha_core::infrastructure::{InMemorySecretStore, MockTranslator, TomlGlossaryRepository};
 use kotoha_protocol::resolve_endpoint;
 use kotoha_setup::{
-    discover_mumble_plugin_dirs, plugin_filename, AppSettings, DownloadPhase, DownloadProgress,
-    FileSettingsStore, MumblePluginDirKind, OverlayStyleSettings, PluginInstallOutcome,
-    TargetPlatform,
+    cleanup_stale_part_files, discover_mumble_plugin_dirs, plugin_filename, AppSettings,
+    DownloadPhase, DownloadProgress, FileSettingsStore, MumblePluginDirKind, OverlayStyleSettings,
+    PluginInstallOutcome, TargetPlatform,
 };
 use kotoha_translate_http::HttpTranslatorFactory;
 use kotoha_translate_local::{CompositeTranslatorFactory, LocalNmtTranslatorFactory};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 use tokio::task::spawn_blocking;
 
 /// Maximum number of recent subtitle entries kept in memory for initial UI hydration.
@@ -340,6 +338,28 @@ impl SecretStatusDto {
     }
 }
 
+/// Whether the configured translation provider could actually be built, matching
+/// `TranslatorStatus` in `app/ui/src/types/kotoha.ts`. Carries user-safe text only (no secrets).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TranslatorStatusDto {
+    /// The configured provider is active.
+    Ok,
+    /// The configured provider is not active; placeholder (mock) translations are produced.
+    Error {
+        /// User-safe explanation.
+        reason: String,
+    },
+}
+
+impl TranslatorStatusDto {
+    fn error(reason: impl Into<String>) -> Self {
+        Self::Error {
+            reason: reason.into(),
+        }
+    }
+}
+
 /// Full runtime snapshot matching `AppRuntimeState` in `app/ui/src/types/kotoha.ts`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppRuntimeStateDto {
@@ -351,6 +371,10 @@ pub struct AppRuntimeStateDto {
     pub provider: TranslationProviderConfig,
     /// Which provider secrets are stored (booleans only; values are write-only).
     pub secrets: SecretStatusDto,
+    /// Whether the configured provider is actually in use or a placeholder translator is active.
+    pub translator_status: TranslatorStatusDto,
+    /// Notice shown when the settings file was unusable and defaults were loaded instead.
+    pub settings_notice: Option<String>,
     /// Current overlay display configuration.
     pub overlay_options: OverlayDisplayOptionsDto,
     /// Whether the overlay window is currently visible.
@@ -386,6 +410,12 @@ pub struct AppState {
     settings_store: FileSettingsStore,
     secret_store: Arc<InMemorySecretStore>,
     translator_manager: Arc<TranslatorManager>,
+    translator_status: RwLock<TranslatorStatusDto>,
+    settings_notice: Option<String>,
+    /// `true` when the existing settings file could not be used or set aside; saving is refused
+    /// so the file is never overwritten (see [`kotoha_setup::SettingsLoadOutcome::save_blocked`]).
+    settings_save_blocked: bool,
+    language_pair_tx: watch::Sender<(LanguageCode, LanguageCode)>,
     glossary_manager: Arc<RwLock<GlossaryManager>>,
     glossary_file_paths: RwLock<HashMap<String, String>>,
     connection_status: RwLock<ConnectionStatusDto>,
@@ -401,64 +431,50 @@ pub struct AppState {
 impl AppState {
     /// Initializes [`AppState`] rooted under `data_dir` (loading persisted sanitized settings and
     /// TOML glossary profiles if present).
+    ///
+    /// A corrupt or out-of-range settings file never prevents startup: it is backed up, defaults
+    /// are used and [`AppRuntimeStateDto::settings_notice`] tells the UI. A provider that cannot
+    /// be built is reported through [`AppRuntimeStateDto::translator_status`]; a placeholder
+    /// translator keeps the pipeline alive, but the UI is told it is not the configured one.
     pub fn new(data_dir: impl Into<PathBuf>) -> Result<Self, String> {
         let data_root = data_dir.into();
         let settings_store = FileSettingsStore::in_dir(&data_root);
         let secret_store = Arc::new(InMemorySecretStore::new());
-        let mut settings = settings_store
-            .load(secret_store.as_ref())
-            .map_err(|err| format!("failed to load settings: {err}"))?;
+        let loaded = settings_store.load_or_recover(secret_store.as_ref());
+        let settings = loaded.settings;
 
         let models_root_dir = data_root.join("models");
         let default_glossary_dir = resolve_default_glossary_dir(&data_root);
+        let removed = cleanup_stale_part_files(&models_root_dir);
+        if removed > 0 {
+            eprintln!("removed {removed} stale model download file(s)");
+        }
 
-        let initial_translator = Arc::new(MockTranslator::new(
-            "mock",
-            format!("[{}] ", settings.tgt_lang.as_str()),
-        ));
+        let factory = build_composite_factory(&models_root_dir, secret_store.clone());
+        let (translator, status): (Arc<dyn Translator>, TranslatorStatusDto) =
+            match factory.create(&settings.translation_provider) {
+                Ok(translator) => (translator, TranslatorStatusDto::Ok),
+                Err(_) => (
+                    Arc::new(MockTranslator::new(
+                        "mock",
+                        format!("[{}] ", settings.tgt_lang.as_str()),
+                    )),
+                    TranslatorStatusDto::error(describe_provider_unavailable(
+                        &settings.translation_provider,
+                        secret_store.as_ref(),
+                    )),
+                ),
+            };
         let translator_manager = Arc::new(TranslatorManager::new(
-            initial_translator,
+            translator,
             settings.translation_provider.clone(),
         ));
 
-        // Attempt immediate provider hydration when configured (e.g., HTTP or downloaded local NMT).
-        // Fall back gracefully to MockTranslator if local model weights have not been downloaded yet.
-        let factory = build_composite_factory(&models_root_dir, secret_store.clone());
-        if let Ok(translator) = factory.create(&settings.translation_provider) {
-            // Recreate with the hydrated translator when available.
-            let hydrated =
-                TranslatorManager::new(translator, settings.translation_provider.clone());
-            return Self::finish_init(
-                settings,
-                settings_store,
-                secret_store,
-                Arc::new(hydrated),
-                models_root_dir,
-                default_glossary_dir,
-            );
-        }
-
-        if matches!(
-            settings.translation_provider,
-            TranslationProviderConfig::Mock { .. }
-        ) {
-            if let Ok(mock) = DefaultTranslatorFactory.create(&settings.translation_provider) {
-                let hydrated = TranslatorManager::new(mock, settings.translation_provider.clone());
-                return Self::finish_init(
-                    settings,
-                    settings_store,
-                    secret_store,
-                    Arc::new(hydrated),
-                    models_root_dir,
-                    default_glossary_dir,
-                );
-            }
-        }
-
-        // Ensure default local_model remains selectable before first download.
-        let _ = &mut settings;
         Self::finish_init(
             settings,
+            loaded.notice,
+            loaded.save_blocked,
+            status,
             settings_store,
             secret_store,
             translator_manager,
@@ -467,8 +483,12 @@ impl AppState {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_init(
         settings: AppSettings,
+        settings_notice: Option<String>,
+        settings_save_blocked: bool,
+        translator_status: TranslatorStatusDto,
         settings_store: FileSettingsStore,
         secret_store: Arc<InMemorySecretStore>,
         translator_manager: Arc<TranslatorManager>,
@@ -480,12 +500,18 @@ impl AppState {
 
         let detected = detect_mumble_environment(settings.custom_mumble_plugin_dir.as_deref());
         let endpoint = resolve_endpoint();
+        let (language_pair_tx, _) =
+            watch::channel((settings.src_lang.clone(), settings.tgt_lang.clone()));
 
         Ok(Self {
             settings: RwLock::new(settings),
             settings_store,
             secret_store,
             translator_manager,
+            translator_status: RwLock::new(translator_status),
+            settings_notice,
+            settings_save_blocked,
+            language_pair_tx,
             glossary_manager: Arc::new(RwLock::new(glossary_manager)),
             glossary_file_paths: RwLock::new(file_paths),
             connection_status: RwLock::new(ConnectionStatusDto::disconnected(endpoint)),
@@ -497,6 +523,12 @@ impl AppState {
             is_flatpak_mumble: RwLock::new(detected.is_flatpak),
             settings_write_mutex: Mutex::new(()),
         })
+    }
+
+    /// Subscribes to `(src_lang, tgt_lang)` changes so the running pipeline can be reconfigured.
+    #[must_use]
+    pub fn subscribe_language_pair(&self) -> watch::Receiver<(LanguageCode, LanguageCode)> {
+        self.language_pair_tx.subscribe()
     }
 
     /// Returns the shared [`TranslatorManager`].
@@ -549,6 +581,8 @@ impl AppState {
             tgt_lang: settings.tgt_lang.as_str().to_owned(),
             provider: settings.translation_provider.clone(),
             secrets: SecretStatusDto::from_store(self.secret_store.as_ref()),
+            translator_status: self.translator_status.read().await.clone(),
+            settings_notice: self.settings_notice.clone(),
             overlay_options,
             overlay_visible,
             glossary,
@@ -688,12 +722,18 @@ impl AppState {
             TranslationProviderConfig::Mock { .. } => true,
         };
 
-        if should_hot_swap {
+        let new_status = if should_hot_swap {
             self.translator_manager
-                .switch_provider(effective_config, factory)
+                .switch_provider(effective_config.clone(), factory)
                 .await
                 .map_err(|err| format!("failed to switch translation provider: {err}"))?;
-        }
+            TranslatorStatusDto::Ok
+        } else {
+            TranslatorStatusDto::error(describe_provider_unavailable(
+                &effective_config,
+                self.secret_store.as_ref(),
+            ))
+        };
 
         self.persist_settings_async(next.clone()).await?;
 
@@ -701,10 +741,21 @@ impl AppState {
             let mut glossary_mgr = self.glossary_manager.write().await;
             glossary_mgr.set_language_pair(next.src_lang.clone(), next.tgt_lang.clone());
         }
+        *self.translator_status.write().await = new_status;
         {
             let mut guard = self.settings.write().await;
-            *guard = next;
+            *guard = next.clone();
         }
+        // Wake the pipeline bridge so a changed language pair applies without a restart.
+        self.language_pair_tx.send_if_modified(|pair| {
+            let next_pair = (next.src_lang.clone(), next.tgt_lang.clone());
+            if *pair == next_pair {
+                false
+            } else {
+                *pair = next_pair;
+                true
+            }
+        });
 
         Ok(self.snapshot().await)
     }
@@ -799,7 +850,9 @@ impl AppState {
         self.translator_manager
             .switch_provider(config.clone(), self.translator_factory())
             .await
-            .map_err(|err| format!("failed to switch translation provider: {err}"))
+            .map_err(|err| format!("failed to switch translation provider: {err}"))?;
+        *self.translator_status.write().await = TranslatorStatusDto::Ok;
+        Ok(())
     }
 
     /// Updates glossary selection, `hotwords_score`, and optional custom glossary directory.
@@ -1046,6 +1099,13 @@ impl AppState {
     }
 
     async fn persist_settings_async(&self, settings: AppSettings) -> Result<(), String> {
+        if self.settings_save_blocked {
+            return Err(
+                "settings cannot be saved because the existing settings file could not \
+                        be read or backed up; fix the file and restart Kotoha"
+                    .to_owned(),
+            );
+        }
         let store = self.settings_store.clone();
         spawn_blocking(move || {
             store
@@ -1055,6 +1115,44 @@ impl AppState {
         .await
         .map_err(|err| format!("settings persistence task failed: {err}"))?
     }
+}
+
+/// Validates a user-supplied Mumble plugin directory (absolute, existing, a directory).
+///
+/// Returns the canonical path (symlinks resolved). Symlinked directories are accepted
+/// deliberately, since Mumble setups commonly symlink the plugin folder; the resolved target is
+/// what gets written to and persisted, so a later change of the link cannot redirect the install.
+pub fn validate_custom_plugin_dir(raw: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(raw.trim());
+    if !path.is_absolute() {
+        return Err("The plugin directory must be an absolute path.".to_owned());
+    }
+    let canonical = fs::canonicalize(&path).map_err(|_| {
+        "The specified plugin directory does not exist or is not accessible.".to_owned()
+    })?;
+    if !canonical.is_dir() {
+        return Err("The specified plugin path is not a directory.".to_owned());
+    }
+    Ok(canonical)
+}
+
+/// Returns a user-safe reason (never secret values) why `config` could not be activated.
+fn describe_provider_unavailable(
+    config: &TranslationProviderConfig,
+    secrets: &dyn SecretStore,
+) -> String {
+    let missing_secret = config
+        .required_secret_refs()
+        .iter()
+        .any(|r| !secrets.is_configured(r));
+    let detail = if missing_secret {
+        "the required API key / endpoint is not set (saved keys are lost when the app restarts)"
+    } else if matches!(config, TranslationProviderConfig::LocalModel { .. }) {
+        "the local translation model is not downloaded or could not be loaded"
+    } else {
+        "the provider could not be initialized; check its settings"
+    };
+    format!("The configured translation provider is not active because {detail}. Placeholder translations are shown instead.")
 }
 
 /// Converts [`PluginInstallOutcome`] + detected environment into [`PluginInstallResultDto`].

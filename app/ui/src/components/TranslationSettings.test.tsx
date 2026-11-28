@@ -375,3 +375,32 @@ describe('TranslationSettings', () => {
     );
   });
 });
+
+describe('TranslationSettings status notices', () => {
+  it('shows the translator error reason and the settings notice, and dismisses the notice', () => {
+    const onDismiss = vi.fn();
+    render(
+      <TranslationSettings
+        srcLang="en"
+        tgtLang="ja"
+        provider={createDefaultProviderConfig('local_model')}
+        secrets={NO_SECRETS}
+        translatorStatus={{ state: 'error', reason: 'model is missing' }}
+        settingsNotice="settings were reset"
+        onDismissSettingsNotice={onDismiss}
+        overlayOptions={defaultOverlayOptions}
+        glossarySettings={defaultGlossarySettings}
+        onChangeLanguages={vi.fn()}
+        onChangeProvider={vi.fn()}
+        onSetSecret={vi.fn().mockResolvedValue(undefined)}
+        onClearSecret={vi.fn().mockResolvedValue(undefined)}
+        onChangeOverlayOptions={vi.fn()}
+        onChangeGlossarySettings={vi.fn()}
+      />,
+    );
+    expect(screen.getByTestId('translator-status-error')).toHaveTextContent('model is missing');
+    expect(screen.getByTestId('settings-notice')).toHaveTextContent('settings were reset');
+    fireEvent.click(screen.getByTestId('dismiss-settings-notice-btn'));
+    expect(onDismiss).toHaveBeenCalled();
+  });
+});

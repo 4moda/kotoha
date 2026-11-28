@@ -18,8 +18,18 @@ use crate::error::SetupError;
 /// Default maximum HTTP redirects permitted while downloading model artifacts.
 pub const DEFAULT_MAX_DOWNLOAD_REDIRECTS: usize = 5;
 
-/// Default HTTP request timeout in seconds for model downloads (`300` seconds).
-pub const DEFAULT_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
+/// Default TCP/TLS connect timeout in seconds for model downloads.
+pub const DEFAULT_DOWNLOAD_CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// Default read-idle timeout in seconds: the download aborts only when no bytes arrive for this
+/// long. Unlike a whole-request timeout, a slow but steady multi-GB download is never cut off.
+pub const DEFAULT_DOWNLOAD_READ_TIMEOUT_SECS: u64 = 60;
+
+/// Default hard upper bound for a single downloaded artifact (8 GiB).
+pub const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Allowed overshoot (percent) of the real size over the catalog `size_mb` estimate.
+pub const DOWNLOAD_SIZE_MARGIN_PERCENT: u64 = 25;
 
 /// Placeholder SHA-256 sentinel used in unreleased catalogs; rejected unless explicitly allowed.
 pub const PENDING_RELEASE_MANIFEST_SHA256: &str = "pending-release-manifest";
@@ -54,8 +64,12 @@ pub struct DownloadProgress {
 /// Configuration for [`ModelDownloader`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDownloaderConfig {
-    /// Request timeout (applied via `reqwest::ClientBuilder::timeout`).
-    pub timeout: Duration,
+    /// Connect timeout (applied via `reqwest::ClientBuilder::connect_timeout`).
+    pub connect_timeout: Duration,
+    /// Read-idle timeout between received chunks (applied via `reqwest::ClientBuilder::read_timeout`).
+    pub read_timeout: Duration,
+    /// Hard maximum number of bytes accepted for one download, regardless of the catalog size.
+    pub max_download_bytes: u64,
     /// Maximum number of HTTP redirects to follow (must not exceed safe bounds; default `5`).
     pub max_redirects: usize,
     /// Explicit development override allowing [`PENDING_RELEASE_MANIFEST_SHA256`] without checksum
@@ -66,7 +80,9 @@ pub struct ModelDownloaderConfig {
 impl Default for ModelDownloaderConfig {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(DEFAULT_DOWNLOAD_TIMEOUT_SECS),
+            connect_timeout: Duration::from_secs(DEFAULT_DOWNLOAD_CONNECT_TIMEOUT_SECS),
+            read_timeout: Duration::from_secs(DEFAULT_DOWNLOAD_READ_TIMEOUT_SECS),
+            max_download_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
             max_redirects: DEFAULT_MAX_DOWNLOAD_REDIRECTS,
             allow_unverified_in_dev: false,
         }
@@ -207,11 +223,39 @@ impl ModelDownloader {
         url: &str,
         dest_path: &Path,
         expected_sha256: &str,
+        progress_cb: F,
+    ) -> Result<DownloadedArtifact, SetupError>
+    where
+        F: FnMut(DownloadProgress),
+    {
+        self.download_file_with_expected_size(
+            model_id,
+            url,
+            dest_path,
+            expected_sha256,
+            None,
+            progress_cb,
+        )
+        .await
+    }
+
+    /// Like [`Self::download_file_for_model`], additionally bounding the transfer by
+    /// `expected_size_bytes` (the catalog estimate): `Content-Length` and the streamed byte count
+    /// must not exceed it by more than [`DOWNLOAD_SIZE_MARGIN_PERCENT`], and never exceed
+    /// [`ModelDownloaderConfig::max_download_bytes`].
+    pub async fn download_file_with_expected_size<F>(
+        &self,
+        model_id: &str,
+        url: &str,
+        dest_path: &Path,
+        expected_sha256: &str,
+        expected_size_bytes: Option<u64>,
         mut progress_cb: F,
     ) -> Result<DownloadedArtifact, SetupError>
     where
         F: FnMut(DownloadProgress),
     {
+        let size_limit = effective_size_limit(self.config.max_download_bytes, expected_size_bytes);
         let validated_url = Self::validate_download_url(url)?;
         let expected_digest =
             validate_expected_sha256(expected_sha256, self.config.allow_unverified_in_dev)?;
@@ -249,6 +293,14 @@ impl ModelDownloader {
             )));
         }
 
+        if let Some(declared) = response.content_length() {
+            if declared > size_limit {
+                return Err(SetupError::Network(format!(
+                    "download size {declared} bytes exceeds the allowed maximum of {size_limit} bytes"
+                )));
+            }
+        }
+
         if let Some(parent) = dest_path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
@@ -263,6 +315,7 @@ impl ModelDownloader {
             dest_path,
             &part_path,
             expected_digest.as_deref(),
+            size_limit,
             &mut progress_cb,
         )
         .await?;
@@ -292,6 +345,7 @@ async fn stream_and_verify_download<F>(
     dest_path: &Path,
     part_path: &Path,
     expected_digest: Option<&str>,
+    size_limit: u64,
     progress_cb: &mut F,
 ) -> Result<(u64, String, bool), SetupError>
 where
@@ -318,6 +372,12 @@ where
         .await
         .map_err(|err| map_download_reqwest_error(&err))?
     {
+        let next_total = bytes_downloaded.saturating_add(chunk.len() as u64);
+        if next_total > size_limit {
+            return Err(SetupError::Network(format!(
+                "download exceeded the allowed maximum of {size_limit} bytes; aborting"
+            )));
+        }
         part_file.write_all(&chunk)?;
         hasher.update(&chunk);
         bytes_downloaded = bytes_downloaded.saturating_add(chunk.len() as u64);
@@ -354,6 +414,51 @@ where
     };
 
     Ok((bytes_downloaded, actual_sha256, verified))
+}
+
+/// Returns the byte limit for a download: the hard cap, tightened to the catalog estimate plus
+/// [`DOWNLOAD_SIZE_MARGIN_PERCENT`] when one is known.
+fn effective_size_limit(max_download_bytes: u64, expected_size_bytes: Option<u64>) -> u64 {
+    expected_size_bytes.map_or(max_download_bytes, |expected| {
+        let with_margin =
+            expected.saturating_add(expected.saturating_mul(DOWNLOAD_SIZE_MARGIN_PERCENT) / 100);
+        with_margin.min(max_download_bytes)
+    })
+}
+
+/// Removes leftover `*.part` files from interrupted downloads.
+///
+/// Looks at
+/// `models_root` itself and its immediate sub-directories (`<root>/<model_id>/`). Intended to run
+/// once at startup, before any download is started. Returns the number of files removed.
+#[must_use]
+pub fn cleanup_stale_part_files(models_root: &Path) -> usize {
+    let mut removed = 0;
+    let mut dirs = vec![models_root.to_path_buf()];
+    if let Ok(entries) = fs::read_dir(models_root) {
+        dirs.extend(
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.path()),
+        );
+    }
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_part = path.extension().is_some_and(|ext| ext == "part");
+            if is_part
+                && entry.file_type().is_ok_and(|t| t.is_file())
+                && fs::remove_file(&path).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
 /// Computes the `<dest>.part` temporary path for `dest_path`.
@@ -447,7 +552,8 @@ fn build_download_client(
     };
 
     Client::builder()
-        .timeout(config.timeout)
+        .connect_timeout(config.connect_timeout)
+        .read_timeout(config.read_timeout)
         .redirect(policy)
         .use_rustls_tls()
         .build()

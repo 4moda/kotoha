@@ -50,11 +50,11 @@ const LEGACY_SECRET_SENTINEL: &str = "__KOTOHA_SECRET_STORE__";
 /// Persistent styling and geometry preferences for the transparent subtitle overlay window.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OverlayStyleSettings {
-    /// Background / window opacity in `0.15..=1.0`.
+    /// Background / window opacity in `0.1..=1.0`.
     pub opacity: f32,
-    /// Subtitle font size in pixels (`12..=48`).
+    /// Subtitle font size in pixels (`10..=72`).
     pub font_size_px: u16,
-    /// Maximum visible subtitle lines/cards (`1..=12`).
+    /// Maximum visible subtitle lines/cards (`1..=20`).
     pub max_lines: u8,
     /// Whether to display original source speech alongside translated text.
     pub show_source_text: bool,
@@ -273,23 +273,195 @@ impl FileSettingsStore {
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(AppSettings::default()),
             Err(err) => return Err(SetupError::Io(err)),
         };
+        let (loaded, migrated) = self.parse_settings(&raw, secrets)?;
+        if migrated {
+            self.save(&loaded)?;
+        }
+        Ok(loaded)
+    }
 
+    /// Parses, migrates legacy secrets of and validates `raw`. Returns the settings and whether
+    /// legacy plaintext fields were present (the file then needs rewriting).
+    fn parse_settings(
+        &self,
+        raw: &str,
+        secrets: &dyn SecretWriter,
+    ) -> Result<(AppSettings, bool), SetupError> {
         let corrupted = |err: serde_json::Error| {
             SetupError::InvalidConfig(format!(
                 "corrupted settings JSON at '{}': {err}",
                 self.settings_path.display()
             ))
         };
-        let mut value: serde_json::Value = serde_json::from_str(&raw).map_err(corrupted)?;
+        let mut value: serde_json::Value = serde_json::from_str(raw).map_err(corrupted)?;
         let migrated = migrate_legacy_provider_secrets(&mut value, secrets)?;
         let loaded: AppSettings = serde_json::from_value(value).map_err(corrupted)?;
         loaded.validate()?;
-
-        if migrated {
-            self.save(&loaded)?;
-        }
-        Ok(loaded)
+        Ok((loaded, migrated))
     }
+}
+
+/// Result of [`FileSettingsStore::load_or_recover`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsLoadOutcome {
+    /// Loaded settings, or [`AppSettings::default`] when the file could not be used.
+    pub settings: AppSettings,
+    /// User-safe notice (no file contents or secrets) when the stored file was unusable.
+    pub notice: Option<String>,
+    /// `true` when the existing file could neither be used nor safely set aside (unreadable, or
+    /// the backup/removal failed). The caller must then **not** save settings, or it would
+    /// overwrite a file the user may still be able to recover.
+    pub save_blocked: bool,
+}
+
+impl SettingsLoadOutcome {
+    const fn ok(settings: AppSettings, notice: Option<String>) -> Self {
+        Self {
+            settings,
+            notice,
+            save_blocked: false,
+        }
+    }
+
+    fn blocked(notice: String) -> Self {
+        Self {
+            settings: AppSettings::default(),
+            notice: Some(notice),
+            save_blocked: true,
+        }
+    }
+}
+
+impl FileSettingsStore {
+    /// Like [`Self::load`], but never fails startup.
+    ///
+    /// - A file that cannot be *read* (I/O or permission error, possibly transient) is left
+    ///   untouched: defaults are returned with `save_blocked = true` and a notice.
+    /// - A file that was read but is corrupt, not valid JSON, out of range, written by a newer
+    ///   version (unknown shape) or fails secret migration is copied to a uniquely named
+    ///   `<file>.bak-<unix-seconds>[-<n>]` with secret fields scrubbed, then removed; defaults are
+    ///   returned with a notice (provider secrets must be re-entered). If the backup or the
+    ///   removal fails, `save_blocked = true` so the original is never overwritten.
+    #[must_use]
+    pub fn load_or_recover(&self, secrets: &dyn SecretWriter) -> SettingsLoadOutcome {
+        let raw = match fs::read_to_string(&self.settings_path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                return SettingsLoadOutcome::ok(AppSettings::default(), None)
+            }
+            Err(_) => {
+                return SettingsLoadOutcome::blocked(
+                    "The settings file could not be read, so Kotoha started with default \
+                     settings. The file was left untouched and changes will not be saved until \
+                     it is readable and Kotoha is restarted."
+                        .to_owned(),
+                )
+            }
+        };
+
+        match self.parse_settings(&raw, secrets) {
+            Ok((loaded, migrated)) => {
+                let notice = (migrated && self.save(&loaded).is_err()).then(|| {
+                    "Legacy settings were loaded but the file could not be rewritten.".to_owned()
+                });
+                SettingsLoadOutcome::ok(loaded, notice)
+            }
+            Err(_) => match self.set_aside_unusable_file(&raw) {
+                Ok(backup_name) => SettingsLoadOutcome::ok(
+                    AppSettings::default(),
+                    Some(format!(
+                        "The settings file was corrupted or contained invalid values, so Kotoha \
+                         started with default settings. The old file was kept as '{backup_name}' \
+                         (API keys removed). Please review your settings and re-enter any API keys."
+                    )),
+                ),
+                Err(()) => SettingsLoadOutcome::blocked(
+                    "The settings file was corrupted and could not be backed up, so Kotoha \
+                     started with default settings. The file was left untouched and changes \
+                     will not be saved."
+                        .to_owned(),
+                ),
+            },
+        }
+    }
+
+    /// Writes a scrubbed copy of `raw` to a fresh backup file and removes the original.
+    /// Returns the backup file name.
+    fn set_aside_unusable_file(&self, raw: &str) -> Result<String, ()> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let scrubbed = scrub_secrets_for_backup(raw);
+
+        for attempt in 0_u32..1000 {
+            let mut name = self.settings_path.as_os_str().to_os_string();
+            if attempt == 0 {
+                name.push(format!(".bak-{stamp}"));
+            } else {
+                name.push(format!(".bak-{stamp}-{attempt}"));
+            }
+            let backup_path = PathBuf::from(name);
+
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&backup_path) {
+                Ok(mut file) => {
+                    if file.write_all(scrubbed.as_bytes()).is_err() || file.sync_all().is_err() {
+                        let _ = fs::remove_file(&backup_path);
+                        return Err(());
+                    }
+                    if fs::remove_file(&self.settings_path).is_err() {
+                        let _ = fs::remove_file(&backup_path);
+                        return Err(());
+                    }
+                    return Ok(backup_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("backup")
+                        .to_owned());
+                }
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+                Err(_) => return Err(()),
+            }
+        }
+        Err(())
+    }
+}
+
+/// Keys that may hold plaintext secrets in files written by older builds.
+const LEGACY_SECRET_FIELDS: [&str; 3] = ["api_key", "bearer_token", "endpoint_url"];
+
+/// Returns `raw` with secret fields removed (valid JSON) or, for text that is not valid JSON,
+/// with the value of every line mentioning a secret field redacted.
+fn scrub_secrets_for_backup(raw: &str) -> String {
+    // Fail closed: only content that parses as JSON with an object-shaped
+    // `translation_provider` (or none at all) is kept, minus the secret fields.
+    // Anything else (non-JSON, hand-edited, unexpected shapes) could hide a secret
+    // in a form a line-based filter would miss, so its body is not copied.
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(root) = value.as_object_mut() {
+            match root.get_mut("translation_provider") {
+                Some(serde_json::Value::Object(provider)) => {
+                    for field in LEGACY_SECRET_FIELDS {
+                        provider.remove(field);
+                    }
+                }
+                Some(_) => {
+                    root.remove("translation_provider");
+                }
+                None => {}
+            }
+            if let Ok(text) = serde_json::to_string_pretty(&value) {
+                return text;
+            }
+        }
+    }
+    "{\"_kotoha_backup_note\": \"original settings file was not valid JSON; its content was omitted from this backup so that no secret is copied\"}".to_owned()
 }
 
 /// Moves legacy plaintext secret fields out of `translation_provider` into `secrets`.

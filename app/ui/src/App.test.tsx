@@ -346,6 +346,76 @@ describe('App', () => {
     });
   });
 
+  it('refreshes the translator status banner after a secret is saved', async () => {
+    const bridge = createMockBridge({ wizard_completed: true });
+    const base = await bridge.getAppState();
+    const getAppState = vi
+      .spyOn(bridge, 'getAppState')
+      .mockResolvedValueOnce({
+        ...base,
+        translator_status: { state: 'error', reason: 'provider not active' },
+      })
+      .mockResolvedValue({ ...base, translator_status: { state: 'ok' } });
+
+    render(<App bridge={bridge} />);
+    await waitFor(() => {
+      expect(screen.getByTestId('ipc-status-pill')).toHaveTextContent('IPC connected');
+    });
+    fireEvent.click(screen.getByTestId('mode-settings-btn'));
+    expect(screen.getByTestId('translator-status-error')).toHaveTextContent(
+      'provider not active',
+    );
+
+    fireEvent.click(screen.getByTestId('provider-tab-deepl'));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    fireEvent.change(document.getElementById('deepl-api-key') as HTMLInputElement, {
+      target: { value: 'k' },
+    });
+    fireEvent.click(screen.getByTestId('secret-set-deep_l_api_key'));
+    await waitFor(() => {
+      expect(screen.queryByTestId('translator-status-error')).not.toBeInTheDocument();
+    });
+    expect(getAppState.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('clears a stale translator error after a model download switches the provider', async () => {
+    const bridge = createMockBridge({ wizard_completed: false });
+    const base = await bridge.getAppState();
+    vi.spyOn(bridge, 'getAppState').mockResolvedValue({
+      ...base,
+      wizard_completed: false,
+      translator_status: { state: 'error', reason: 'model not downloaded' },
+    });
+    vi.spyOn(bridge, 'switchTranslationProvider').mockResolvedValue({
+      ...base,
+      translator_status: { state: 'ok' },
+    });
+
+    render(<App bridge={bridge} />);
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-wizard')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId('mode-settings-btn'));
+    expect(screen.getByTestId('translator-status-error')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('mode-wizard-btn'));
+    fireEvent.click(screen.getByTestId('wizard-step-tab-2'));
+    fireEvent.click(screen.getByTestId('download-model-btn'));
+    await waitFor(() => {
+      expect(screen.getByTestId('download-status-label')).toBeInTheDocument();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    fireEvent.click(screen.getByTestId('mode-settings-btn'));
+    await waitFor(() => {
+      expect(screen.queryByTestId('translator-status-error')).not.toBeInTheDocument();
+    });
+  });
+
   it('reports a rejected secret write in the error banner', async () => {
     const bridge = createMockBridge({ wizard_completed: true });
     vi.spyOn(bridge, 'setProviderSecret').mockRejectedValue(new Error('store unavailable'));

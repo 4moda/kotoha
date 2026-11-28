@@ -206,6 +206,8 @@ function createInitialMockState(): AppRuntimeState {
     tgt_lang: 'ja',
     provider: createDefaultProviderConfig('local_model'),
     secrets: { ...EMPTY_SECRET_STATUS },
+    translator_status: { state: 'ok' },
+    settings_notice: null,
     overlay_options: { ...DEFAULT_OVERLAY_OPTIONS },
     overlay_visible: true,
     glossary: {

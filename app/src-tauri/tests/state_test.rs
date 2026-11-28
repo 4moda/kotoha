@@ -9,9 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use kotoha_app_lib::bridge::ConnectionStatusMonitor;
 use kotoha_app_lib::state::{
-    embedded_mumble_plugin_bytes, map_plugin_install_outcome, AppState, ConnectionState,
-    DownloadProgressEventDto, HostOsPlatform, ModelDownloadStatus, OverlayStyleUpdateInput,
-    PluginInstallStatus, EVENT_CONNECTION_STATUS, EVENT_DOWNLOAD_PROGRESS,
+    embedded_mumble_plugin_bytes, map_plugin_install_outcome, validate_custom_plugin_dir, AppState,
+    ConnectionState, DownloadProgressEventDto, HostOsPlatform, ModelDownloadStatus,
+    OverlayStyleUpdateInput, PluginInstallStatus, EVENT_CONNECTION_STATUS, EVENT_DOWNLOAD_PROGRESS,
     EVENT_OVERLAY_LOCK_CHANGED, EVENT_OVERLAY_STYLE_CHANGED, EVENT_SUBTITLE,
 };
 use kotoha_core::domain::{
@@ -662,4 +662,143 @@ async fn legacy_settings_file_with_plaintext_gas_url_loads_and_is_rewritten() {
     assert!(!rewritten.contains("endpoint_url"));
 
     let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[tokio::test]
+async fn unbuildable_provider_is_reported_as_translator_error_without_secrets() {
+    let data_dir = unique_temp_dir("kotoha_tauri_status");
+    // Default provider is the local model, which is not downloaded in a fresh data dir.
+    let state = AppState::new(&data_dir).unwrap();
+    let json = serde_json::to_value(state.snapshot().await).unwrap();
+    assert_eq!(json["translator_status"]["state"], "error");
+    let reason = json["translator_status"]["reason"].as_str().unwrap();
+    assert!(!reason.is_empty());
+    assert!(json["settings_notice"].is_null());
+
+    // Mock provider is always buildable.
+    state
+        .switch_translation_provider(
+            TranslationProviderConfig::Mock {
+                prefix: "[t] ".to_owned(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let json = serde_json::to_value(state.snapshot().await).unwrap();
+    assert_eq!(json["translator_status"]["state"], "ok");
+
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[tokio::test]
+async fn corrupt_settings_file_is_backed_up_and_startup_uses_defaults_with_notice() {
+    let data_dir = unique_temp_dir("kotoha_tauri_corrupt");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::write(
+        data_dir.join("kotoha-settings.json"),
+        "{ definitely not json",
+    )
+    .unwrap();
+
+    let state = AppState::new(&data_dir).expect("corrupt settings must not abort startup");
+    let json = serde_json::to_value(state.snapshot().await).unwrap();
+    assert_eq!(json["src_lang"], "en");
+    assert!(json["settings_notice"]
+        .as_str()
+        .is_some_and(|n| !n.is_empty()));
+    let has_backup = fs::read_dir(&data_dir)
+        .unwrap()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().contains(".bak-"));
+    assert!(has_backup);
+
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[tokio::test]
+async fn language_pair_changes_are_published_to_the_pipeline_bridge() {
+    let data_dir = unique_temp_dir("kotoha_tauri_lang");
+    let state = AppState::new(&data_dir).unwrap();
+    let mut rx = state.subscribe_language_pair();
+    assert_eq!(rx.borrow_and_update().1.as_str(), "ja");
+
+    let config = state.snapshot().await.provider;
+    state
+        .switch_translation_provider(config.clone(), Some("ja".to_owned()), Some("en".to_owned()))
+        .await
+        .unwrap();
+    assert!(rx.has_changed().unwrap());
+    let pair = rx.borrow_and_update().clone();
+    assert_eq!((pair.0.as_str(), pair.1.as_str()), ("ja", "en"));
+
+    // Same pair again publishes nothing.
+    state
+        .switch_translation_provider(config, None, None)
+        .await
+        .unwrap();
+    assert!(!rx.has_changed().unwrap());
+
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[tokio::test]
+async fn unreadable_settings_file_blocks_saving_instead_of_overwriting() {
+    let data_dir = unique_temp_dir("kotoha_tauri_unreadable");
+    fs::create_dir_all(&data_dir).unwrap();
+    // A directory at the settings path: reading fails with a non-NotFound I/O error.
+    let settings_path = data_dir.join("kotoha-settings.json");
+    fs::create_dir_all(&settings_path).unwrap();
+
+    let state = AppState::new(&data_dir).expect("startup must still succeed");
+    let json = serde_json::to_value(state.snapshot().await).unwrap();
+    assert!(json["settings_notice"].as_str().is_some());
+
+    let err = state
+        .update_overlay_style(OverlayStyleUpdateInput {
+            locked: Some(false),
+            ..Default::default()
+        })
+        .await
+        .expect_err("saving must be refused");
+    assert!(err.contains("cannot be saved"), "{err}");
+    assert!(settings_path.is_dir());
+
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn custom_plugin_dir_must_be_an_existing_absolute_directory_and_is_canonicalized() {
+    let root = unique_temp_dir("kotoha_tauri_plugin_dir");
+    let real = root.join("real");
+    fs::create_dir_all(&real).unwrap();
+    let file = root.join("a_file");
+    fs::write(&file, b"x").unwrap();
+
+    assert!(validate_custom_plugin_dir("relative/dir").is_err());
+    assert!(validate_custom_plugin_dir(root.join("missing").to_str().unwrap()).is_err());
+    assert!(validate_custom_plugin_dir(file.to_str().unwrap()).is_err());
+
+    let canonical = validate_custom_plugin_dir(real.to_str().unwrap()).unwrap();
+    assert_eq!(canonical, fs::canonicalize(&real).unwrap());
+
+    // `..` segments collapse to the canonical form.
+    let dotted = real.join("..").join("real");
+    assert_eq!(
+        validate_custom_plugin_dir(dotted.to_str().unwrap()).unwrap(),
+        canonical
+    );
+
+    #[cfg(unix)]
+    {
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            validate_custom_plugin_dir(link.to_str().unwrap()).unwrap(),
+            canonical
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
 }

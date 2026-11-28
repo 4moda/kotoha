@@ -26,6 +26,7 @@ import type {
   SecretStatus,
   SubtitleEntry,
   TranslationProviderConfig,
+  TranslatorStatus,
 } from './types/kotoha';
 
 export type AppViewMode = 'overlay' | 'wizard' | 'settings';
@@ -104,6 +105,8 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
     createDefaultProviderConfig('local_model'),
   );
   const [secrets, setSecrets] = useState<SecretStatus>(() => ({ ...EMPTY_SECRET_STATUS }));
+  const [translatorStatus, setTranslatorStatus] = useState<TranslatorStatus>({ state: 'ok' });
+  const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
   const [overlayOptions, setOverlayOptions] = useState<OverlayDisplayOptions>(
     DEFAULT_OVERLAY_OPTIONS,
   );
@@ -198,6 +201,8 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
         setTgtLang(state.tgt_lang);
         setProvider(state.provider);
         setSecrets(state.secrets);
+        setTranslatorStatus(state.translator_status ?? { state: 'ok' });
+        setSettingsNotice(state.settings_notice ?? null);
         setOverlayOptions(state.overlay_options);
         setGlossarySettings(state.glossary);
         setConnection(state.connection);
@@ -296,6 +301,7 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
           if (isMountedRef.current && latestProviderRequestRef.current === requestId) {
             // Switching provider / origin may have deleted stored secrets on the Rust side.
             setSecrets(state.secrets);
+            setTranslatorStatus(state.translator_status ?? { state: 'ok' });
             setStatusError(null);
           }
         })
@@ -349,6 +355,18 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
     await inflightProviderCommitRef.current;
   }, [commitTranslationProvider]);
 
+  /** Re-reads the backend translator status (it changes when a secret rebuilds the provider). */
+  const refreshTranslatorStatus = useCallback(async () => {
+    try {
+      const state = await bridge.getAppState();
+      if (isMountedRef.current) {
+        setTranslatorStatus(state.translator_status ?? { state: 'ok' });
+      }
+    } catch {
+      // Best effort: the previous status stays until the next successful refresh.
+    }
+  }, [bridge]);
+
   const handleSetSecret = useCallback(
     async (kind: ProviderSecretKind, value: string) => {
       try {
@@ -359,12 +377,13 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
           setSecrets(status);
           setStatusError(null);
         }
+        await refreshTranslatorStatus();
       } catch (error) {
         reportIpcError(error, 'シークレットの保存に失敗しました。');
         throw error;
       }
     },
-    [bridge, flushProviderSync, reportIpcError],
+    [bridge, flushProviderSync, refreshTranslatorStatus, reportIpcError],
   );
 
   const handleClearSecret = useCallback(
@@ -376,12 +395,13 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
           setSecrets(status);
           setStatusError(null);
         }
+        await refreshTranslatorStatus();
       } catch (error) {
         reportIpcError(error, 'シークレットの削除に失敗しました。');
         throw error;
       }
     },
-    [bridge, flushProviderSync, reportIpcError],
+    [bridge, flushProviderSync, refreshTranslatorStatus, reportIpcError],
   );
 
   const commitOverlayStyle = useCallback(
@@ -551,7 +571,12 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
         model_id: modelId,
       };
       setProvider(nextConfig);
-      await bridge.switchTranslationProvider(nextConfig, srcLang, tgtLang);
+      const switched = await bridge.switchTranslationProvider(nextConfig, srcLang, tgtLang);
+      if (isMountedRef.current) {
+        // The downloaded model may now be loadable: drop a stale "not active" banner.
+        setSecrets(switched.secrets);
+        setTranslatorStatus(switched.translator_status ?? { state: 'ok' });
+      }
     }
     return result;
   };
@@ -799,6 +824,9 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
             tgtLang={tgtLang}
             provider={provider}
             secrets={secrets}
+            translatorStatus={translatorStatus}
+            settingsNotice={settingsNotice}
+            onDismissSettingsNotice={() => setSettingsNotice(null)}
             overlayOptions={overlayOptions}
             glossarySettings={glossarySettings}
             onChangeLanguages={handleUpdateLanguages}
