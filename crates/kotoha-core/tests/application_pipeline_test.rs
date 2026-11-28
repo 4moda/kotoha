@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use common::{
     test_endpoint, CapturingTranslator, DelayByUtteranceTranslator,
-    DelayedFailingOrTaggedTranslator, FailingSubtitleSink, FlakySttEngine,
-    HotwordTrackingSttEngine, RendezvousSttEngine, ScriptedSttEngine, ScriptedTranslator,
-    SttScript, TranslatorScript, UnavailableSttEngine,
+    DelayedFailingOrTaggedTranslator, FailingSubtitleSink, FlakySttEngine, HangingSttEngine,
+    HoldingSink, HotwordTrackingSttEngine, PanicOnceSink, RendezvousSttEngine, ScriptedSttEngine,
+    ScriptedTranslator, SttScript, TranslatorScript, UnavailableSttEngine,
 };
 use kotoha_core::application::{
     PipelineConfig, PipelineService, TranslatorManager, TRANSLATION_SKIPPED_REASON,
@@ -1210,4 +1210,247 @@ async fn failing_create_stream_backs_off() {
     assert_eq!(snapshot.dropped_chunks, 50);
     assert_eq!(snapshot.stt_errors, u64::try_from(attempts).unwrap());
     assert!(sink.entries().await.is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Follow-ups from the execution model review (#57).
+// ---------------------------------------------------------------------------------------------
+
+/// Polls (every 1 ms of tokio time, for at most 30 s) until `done` returns `true`.
+async fn wait_until(mut done: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("condition reached in time");
+}
+
+/// 20 ms of 440 Hz sine at 48 kHz mono for user 1 of `source`.
+fn source_frame(conn_id: u64, source: &str, seq: u32) -> AudioInputEvent {
+    let AudioInputEvent::AudioFrame { chunk, .. } = sine_frame(conn_id, seq) else {
+        unreachable!("sine_frame builds an AudioFrame");
+    };
+    AudioInputEvent::AudioFrame {
+        conn_id,
+        chunk: AudioChunk {
+            speaker_key: SpeakerKey::new(source, 1),
+            ..chunk
+        },
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn source_reset_while_translating_suppresses_the_stale_translation() {
+    let translator = Arc::new(DelayByUtteranceTranslator::new(|_| {
+        Duration::from_millis(200)
+    }));
+    let captured = Arc::clone(&translator.captured_requests);
+    let sink = Arc::new(CollectingSubtitleSink::new());
+    let mut pipeline = pipeline_with_config(
+        Arc::new(MockSttEngine::new(0.005, 1)),
+        translator,
+        sink.clone(),
+        |_| {},
+    );
+    let stats = pipeline.stats_handle();
+    let (tx, rx) = mpsc::channel(16);
+    let task = tokio::spawn(async move { pipeline.run(rx).await });
+
+    tx.send(connected(1)).await.unwrap();
+    tx.send(sine_frame(1, 0)).await.unwrap();
+    // The final card is out and its translation is running: the worker has already published,
+    // so only the epoch check in `finish_job` can drop the late result.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !sink
+            .entries()
+            .await
+            .iter()
+            .any(|e| e.stage == SubtitleStage::FinalPendingTranslation)
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("final card emitted");
+    wait_until(|| captured.lock().unwrap().len() == 1).await;
+
+    tx.send(AudioInputEvent::SourceReset {
+        conn_id: 1,
+        source: "mumble".to_owned(),
+    })
+    .await
+    .unwrap();
+    // Let the 200 ms translation complete after the reset.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(tx);
+    task.await.expect("join").expect("run");
+
+    assert_eq!(sink.cleared_sources().await, vec!["mumble".to_owned()]);
+    let entries = sink.entries().await;
+    assert!(
+        entries.iter().all(|e| !matches!(
+            e.stage,
+            SubtitleStage::Translated | SubtitleStage::TranslationFailed
+        )),
+        "a translation finished after SourceReset must not reach the sink"
+    );
+    let snapshot = stats.snapshot();
+    assert_eq!(snapshot.translations_skipped, 0);
+    assert_eq!(snapshot.translation_failures, 0);
+}
+
+#[tokio::test]
+async fn queued_final_is_skipped_at_its_deadline_while_every_slot_is_busy() {
+    // Source "a" occupies the only translation slot: its translator call outlives the deadline
+    // and its Phase C emit is then held until source "b" has been reported as skipped. "b" waits
+    // in the queue the whole time, so only `expire_late` can resolve it at its deadline; without
+    // it, "b" resolves only after the hold gives up (`released_by_timeout`).
+    const DEADLINE: Duration = Duration::from_millis(300);
+    let translator = Arc::new(DelayByUtteranceTranslator::new(|_| Duration::from_mins(1)));
+    let captured = Arc::clone(&translator.captured_requests);
+    let sink = Arc::new(HoldingSink::new("a", "b", Duration::from_secs(5)));
+    let mut pipeline = pipeline_with_config(
+        Arc::new(MockSttEngine::new(0.005, 1)),
+        translator,
+        sink.clone(),
+        |c| {
+            c.max_concurrent_translations = 1;
+            c.translation_deadline = DEADLINE;
+        },
+    );
+    let stats = pipeline.stats_handle();
+    let (tx, rx) = mpsc::channel(16);
+    let task = tokio::spawn(async move { pipeline.run(rx).await });
+
+    for (conn_id, source) in [(1, "a"), (2, "b")] {
+        tx.send(AudioInputEvent::SourceConnected {
+            conn_id,
+            source: source.to_owned(),
+            plugin_version: "0.1.0".to_owned(),
+        })
+        .await
+        .unwrap();
+    }
+    tx.send(source_frame(1, "a", 0)).await.unwrap();
+    wait_until(|| captured.lock().unwrap().len() == 1).await;
+    tx.send(source_frame(2, "b", 0)).await.unwrap();
+    let poll_sink = Arc::clone(&sink);
+    wait_until(|| {
+        poll_sink.entries().iter().any(|(_, e)| {
+            e.speaker_key.source == "a" && e.stage == SubtitleStage::TranslationFailed
+        })
+    })
+    .await;
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .expect("run() returns")
+        .expect("join")
+        .expect("run");
+
+    assert!(
+        !sink.released_by_timeout.load(AtomicOrdering::SeqCst),
+        "the queued final was not resolved while the translation slot stayed busy"
+    );
+    let entries = sink.entries();
+    let at = |source: &str, stage: SubtitleStage| {
+        entries
+            .iter()
+            .find(|(_, e)| e.speaker_key.source == source && e.stage == stage)
+            .map(|(at, e)| (*at, e.clone()))
+            .expect("entry recorded")
+    };
+    let (b_final_at, _) = at("b", SubtitleStage::FinalPendingTranslation);
+    let (b_failed_at, b_failed) = at("b", SubtitleStage::TranslationFailed);
+    assert_eq!(
+        b_failed.failure_reason.as_deref(),
+        Some(TRANSLATION_SKIPPED_REASON)
+    );
+    assert!(
+        b_failed_at.duration_since(b_final_at) >= DEADLINE,
+        "a queued final must not be skipped before its deadline"
+    );
+    let requests = captured.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the queued final was skipped without calling the translator"
+    );
+    let snapshot = stats.snapshot();
+    assert_eq!(snapshot.translations_skipped, 2);
+    assert_eq!(snapshot.pending_translations, 0);
+}
+
+#[tokio::test]
+async fn panicking_sink_emit_is_contained_and_the_utterance_still_translates() {
+    let sink = Arc::new(PanicOnceSink::new(SubtitleStage::FinalPendingTranslation));
+    let pipeline = pipeline_with(
+        Arc::new(MockSttEngine::new(0.005, 2)),
+        Arc::new(MockTranslator::new("mock", "[ja] ")),
+        sink.clone(),
+    );
+    let mut events = vec![connected(1)];
+    events.extend((0..10).map(|seq| sine_frame(1, seq)));
+    let (pipeline, result) = run_with_events(pipeline, events).await;
+    result.expect("a sink panic must not end run()");
+
+    let entries = sink.entries();
+    let ids = |stage: SubtitleStage| -> Vec<u64> {
+        let mut ids: Vec<u64> = entries
+            .iter()
+            .filter(|e| e.stage == stage)
+            .map(|e| e.utterance_id.0)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    assert_eq!(ids(SubtitleStage::Interim), vec![1, 2, 3, 4, 5]);
+    // Utterance 1's final card was lost in the panic, but the worker kept going: the utterance
+    // was still queued for translation and every later card arrived.
+    assert_eq!(
+        ids(SubtitleStage::FinalPendingTranslation),
+        vec![2, 3, 4, 5]
+    );
+    assert_eq!(ids(SubtitleStage::Translated), vec![1, 2, 3, 4, 5]);
+
+    let stats = pipeline.stats();
+    assert_eq!(stats.task_panics, 1);
+    assert_eq!(stats.sink_errors, 1);
+    assert_eq!(
+        stats.stt_stream_resets, 0,
+        "a sink panic must not unwind the speaker worker"
+    );
+    assert_eq!(stats.synthesized_finals, 0);
+}
+
+#[tokio::test]
+async fn hung_stt_call_does_not_block_run_from_returning() {
+    let stt = Arc::new(HangingSttEngine::new());
+    let entered = Arc::clone(&stt.entered);
+    let sink = Arc::new(CollectingSubtitleSink::new());
+    let mut pipeline = pipeline_with_config(
+        Arc::clone(&stt) as Arc<dyn kotoha_core::domain::SttEngine>,
+        Arc::new(MockTranslator::new("mock", "[ja] ")),
+        sink,
+        |c| c.shutdown_timeout = Duration::from_millis(200),
+    );
+    let stats = pipeline.stats_handle();
+    let (tx, rx) = mpsc::channel(16);
+    let task = tokio::spawn(async move { pipeline.run(rx).await });
+    tx.send(connected(1)).await.unwrap();
+    tx.send(sine_frame(1, 0)).await.unwrap();
+    wait_until(|| entered.load(AtomicOrdering::SeqCst)).await;
+    drop(tx);
+
+    // Generous bound: without the shutdown timeout `run()` never returns while STT hangs.
+    let outcome = tokio::time::timeout(Duration::from_secs(10), task).await;
+    stt.release();
+    outcome
+        .expect("run() must return once shutdown_timeout expires")
+        .expect("join")
+        .expect("run");
+    assert_eq!(stats.snapshot().active_speaker_workers, 0);
 }

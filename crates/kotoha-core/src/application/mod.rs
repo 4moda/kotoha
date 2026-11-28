@@ -3,6 +3,7 @@
 pub mod glossary_manager;
 pub mod pipeline;
 pub mod session;
+pub mod suppressible_sink;
 pub mod translator_manager;
 
 pub use glossary_manager::GlossaryManager;
@@ -11,4 +12,5 @@ pub use pipeline::{
     TRANSLATION_SKIPPED_REASON, TRANSLATOR_CRASHED_REASON,
 };
 pub use session::{SeqStatus, SessionAction, SourceSessionManager, SourceStats};
+pub use suppressible_sink::SuppressibleSubtitleSink;
 pub use translator_manager::TranslatorManager;
