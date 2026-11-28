@@ -1454,3 +1454,196 @@ async fn hung_stt_call_does_not_block_run_from_returning() {
         .expect("run");
     assert_eq!(stats.snapshot().active_speaker_workers, 0);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Shutdown timeout (#63): every final card still resolves when the drain is cut short.
+// ---------------------------------------------------------------------------------------------
+
+/// Collecting sink whose `Interim` emits take `interim_delay` (tokio time), so that a speaker's
+/// drain takes a predictable amount of virtual time.
+struct SlowInterimSink {
+    inner: CollectingSubtitleSink,
+    interim_delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl kotoha_core::domain::SubtitleSink for SlowInterimSink {
+    async fn emit(&self, entry: kotoha_core::domain::SubtitleEntry) -> Result<(), CoreError> {
+        if entry.stage == SubtitleStage::Interim {
+            tokio::time::sleep(self.interim_delay).await;
+        }
+        self.inner.emit(entry).await
+    }
+
+    async fn clear_source(&self, source: &str) -> Result<(), CoreError> {
+        self.inner.clear_source(source).await
+    }
+}
+
+/// Asserts that every final card in `entries` has exactly one Phase C entry and returns how many
+/// of them were skipped.
+fn assert_every_final_resolves_once(entries: &[kotoha_core::domain::SubtitleEntry]) -> usize {
+    let finals: Vec<u64> = entries
+        .iter()
+        .filter(|e| e.stage == SubtitleStage::FinalPendingTranslation)
+        .map(|e| e.utterance_id.0)
+        .collect();
+    assert!(!finals.is_empty(), "the drain emitted at least one final");
+    let mut skipped = 0;
+    for id in &finals {
+        let phase_c: Vec<_> = entries
+            .iter()
+            .filter(|e| {
+                e.utterance_id.0 == *id
+                    && matches!(
+                        e.stage,
+                        SubtitleStage::Translated | SubtitleStage::TranslationFailed
+                    )
+            })
+            .collect();
+        assert_eq!(
+            phase_c.len(),
+            1,
+            "every final card must resolve exactly once, even when shutdown times out"
+        );
+        if phase_c[0].stage == SubtitleStage::TranslationFailed {
+            assert_eq!(
+                phase_c[0].failure_reason.as_deref(),
+                Some(TRANSLATION_SKIPPED_REASON),
+                "a final cut short by the shutdown timeout is reported as skipped"
+            );
+            skipped += 1;
+        }
+    }
+    skipped
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_timeout_resolves_an_in_flight_translation_within_its_deadline() {
+    // The reviewer's reproduction of #63 in virtual time: the speaker's drain takes about 2 s
+    // (20 interim cards x 100 ms), its last final is translated in 1.5 s and must resolve within
+    // 2 s of being finalized, but `shutdown_timeout` (2.5 s, counted from the input close)
+    // expires first. The final must still resolve instead of staying FinalPendingTranslation.
+    let sink = Arc::new(SlowInterimSink {
+        inner: CollectingSubtitleSink::new(),
+        interim_delay: Duration::from_millis(100),
+    });
+    let pipeline = pipeline_with_config(
+        // Never finalize on its own: only the shutdown flush produces the final.
+        Arc::new(MockSttEngine::new(0.005, 1_000_000)),
+        Arc::new(DelayByUtteranceTranslator::new(|_| {
+            Duration::from_millis(1_500)
+        })),
+        sink.clone(),
+        |c| {
+            c.translation_deadline = Duration::from_secs(2);
+            c.shutdown_timeout = Duration::from_millis(2_500);
+        },
+    );
+    let stats = pipeline.stats_handle();
+    let mut events = vec![connected(1)];
+    events.extend((0..20).map(|seq| sine_frame(1, seq)));
+    let (_pipeline, result) = run_with_events(pipeline, events).await;
+    result.expect("run");
+
+    let entries = sink.inner.entries().await;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e.stage == SubtitleStage::Interim)
+            .count(),
+        20,
+        "the worker drained every queued chunk before the timeout"
+    );
+    let skipped = assert_every_final_resolves_once(&entries);
+    assert_eq!(skipped, 1, "the in-flight final was skipped at shutdown");
+    let snapshot = stats.snapshot();
+    assert_eq!(snapshot.shutdown_timeouts, 1);
+    assert_eq!(snapshot.translations_skipped, 1);
+    assert_eq!(snapshot.translation_failures, 0);
+    assert_eq!(snapshot.pending_translations, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_timeout_resolves_queued_and_hung_translations() {
+    // A translator that never answers in time, with a deadline longer than the shutdown timeout:
+    // one final is in flight and the others wait in the queue when the timeout fires. All of
+    // them must resolve as skipped before `run()` returns.
+    let sink = Arc::new(CollectingSubtitleSink::new());
+    let pipeline = pipeline_with_config(
+        Arc::new(MockSttEngine::new(0.005, 1)),
+        Arc::new(DelayByUtteranceTranslator::new(|_| Duration::from_hours(1))),
+        sink.clone(),
+        |c| {
+            c.max_concurrent_translations = 1;
+            c.translation_deadline = Duration::from_mins(10);
+            c.shutdown_timeout = Duration::from_secs(1);
+        },
+    );
+    let stats = pipeline.stats_handle();
+    let started = tokio::time::Instant::now();
+    let mut events = vec![connected(1)];
+    events.extend((0..3).map(|seq| sine_frame(1, seq)));
+    let (_pipeline, result) = run_with_events(pipeline, events).await;
+    result.expect("run");
+    let elapsed = started.elapsed();
+
+    let entries = sink.entries().await;
+    let skipped = assert_every_final_resolves_once(&entries);
+    assert_eq!(skipped, 3, "every final was skipped at shutdown");
+    let snapshot = stats.snapshot();
+    assert_eq!(snapshot.shutdown_timeouts, 1);
+    assert_eq!(snapshot.translations_skipped, 3);
+    assert_eq!(snapshot.pending_translations, 0);
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "run() must not wait for the translation deadline once shutdown times out"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_timeout_does_not_revive_a_reset_source() {
+    // The final of the reset source is still in flight when the shutdown timeout fires; the
+    // skip report at shutdown must respect the epoch just like a normal translation result.
+    let translator = Arc::new(DelayByUtteranceTranslator::new(|_| Duration::from_hours(1)));
+    let captured = Arc::clone(&translator.captured_requests);
+    let sink = Arc::new(CollectingSubtitleSink::new());
+    let mut pipeline = pipeline_with_config(
+        Arc::new(MockSttEngine::new(0.005, 1)),
+        translator,
+        sink.clone(),
+        |c| {
+            c.translation_deadline = Duration::from_mins(10);
+            c.shutdown_timeout = Duration::from_secs(1);
+        },
+    );
+    let stats = pipeline.stats_handle();
+    let (tx, rx) = mpsc::channel(16);
+    let task = tokio::spawn(async move { pipeline.run(rx).await });
+
+    tx.send(connected(1)).await.unwrap();
+    tx.send(sine_frame(1, 0)).await.unwrap();
+    wait_until(|| captured.lock().unwrap().len() == 1).await;
+    tx.send(AudioInputEvent::SourceReset {
+        conn_id: 1,
+        source: "mumble".to_owned(),
+    })
+    .await
+    .unwrap();
+    wait_until(|| stats.snapshot().active_speaker_workers == 0).await;
+    drop(tx);
+    task.await.expect("join").expect("run");
+
+    assert_eq!(sink.cleared_sources().await, vec!["mumble".to_owned()]);
+    let entries = sink.entries().await;
+    assert!(
+        entries.iter().all(|e| !matches!(
+            e.stage,
+            SubtitleStage::Translated | SubtitleStage::TranslationFailed
+        )),
+        "a shutdown timeout must not report a final of a reset source"
+    );
+    let snapshot = stats.snapshot();
+    assert_eq!(snapshot.shutdown_timeouts, 1);
+    assert_eq!(snapshot.translations_skipped, 0);
+}

@@ -21,6 +21,15 @@ use crate::domain::{CoreError, SubtitleEntry, SubtitleSink};
 /// later `emit` for that source is dropped, and no `emit` that passed the check earlier is still
 /// in progress: a `clear_source` issued afterwards (by another pipeline) cannot be undone by this
 /// sink.
+///
+/// # The inner sink must be fast
+///
+/// Because the forwarded `emit` runs under that lock, every `emit` through this sink is
+/// serialized across all sources of the pipeline using it, and [`Self::suppress_source`] waits
+/// for the `emit` in progress. A slow or blocking inner sink therefore stalls that pipeline's
+/// subtitle output for every source, and whoever calls `suppress_source` (the bridge's IPC event
+/// loop). Wrap only sinks whose `emit` returns promptly, such as one that just forwards to the
+/// UI.
 pub struct SuppressibleSubtitleSink {
     inner: Arc<dyn SubtitleSink>,
     suppressed: Mutex<HashSet<String>>,
@@ -41,11 +50,6 @@ impl SuppressibleSubtitleSink {
     /// Waits for an `emit` in progress to finish first (see the type docs).
     pub async fn suppress_source(&self, source: &str) {
         self.suppressed.lock().await.insert(source.to_owned());
-    }
-
-    /// Returns `true` if `source` has been suppressed.
-    pub async fn is_suppressed(&self, source: &str) -> bool {
-        self.suppressed.lock().await.contains(source)
     }
 }
 

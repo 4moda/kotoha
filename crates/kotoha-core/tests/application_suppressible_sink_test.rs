@@ -41,8 +41,6 @@ async fn suppressed_sources_are_dropped_and_others_pass_through() {
 
     sink.emit(entry("mumble", 1)).await.unwrap();
     sink.suppress_source("mumble").await;
-    assert!(sink.is_suppressed("mumble").await);
-    assert!(!sink.is_suppressed("ts3").await);
     sink.emit(entry("mumble", 2)).await.unwrap();
     sink.emit(entry("ts3", 3)).await.unwrap();
     sink.clear_source("mumble").await.unwrap();
