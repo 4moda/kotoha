@@ -601,7 +601,10 @@ async fn provider_secrets_are_write_only_scoped_to_the_active_provider_and_host_
         )
         .await
         .expect_err("invalid scheme");
-    assert!(!err.contains("CAP-C"), "{err}");
+    assert!(
+        !err.contains("CAP-C"),
+        "error must not contain the GAS capability id"
+    );
     assert!(state.secret_status().gas_endpoint_url);
 
     let status = state

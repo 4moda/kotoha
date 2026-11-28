@@ -78,9 +78,18 @@ fn env_store_resolves_values_and_errors_do_not_leak() {
         let err = store.resolve(&missing).unwrap_err();
         assert!(matches!(err, CoreError::SecretMissing(_)));
         let msg = err.to_string();
-        assert!(msg.contains("KOTOHA_SECRET_"), "{msg}");
-        assert!(!msg.contains("env-deepl-value"), "{msg}");
-        assert!(!msg.contains("other-secret-value"), "{msg}");
+        assert!(
+            msg.contains("KOTOHA_SECRET_"),
+            "missing-secret error must name the env variable"
+        );
+        assert!(
+            !msg.contains("env-deepl-value"),
+            "missing-secret error must not contain another secret"
+        );
+        assert!(
+            !msg.contains("other-secret-value"),
+            "missing-secret error must not contain another secret"
+        );
     }
     assert!(!format!("{store:?}").contains("env-deepl-value"));
 }

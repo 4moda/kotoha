@@ -37,8 +37,8 @@ fn domain_error_scope_classifies_each_variant() {
         ),
         (CoreError::ChannelClosed("x"), ErrorScope::Fatal),
     ];
-    for (err, expected) in cases {
-        assert_eq!(err.scope(), expected, "{err:?}");
+    for (index, (err, expected)) in cases.into_iter().enumerate() {
+        assert_eq!(err.scope(), expected, "unexpected scope for case #{index}");
         assert_eq!(err.scope().is_fatal(), expected == ErrorScope::Fatal);
     }
 }

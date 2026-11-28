@@ -65,7 +65,10 @@ fn assert_no_secrets(text: &str) {
         "CAPABILITY-ID",
         "/macros/s/",
     ] {
-        assert!(!text.contains(needle), "leaked '{needle}' in: {text}");
+        assert!(
+            !text.contains(needle),
+            "a secret value leaked into the error text"
+        );
     }
 }
 
@@ -99,7 +102,10 @@ fn missing_required_secret_errors_and_optional_secret_is_skipped() {
         assert_eq!(*idx, provider_index);
         assert!(matches!(err, CoreError::SecretMissing(_)));
         let msg = err.to_string();
-        assert!(msg.contains(skipped.secret_ref().as_str()), "{msg}");
+        assert!(
+            msg.contains(skipped.secret_ref().as_str()),
+            "missing-secret error must name the skipped secret ref"
+        );
         assert_no_secrets(&msg);
     }
 
