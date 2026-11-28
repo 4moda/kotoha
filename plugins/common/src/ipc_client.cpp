@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -23,6 +24,58 @@
 namespace kotoha::ipc {
 namespace {
 
+#if !defined(_WIN32)
+/// Strict UTF-8 validation (rejects overlong forms, surrogates and code points > U+10FFFF), the
+/// same set of sequences Rust's `str::from_utf8` accepts.
+[[nodiscard]] bool is_valid_utf8(std::string_view text) noexcept {
+    const auto* p = reinterpret_cast<const unsigned char*>(text.data());
+    const size_t n = text.size();
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char b0 = p[i];
+        if (b0 < 0x80) {
+            ++i;
+            continue;
+        }
+        size_t len = 0;
+        unsigned char lo = 0x80;
+        unsigned char hi = 0xBF;
+        if (b0 >= 0xC2 && b0 <= 0xDF) {
+            len = 2;
+        } else if (b0 >= 0xE0 && b0 <= 0xEF) {
+            len = 3;
+            if (b0 == 0xE0) {
+                lo = 0xA0;
+            } else if (b0 == 0xED) {
+                hi = 0x9F;
+            }
+        } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+            len = 4;
+            if (b0 == 0xF0) {
+                lo = 0x90;
+            } else if (b0 == 0xF4) {
+                hi = 0x8F;
+            }
+        } else {
+            return false;
+        }
+        if (i + len > n) {
+            return false;
+        }
+        if (p[i + 1] < lo || p[i + 1] > hi) {
+            return false;
+        }
+        for (size_t k = 2; k < len; ++k) {
+            if (p[i + k] < 0x80 || p[i + k] > 0xBF) {
+                return false;
+            }
+        }
+        i += len;
+    }
+    return true;
+}
+#endif
+
 [[nodiscard]] std::string read_env_var(const char* name) {
 #if defined(_WIN32)
     char* raw = nullptr;
@@ -36,6 +89,12 @@ namespace {
 #else
     const char* raw = std::getenv(name);
     if (raw == nullptr) {
+        return {};
+    }
+    // The Rust resolver (`kotoha_protocol`) reads the environment through `var_os` and treats a
+    // value that is not valid UTF-8 as unset, because its endpoints are `String`s. Do the same
+    // here so both sides resolve to the same endpoint (DESIGN.md Section 3.1).
+    if (!is_valid_utf8(raw)) {
         return {};
     }
     return {raw};
@@ -118,25 +177,40 @@ constexpr std::string_view kPrivateDirPrefix = "kotoha-";
 }
 
 #if defined(_WIN32)
+/// Closes the wrapped process token handle on scope exit (also when `std::vector` throws).
+class TokenHandleGuard {
+public:
+    explicit TokenHandleGuard(HANDLE handle) noexcept : handle_(handle) {}
+    ~TokenHandleGuard() {
+        if (handle_ != nullptr) {
+            CloseHandle(handle_);
+        }
+    }
+
+    TokenHandleGuard(const TokenHandleGuard&) = delete;
+    TokenHandleGuard& operator=(const TokenHandleGuard&) = delete;
+
+private:
+    HANDLE handle_;
+};
+
 /// Returns the TOKEN_USER information of `process`, or an empty buffer on failure.
 [[nodiscard]] std::vector<uint8_t> query_process_token_user(HANDLE process) noexcept {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(process, TOKEN_QUERY, &token)) {
+        return {};
+    }
+    const TokenHandleGuard token_guard(token);
     try {
-        HANDLE token = nullptr;
-        if (!OpenProcessToken(process, TOKEN_QUERY, &token)) {
-            return {};
-        }
         DWORD needed = 0;
         GetTokenInformation(token, TokenUser, nullptr, 0, &needed);
         if (needed == 0) {
-            CloseHandle(token);
             return {};
         }
         std::vector<uint8_t> buffer(static_cast<size_t>(needed));
         if (!GetTokenInformation(token, TokenUser, buffer.data(), needed, &needed)) {
-            CloseHandle(token);
             return {};
         }
-        CloseHandle(token);
         return buffer;
     } catch (...) {
         return {};
