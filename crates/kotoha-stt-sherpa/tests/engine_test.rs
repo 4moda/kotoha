@@ -368,7 +368,7 @@ async fn full_pipeline_integration_three_stage_subtitles_and_glossary_hotwords()
         stt_engine.clone(),
         translator_mgr,
         sink.clone(),
-        Arc::new(AudioPreprocessor::process_chunk),
+        AudioPreprocessor::resampler_factory(),
     );
 
     let glossary = MergedGlossary::new(BTreeMap::from([

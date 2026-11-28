@@ -281,7 +281,7 @@ async fn start_pipeline(
     let translator_manager = Arc::clone(state.translator_manager());
     let sink: Arc<dyn SubtitleSink> =
         Arc::new(TauriSubtitleSink::new(app.clone(), Arc::clone(state)));
-    let resample_fn = Arc::new(AudioPreprocessor::process_chunk);
+    let resample_fn = AudioPreprocessor::resampler_factory();
 
     let mut pipeline = PipelineService::new(
         PipelineConfig::new(src_lang, tgt_lang),

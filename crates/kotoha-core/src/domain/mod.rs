@@ -22,7 +22,7 @@ pub use logic::{
     DEFAULT_CONTEXT_WINDOW_CAPACITY,
 };
 pub use ports::{
-    GlossaryRepository, SecretStore, SecretWriter, SttEngine, SttStream, SubtitleSink, Translator,
-    TranslatorFactory,
+    GlossaryRepository, Resampler, SecretStore, SecretWriter, SttEngine, SttStream, SubtitleSink,
+    Translator, TranslatorFactory,
 };
 pub use secret::{ProviderSecretKind, Secret, SecretRef, MAX_SECRET_REF_LEN, REDACTED};

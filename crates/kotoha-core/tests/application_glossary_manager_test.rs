@@ -87,7 +87,7 @@ async fn glossary_manager_priority_merge_and_hot_reload_syncs_pipeline_and_stt()
         stt.clone(),
         translator_mgr,
         sink,
-        Arc::new(AudioPreprocessor::process_chunk),
+        AudioPreprocessor::resampler_factory(),
     );
 
     mgr.set_hotwords_score(2.25).expect("valid hotwords score");
@@ -190,7 +190,7 @@ async fn glossary_manager_priority_merge_and_hot_reload_syncs_pipeline_and_stt()
             },
         )),
         Arc::new(CollectingSubtitleSink::new()),
-        Arc::new(AudioPreprocessor::process_chunk),
+        AudioPreprocessor::resampler_factory(),
     );
     let err = mgr
         .update_enabled_and_sync_pipeline(vec!["Fleet".to_owned()], &mut failing_pipeline)

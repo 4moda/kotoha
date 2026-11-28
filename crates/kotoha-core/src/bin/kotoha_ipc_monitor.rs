@@ -6,7 +6,7 @@ use std::time::Duration;
 use kotoha_core::application::{SeqStatus, SessionAction, SourceSessionManager};
 use kotoha_core::domain::AudioInputEvent;
 use kotoha_core::infrastructure::{
-    parse_config_number, AudioPreprocessor, IpcServerAdapter, IpcServerConfig,
+    parse_config_number, AudioPreprocessor, IpcServerAdapter, IpcServerConfig, StreamResampler,
 };
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -414,8 +414,9 @@ fn emit_audio_frame(
     json: bool,
 ) {
     let rms = AudioPreprocessor::compute_rms(&chunk.samples);
-    let samples_16k_mono =
-        AudioPreprocessor::process_chunk(chunk).map_or(0, |resampled| resampled.len());
+    let samples_16k_mono = StreamResampler::new()
+        .process_chunk(chunk)
+        .map_or(0, |resampled| resampled.len());
     let (seq_status, dropped_frames) = match action {
         SessionAction::AudioSequenceChecked(SeqStatus::Initialized { .. }) => ("init", 0),
         SessionAction::AudioSequenceChecked(SeqStatus::InOrder) => ("ok", 0),
