@@ -1,6 +1,13 @@
 //! Unit tests for `kotoha-core` audio preprocessor (`src/infrastructure/audio.rs`).
 
-#![allow(clippy::expect_used, clippy::cast_precision_loss)]
+#![allow(
+    clippy::expect_used,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::suboptimal_flops,
+    clippy::many_single_char_names,
+    clippy::suspicious_operation_groupings
+)]
 
 use std::f32::consts::PI;
 
@@ -227,4 +234,55 @@ fn resampler_recreates_filter_on_format_change() {
         .process_interleaved(&b, 44_100, 2)
         .expect("fresh");
     assert_eq!(switched, fresh);
+}
+
+/// Fits `a*sin + b*cos` at `freq` (least squares over whole output) and returns the residual
+/// power relative to the fitted signal power, in dB.
+fn sinad_db(out: &[f32], freq: f64, out_rate: f64) -> f64 {
+    let (mut ss, mut cc, mut sc, mut ys, mut yc) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let w = 2.0 * std::f64::consts::PI * freq / out_rate;
+    for (n, &y) in out.iter().enumerate() {
+        let (s, c) = (w * n as f64).sin_cos();
+        let y = f64::from(y);
+        ss += s * s;
+        cc += c * c;
+        sc += s * c;
+        ys += y * s;
+        yc += y * c;
+    }
+    let det = ss * cc - sc * sc;
+    let a = (ys * cc - yc * sc) / det;
+    let b = (yc * ss - ys * sc) / det;
+    let mut resid = 0.0f64;
+    let mut sig = 0.0f64;
+    for (n, &y) in out.iter().enumerate() {
+        let (s, c) = (w * n as f64).sin_cos();
+        let fit = a * s + b * c;
+        resid += (f64::from(y) - fit).powi(2);
+        sig += fit * fit;
+    }
+    10.0 * (resid / sig).log10()
+}
+
+#[test]
+fn resampler_tone_fit_residual_is_below_minus_60_db() {
+    // (input rate, tone Hz); output is always 16 kHz.
+    for (rate, freq) in [(44_100u32, 1_000.0f64), (44_100, 6_000.0), (8_000, 1_000.0)] {
+        let frames = rate as usize; // 1 s
+                                    // f64 phase avoids f32 phase error in the reference tone.
+        let input: Vec<f32> = (0..frames)
+            .map(|i| {
+                (0.5 * (2.0 * std::f64::consts::PI * freq * i as f64 / f64::from(rate)).sin())
+                    as f32
+            })
+            .collect();
+        let chunk = (rate / 50) as usize;
+        let out = run_chunked(&input, rate, 1, chunk, &mut StreamResampler::new());
+        // Skip start-up and tail transients.
+        let skip = 400;
+        let steady = &out[skip..out.len() - skip];
+        // The fit uses indices relative to `skip`; a phase offset is absorbed by sin/cos.
+        let sinad = sinad_db(steady, freq, 16_000.0);
+        assert!(sinad < -60.0, "tone-fit residual is not below -60 dB");
+    }
 }
