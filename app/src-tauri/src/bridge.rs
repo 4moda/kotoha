@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use kotoha_core::application::{PipelineConfig, PipelineService, SourceSessionManager};
+use kotoha_core::application::{
+    PipelineConfig, PipelineService, SourceSessionManager, SuppressibleSubtitleSink,
+};
 use kotoha_core::domain::{
     AudioInputEvent, CoreError, LanguageCode, SpeakerKey, SttEngine, SubtitleEntry, SubtitleSink,
 };
@@ -198,7 +200,9 @@ impl SessionReplayLog {
         self.user_info.retain(|key, _| key.source != source);
     }
 
-    fn observe(&mut self, event: &AudioInputEvent) {
+    /// Records `event` and returns the source it clears (an owner's `SourceReset` or disconnect),
+    /// i.e. the source whose cards the pipeline is about to `clear_source`.
+    fn observe(&mut self, event: &AudioInputEvent) -> Option<String> {
         match event {
             AudioInputEvent::SourceConnected {
                 conn_id, source, ..
@@ -212,11 +216,13 @@ impl SessionReplayLog {
                 if self.is_owner(*conn_id, source) {
                     self.owners.remove(source);
                     self.clear_source(source);
+                    return Some(source.clone());
                 }
             }
             AudioInputEvent::SourceReset { conn_id, source } => {
                 if self.is_owner(*conn_id, source) {
                     self.clear_source(source);
+                    return Some(source.clone());
                 }
             }
             AudioInputEvent::UserInfoUpdated {
@@ -236,6 +242,7 @@ impl SessionReplayLog {
             }
             _ => {}
         }
+        None
     }
 
     fn replay(&self) -> Vec<AudioInputEvent> {
@@ -259,6 +266,20 @@ pub fn new_shared_stt_engine() -> Arc<dyn SttEngine> {
 struct RunningPipeline {
     tx: mpsc::Sender<AudioInputEvent>,
     handle: tokio::task::JoinHandle<()>,
+    /// The pipeline's sink; suppressed per source once the pipeline is retired (see
+    /// [`RetiredPipeline`]).
+    sink: Arc<SuppressibleSubtitleSink>,
+}
+
+/// A pipeline retired by a language change that is still draining its in-flight utterances.
+///
+/// Only the current pipeline receives input events, so a retired one never sees a later
+/// `SourceReset` / disconnect. When such an event clears a source, the retired pipeline's sink
+/// suppresses that source before the event is forwarded, so a late translation from the old
+/// pipeline cannot bring back the cards the new pipeline is about to clear.
+struct RetiredPipeline {
+    handle: tokio::task::JoinHandle<()>,
+    sink: Arc<SuppressibleSubtitleSink>,
 }
 
 /// Builds a [`PipelineService`] for `(src_lang, tgt_lang)` and runs it on its own task.
@@ -279,15 +300,16 @@ async fn start_pipeline(
 ) -> RunningPipeline {
     let (src_lang, tgt_lang) = pair;
     let translator_manager = Arc::clone(state.translator_manager());
-    let sink: Arc<dyn SubtitleSink> =
-        Arc::new(TauriSubtitleSink::new(app.clone(), Arc::clone(state)));
+    let sink = Arc::new(SuppressibleSubtitleSink::new(Arc::new(
+        TauriSubtitleSink::new(app.clone(), Arc::clone(state)),
+    )));
     let resample_fn = AudioPreprocessor::resampler_factory();
 
     let mut pipeline = PipelineService::new(
         PipelineConfig::new(src_lang, tgt_lang),
         stt_engine,
         translator_manager,
-        sink,
+        Arc::clone(&sink) as Arc<dyn SubtitleSink>,
         resample_fn,
     );
 
@@ -307,14 +329,15 @@ async fn start_pipeline(
             break;
         }
     }
-    RunningPipeline { tx, handle }
+    RunningPipeline { tx, handle, sink }
 }
 
 /// Spawns the background IPC server and audio-to-subtitle pipeline onto Tauri's async runtime.
 ///
 /// Language changes take effect without a restart: when the configured language pair changes the
 /// current pipeline is retired (its sender is dropped so it drains in-flight work) and a new one
-/// is started with the new pair. Subtitles in flight at that moment finish with the old pair.
+/// is started with the new pair. Subtitles in flight at that moment finish with the old pair,
+/// except for sources cleared after the switch (see [`RetiredPipeline`]).
 pub fn spawn_background_pipeline(app: AppHandle, shutdown_rx: watch::Receiver<bool>) {
     let state = app.state::<Arc<AppState>>().inner().clone();
 
@@ -345,7 +368,7 @@ pub fn spawn_background_pipeline(app: AppHandle, shutdown_rx: watch::Receiver<bo
             Vec::new(),
         )
         .await;
-        let mut retired: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut retired: Vec<RetiredPipeline> = Vec::new();
 
         let mut forward_shutdown = shutdown_rx;
         loop {
@@ -372,15 +395,24 @@ pub fn spawn_background_pipeline(app: AppHandle, shutdown_rx: watch::Receiver<bo
                         .await;
                         let old = std::mem::replace(&mut pipeline, next);
                         drop(old.tx);
-                        retired.push(old.handle);
-                        retired.retain(|h| !h.is_finished());
+                        retired.push(RetiredPipeline {
+                            handle: old.handle,
+                            sink: old.sink,
+                        });
+                        retired.retain(|r| !r.handle.is_finished());
                     }
                 }
                 maybe_event = raw_rx.recv() => {
                     let Some(event) = maybe_event else {
                         break;
                     };
-                    replay_log.observe(&event);
+                    if let Some(source) = replay_log.observe(&event) {
+                        retired.retain(|r| !r.handle.is_finished());
+                        // Before forwarding, so that it precedes the new pipeline's clear.
+                        for old in &retired {
+                            old.sink.suppress_source(&source).await;
+                        }
+                    }
                     if let Some(status) = monitor.observe(&event) {
                         state.set_connection_status(status.clone()).await;
                         let _ = app.emit(EVENT_CONNECTION_STATUS, &status);
@@ -394,8 +426,8 @@ pub fn spawn_background_pipeline(app: AppHandle, shutdown_rx: watch::Receiver<bo
 
         drop(pipeline.tx);
         let _ = pipeline.handle.await;
-        for handle in retired {
-            let _ = handle.await;
+        for old in retired {
+            let _ = old.handle.await;
         }
         let _ = ipc_handle.await;
     });
@@ -488,10 +520,11 @@ mod tests {
         assert!(log.replay().contains(&user_info(1, "mumble", 10, "Alice")));
         assert_eq!(log.replay().len(), 2);
 
-        log.observe(&AudioInputEvent::SourceReset {
+        let cleared = log.observe(&AudioInputEvent::SourceReset {
             conn_id: 1,
             source: "mumble".to_owned(),
         });
+        assert_eq!(cleared.as_deref(), Some("mumble"));
         assert_eq!(log.replay(), vec![connected(1, "mumble")]);
 
         log.observe(&user_info(1, "mumble", 10, "Alice"));
@@ -500,5 +533,46 @@ mod tests {
             speaker_key: key("mumble", 10),
         });
         assert_eq!(log.replay(), vec![connected(1, "mumble")]);
+    }
+
+    #[test]
+    fn replay_log_reports_sources_cleared_by_their_owner_only() {
+        let mut log = SessionReplayLog::default();
+        assert_eq!(log.observe(&connected(1, "mumble")), None);
+        assert_eq!(log.observe(&user_info(1, "mumble", 10, "Alice")), None);
+        assert_eq!(
+            log.observe(&AudioInputEvent::UserRemoved {
+                conn_id: 1,
+                speaker_key: key("mumble", 10),
+            }),
+            None,
+            "UserRemoved does not clear the source's cards"
+        );
+        assert_eq!(
+            log.observe(&AudioInputEvent::SourceReset {
+                conn_id: 2,
+                source: "mumble".to_owned(),
+            }),
+            None,
+            "a non-owner reset is ignored by the pipeline as well"
+        );
+        assert_eq!(
+            log.observe(&AudioInputEvent::SourceDisconnected {
+                conn_id: 1,
+                source: "mumble".to_owned(),
+                reason: DisconnectReason::Eof,
+            })
+            .as_deref(),
+            Some("mumble")
+        );
+        assert_eq!(
+            log.observe(&AudioInputEvent::SourceDisconnected {
+                conn_id: 1,
+                source: "mumble".to_owned(),
+                reason: DisconnectReason::Eof,
+            }),
+            None,
+            "the source has no owner any more"
+        );
     }
 }

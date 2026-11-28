@@ -2,14 +2,15 @@
 
 #![allow(dead_code, clippy::expect_used, clippy::panic)]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use kotoha_core::domain::{
     CoreError, LanguageCode, SpeakerKey, SttEngine, SttHotwordsConfig, SttStream, SubtitleEntry,
-    SubtitleSink, TranscriptEvent, TranslationRequest, TranslationResult, Translator,
+    SubtitleSink, SubtitleStage, TranscriptEvent, TranslationRequest, TranslationResult,
+    Translator,
 };
 use kotoha_core::infrastructure::MockSttEngine;
 
@@ -553,5 +554,171 @@ impl SttStream for RendezvousSttStream {
 
     fn flush(&mut self, timestamp_ms: u64) -> Result<Vec<TranscriptEvent>, CoreError> {
         self.inner.flush(timestamp_ms)
+    }
+}
+
+/// STT engine whose streams block inside `accept_audio` until [`HangingSttEngine::release`] is
+/// called (or a 60 s safety limit passes), modelling a hung native decoder.
+pub struct HangingSttEngine {
+    pub entered: Arc<AtomicBool>,
+    released: Arc<(StdMutex<bool>, std::sync::Condvar)>,
+}
+
+impl HangingSttEngine {
+    pub fn new() -> Self {
+        Self {
+            entered: Arc::new(AtomicBool::new(false)),
+            released: Arc::new((StdMutex::new(false), std::sync::Condvar::new())),
+        }
+    }
+
+    /// Lets every blocked and future `accept_audio` call return.
+    pub fn release(&self) {
+        let (released, cvar) = &*self.released;
+        *released.lock().expect("lock") = true;
+        cvar.notify_all();
+    }
+}
+
+impl Default for HangingSttEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SttEngine for HangingSttEngine {
+    fn name(&self) -> &'static str {
+        "hanging-stt"
+    }
+
+    fn create_stream(
+        &self,
+        _speaker_key: SpeakerKey,
+        _src_lang: &LanguageCode,
+    ) -> Result<Box<dyn SttStream>, CoreError> {
+        Ok(Box::new(HangingSttStream {
+            entered: Arc::clone(&self.entered),
+            released: Arc::clone(&self.released),
+        }))
+    }
+}
+
+struct HangingSttStream {
+    entered: Arc<AtomicBool>,
+    released: Arc<(StdMutex<bool>, std::sync::Condvar)>,
+}
+
+impl SttStream for HangingSttStream {
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "false positive: the guard is moved into `Condvar::wait_timeout_while`"
+    )]
+    fn accept_audio(
+        &mut self,
+        _samples_16k_mono: &[f32],
+        _timestamp_ms: u64,
+    ) -> Result<Vec<TranscriptEvent>, CoreError> {
+        self.entered.store(true, Ordering::SeqCst);
+        let (released, cvar) = &*self.released;
+        let guard = released.lock().expect("lock");
+        let (guard, _) = cvar
+            .wait_timeout_while(guard, Duration::from_mins(1), |released| !*released)
+            .expect("lock");
+        drop(guard);
+        Ok(Vec::new())
+    }
+
+    fn flush(&mut self, _timestamp_ms: u64) -> Result<Vec<TranscriptEvent>, CoreError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Recording sink whose first `emit` of a `panic_on` entry panics; every other entry is kept.
+pub struct PanicOnceSink {
+    pub panic_on: SubtitleStage,
+    armed: AtomicBool,
+    entries: StdMutex<Vec<SubtitleEntry>>,
+}
+
+impl PanicOnceSink {
+    pub const fn new(panic_on: SubtitleStage) -> Self {
+        Self {
+            panic_on,
+            armed: AtomicBool::new(true),
+            entries: StdMutex::new(Vec::new()),
+        }
+    }
+
+    pub fn entries(&self) -> Vec<SubtitleEntry> {
+        self.entries.lock().expect("lock").clone()
+    }
+}
+
+#[async_trait]
+impl SubtitleSink for PanicOnceSink {
+    async fn emit(&self, entry: SubtitleEntry) -> Result<(), CoreError> {
+        let trips = entry.stage == self.panic_on && self.armed.swap(false, Ordering::SeqCst);
+        assert!(!trips, "scripted sink panic");
+        self.entries.lock().expect("lock").push(entry);
+        Ok(())
+    }
+}
+
+/// Sink that records every entry with its emit time and holds the Phase C emit (`Translated` /
+/// `TranslationFailed`) of `hold_source` until a `TranslationFailed` of `release_source` has been
+/// emitted, or `hold_timeout` passes (then `released_by_timeout` is set).
+///
+/// Holding a Phase C emit keeps that translation's in-flight slot busy.
+pub struct HoldingSink {
+    pub hold_source: String,
+    pub release_source: String,
+    pub hold_timeout: Duration,
+    pub released_by_timeout: AtomicBool,
+    entries: StdMutex<Vec<(tokio::time::Instant, SubtitleEntry)>>,
+    release: tokio::sync::Notify,
+}
+
+impl HoldingSink {
+    pub fn new(hold_source: &str, release_source: &str, hold_timeout: Duration) -> Self {
+        Self {
+            hold_source: hold_source.to_owned(),
+            release_source: release_source.to_owned(),
+            hold_timeout,
+            released_by_timeout: AtomicBool::new(false),
+            entries: StdMutex::new(Vec::new()),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub fn entries(&self) -> Vec<(tokio::time::Instant, SubtitleEntry)> {
+        self.entries.lock().expect("lock").clone()
+    }
+}
+
+#[async_trait]
+impl SubtitleSink for HoldingSink {
+    async fn emit(&self, entry: SubtitleEntry) -> Result<(), CoreError> {
+        let source = entry.speaker_key.source.clone();
+        let stage = entry.stage;
+        self.entries
+            .lock()
+            .expect("lock")
+            .push((tokio::time::Instant::now(), entry));
+        if source == self.release_source && stage == SubtitleStage::TranslationFailed {
+            self.release.notify_one();
+        }
+        let is_phase_c = matches!(
+            stage,
+            SubtitleStage::Translated | SubtitleStage::TranslationFailed
+        );
+        if source == self.hold_source
+            && is_phase_c
+            && tokio::time::timeout(self.hold_timeout, self.release.notified())
+                .await
+                .is_err()
+        {
+            self.released_by_timeout.store(true, Ordering::SeqCst);
+        }
+        Ok(())
     }
 }

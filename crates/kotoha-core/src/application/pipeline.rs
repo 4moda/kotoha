@@ -62,8 +62,18 @@
 //! | `SttStream::accept_audio` | [`ErrorScope::Speaker`] | `Chunk`: drop the chunk; otherwise (or on panic) drop the speaker's stream |
 //! | `SttStream::flush` (error or panic) | [`ErrorScope::Speaker`] | drop the speaker's stream |
 //! | `Translator::translate` (error or panic) | [`ErrorScope::Utterance`] | emit [`SubtitleStage::TranslationFailed`]; the context window does not record the turn |
-//! | `SubtitleSink::emit` / `clear_source` | [`ErrorScope::Utterance`] | lose that update only |
+//! | `SubtitleSink::emit` / `clear_source` (error or panic) | [`ErrorScope::Utterance`] | lose that update only |
 //! | worker / translation task panic | [`ErrorScope::Speaker`] / [`ErrorScope::Utterance`] | count it and continue |
+//!
+//! A sink panic is caught around each call (`emit` is polled inside `catch_unwind`), so it never
+//! unwinds a speaker worker and the utterance it belonged to still finalizes and translates.
+//!
+//! # Shutdown
+//!
+//! When the input channel closes, `run()` waits for workers and queued translations to drain, but
+//! at most [`PipelineConfig::shutdown_timeout`]. An adapter that hangs past it (for example an STT
+//! call stuck on the blocking pool) is abandoned: its task is aborted (a blocking call keeps its
+//! thread until it returns) and `run()` returns `Ok(())`.
 //!
 //! Whenever a stream is dropped while an utterance is still open (idle timeout, STT error or
 //! panic), the last interim text is emitted as the utterance's final card so that no card stays
@@ -80,9 +90,12 @@
 //! `SttStream` + dispatcher pair, while keeping the same router, queues, gates and error policy.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc::{self, error::TrySendError};
@@ -144,13 +157,18 @@ pub struct PipelineConfig {
     /// Capacity, in audio chunks, of each speaker worker's input queue. Chunks arriving while it
     /// is full are dropped so that one slow speaker never blocks the others.
     pub speaker_queue_capacity: usize,
+    /// Upper bound on how long [`PipelineService::run`] waits, after its input channel closes,
+    /// for workers and queued translations to drain. Work still running afterwards (e.g. a hung
+    /// adapter) is abandoned. Keep it above `translation_deadline` so that a normal drain is
+    /// never cut short.
+    pub shutdown_timeout: Duration,
 }
 
 impl PipelineConfig {
     /// Creates a [`PipelineConfig`] with sensible defaults: `max_concurrent_translations = 4`,
     /// `context_window_capacity = 8`, `max_pending_translations = 16`,
     /// `translation_deadline = 10 s`, `speaker_idle_timeout = 5 s`,
-    /// `speaker_queue_capacity = 256` (about 5 s of 20 ms frames).
+    /// `speaker_queue_capacity = 256` (about 5 s of 20 ms frames), `shutdown_timeout = 15 s`.
     #[must_use]
     pub const fn new(src_lang: LanguageCode, tgt_lang: LanguageCode) -> Self {
         Self {
@@ -162,6 +180,7 @@ impl PipelineConfig {
             translation_deadline: Duration::from_secs(10),
             speaker_idle_timeout: Duration::from_secs(5),
             speaker_queue_capacity: 256,
+            shutdown_timeout: Duration::from_secs(15),
         }
     }
 }
@@ -554,7 +573,8 @@ impl PipelineService {
     ///
     /// On close, every speaker worker processes its queued audio, flushes and finalizes its
     /// stream, and every queued final is translated (or skipped at its deadline) before this
-    /// returns.
+    /// returns. That drain is bounded by [`PipelineConfig::shutdown_timeout`]: work still running
+    /// when it expires (a hung adapter) is abandoned and this returns anyway.
     ///
     /// Returns `Ok(())` when the input channel closes. Every adapter error and panic is recovered
     /// from (see the module docs); `Err` is reserved for [`ErrorScope::Fatal`] pipeline
@@ -603,16 +623,33 @@ impl PipelineService {
 
         // Graceful shutdown: closing every queue lets each worker drain, flush and finalize.
         self.speaker_workers.clear();
-        while let Some(res) = state.workers.join_next_with_id().await {
-            self.on_worker_exit(&mut state, res);
-        }
-        // The last job sender lives in `deps`; dropping it lets the dispatcher drain and stop.
-        drop(state);
-        if let Err(err) = dispatcher_task.await {
-            if err.is_panic() {
-                self.stats.task_panic();
-                tracing::error!("translation dispatcher panicked");
+        let shutdown_deadline = Instant::now() + self.config.shutdown_timeout;
+        let workers_done = tokio::time::timeout_at(shutdown_deadline, async {
+            while let Some(res) = state.workers.join_next_with_id().await {
+                self.on_worker_exit(&mut state, res);
             }
+        })
+        .await
+        .is_ok();
+        // The last job sender lives in `deps`; dropping it lets the dispatcher drain and stop.
+        // Dropping the `JoinSet` also aborts any worker that did not finish in time.
+        drop(state);
+        let mut dispatcher_task = dispatcher_task;
+        let dispatcher_done = workers_done
+            && match tokio::time::timeout_at(shutdown_deadline, &mut dispatcher_task).await {
+                Ok(Err(err)) => {
+                    if err.is_panic() {
+                        self.stats.task_panic();
+                        tracing::error!("translation dispatcher panicked");
+                    }
+                    true
+                }
+                Ok(Ok(())) => true,
+                Err(_elapsed) => false,
+            };
+        if !dispatcher_done {
+            dispatcher_task.abort();
+            tracing::warn!("pipeline shutdown timed out; abandoning unfinished workers");
         }
         self.stats.set_active_speaker_workers(0);
         Ok(())
@@ -1247,7 +1284,7 @@ impl SpeakerWorker {
                 failure_reason: None,
                 timestamp_ms: event.timestamp_ms,
             };
-            deps.stats.record_sink(&deps.sink.emit(entry).await);
+            emit_contained(&deps.sink, entry, &deps.stats).await;
 
             if !event.is_final || !deps.pre_filter.should_translate(&event.text) {
                 continue;
@@ -1569,6 +1606,38 @@ async fn finish_job(
         failure_reason: failure_reason.map(str::to_owned),
         timestamp_ms,
     };
-    stats.record_sink(&sink.emit(entry).await);
+    emit_contained(sink, entry, stats).await;
     drop(gate);
+}
+
+/// Polls an [`Unpin`] future inside `catch_unwind`; resolves to `None` if a poll panicked.
+struct CatchUnwind<F>(F);
+
+impl<F: Future + Unpin> Future for CatchUnwind<F> {
+    type Output = Option<F::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = &mut self.0;
+        match catch_unwind(AssertUnwindSafe(|| Pin::new(inner).poll(cx))) {
+            Ok(Poll::Ready(output)) => Poll::Ready(Some(output)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(_) => Poll::Ready(None),
+        }
+    }
+}
+
+/// Calls [`SubtitleSink::emit`] so that neither an error nor a panic escapes: both lose this
+/// update only (see "Error policy"). Runs in place, so a caller holding the source gate keeps it.
+async fn emit_contained(
+    sink: &Arc<dyn SubtitleSink>,
+    entry: SubtitleEntry,
+    stats: &PipelineStatsHandle,
+) {
+    if let Some(result) = CatchUnwind(sink.emit(entry)).await {
+        stats.record_sink(&result);
+    } else {
+        stats.sink_error();
+        stats.task_panic();
+        tracing::error!("subtitle sink panicked in emit");
+    }
 }
