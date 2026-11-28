@@ -14,6 +14,9 @@
 //! There is intentionally no fallback directly inside a world-writable directory (such as the
 //! former `/tmp/kotoha_v1.sock`), because another local user could pre-create (squat) that path.
 //!
+//! An environment variable whose value is not valid UTF-8 is treated as unset (the C++ client
+//! applies the same rule rather than using raw bytes).
+//!
 //! The C++ client (`plugins/common/src/ipc_client.cpp`, `resolve_ipc_endpoint`) implements the
 //! identical rules; `tests/fixtures/endpoint_resolution_cases.tsv` is checked by both test suites.
 
@@ -107,6 +110,16 @@ pub fn current_euid() -> u32 {
     }
 }
 
+/// Reads an environment variable through [`env::var_os`] and returns it only when it is valid
+/// UTF-8; a non-UTF-8 value is treated as unset.
+///
+/// Endpoints are `String`s, so a non-UTF-8 value cannot be carried through. The C++ client
+/// (`read_env_var` in `ipc_client.cpp`) applies the same rule instead of using the raw bytes,
+/// which keeps both sides resolving to the same endpoint.
+fn utf8_env(name: &str) -> Option<String> {
+    env::var_os(name).and_then(|value| value.into_string().ok())
+}
+
 /// Resolves the IPC endpoint using the current process environment and target OS.
 #[must_use]
 pub fn resolve_endpoint() -> String {
@@ -117,9 +130,9 @@ pub fn resolve_endpoint() -> String {
 /// environment and target OS.
 #[must_use]
 pub fn resolve_endpoint_details() -> ResolvedEndpoint {
-    let env_override = env::var(ENV_IPC_ENDPOINT).ok();
-    let xdg_runtime_dir = env::var("XDG_RUNTIME_DIR").ok();
-    let tmpdir = env::var("TMPDIR").ok();
+    let env_override = utf8_env(ENV_IPC_ENDPOINT);
+    let xdg_runtime_dir = utf8_env("XDG_RUNTIME_DIR");
+    let tmpdir = utf8_env("TMPDIR");
     resolve_endpoint_details_with(
         TargetOs::current(),
         &EndpointEnv {
@@ -224,7 +237,7 @@ pub fn extract_windows_pipe_name(endpoint: &str) -> Result<&str, ProtocolError> 
 
 /// Resolves the Windows pipe name from the current environment, stripping `\\.\pipe\` if present.
 pub fn resolve_windows_pipe_name() -> Result<String, ProtocolError> {
-    let env_override = env::var(ENV_IPC_ENDPOINT).ok();
+    let env_override = utf8_env(ENV_IPC_ENDPOINT);
     let endpoint = resolve_endpoint_with(
         TargetOs::Windows,
         &EndpointEnv {

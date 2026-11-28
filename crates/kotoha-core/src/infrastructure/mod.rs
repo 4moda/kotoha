@@ -8,7 +8,10 @@ pub mod secret_store;
 
 pub use audio::{AudioPreprocessor, TARGET_SAMPLE_RATE};
 pub use glossary_toml::TomlGlossaryRepository;
-pub use ipc_server::{connect_local_socket, IpcServerAdapter, IpcServerConfig};
+pub use ipc_server::{
+    connect_local_socket, parse_config_number, IpcDiagnostic, IpcServerAdapter, IpcServerConfig,
+    ENV_IPC_HELLO_TIMEOUT_MS, ENV_IPC_IDLE_TIMEOUT_MS, ENV_IPC_MAX_CONNECTIONS,
+};
 pub use mock_adapters::{
     CollectingSubtitleSink, DefaultTranslatorFactory, MockSttEngine, MockTranslator,
 };

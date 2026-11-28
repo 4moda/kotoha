@@ -123,6 +123,115 @@ async fn ipc_server_handles_shutdown_signal() {
         .expect("server ok");
 }
 
+mod config {
+    //! `IpcServerConfig` parsing and validation (environment variables / CLI flags).
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use kotoha_core::domain::CoreError;
+    use kotoha_core::infrastructure::{
+        IpcServerConfig, ENV_IPC_HELLO_TIMEOUT_MS, ENV_IPC_IDLE_TIMEOUT_MS, ENV_IPC_MAX_CONNECTIONS,
+    };
+
+    fn parse(vars: &[(&str, &str)]) -> Result<IpcServerConfig, CoreError> {
+        let map: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        IpcServerConfig::from_lookup(|name| Ok(map.get(name).cloned()))
+    }
+
+    fn message(res: Result<IpcServerConfig, CoreError>) -> String {
+        match res {
+            Err(CoreError::Ipc(msg)) => msg,
+            other => panic!("expected an IPC config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unset_and_empty_variables_keep_defaults() {
+        assert_eq!(parse(&[]).unwrap(), IpcServerConfig::default());
+        let empty = parse(&[
+            (ENV_IPC_HELLO_TIMEOUT_MS, ""),
+            (ENV_IPC_IDLE_TIMEOUT_MS, "  "),
+            (ENV_IPC_MAX_CONNECTIONS, ""),
+        ]);
+        assert_eq!(empty.unwrap(), IpcServerConfig::default());
+    }
+
+    #[test]
+    fn variables_override_individual_limits() {
+        let config = parse(&[
+            (ENV_IPC_HELLO_TIMEOUT_MS, "500"),
+            (ENV_IPC_IDLE_TIMEOUT_MS, " 7500 "),
+            (ENV_IPC_MAX_CONNECTIONS, "4"),
+        ])
+        .unwrap();
+        assert_eq!(config.hello_timeout, Duration::from_millis(500));
+        assert_eq!(config.idle_timeout, Duration::from_millis(7500));
+        assert_eq!(config.max_connections, 4);
+
+        let partial = parse(&[(ENV_IPC_MAX_CONNECTIONS, "1")]).unwrap();
+        assert_eq!(
+            partial.hello_timeout,
+            IpcServerConfig::default().hello_timeout
+        );
+        assert_eq!(partial.max_connections, 1);
+    }
+
+    #[test]
+    fn invalid_values_are_rejected_with_the_variable_name() {
+        for (name, bad) in [
+            (ENV_IPC_HELLO_TIMEOUT_MS, "abc"),
+            (ENV_IPC_IDLE_TIMEOUT_MS, "-5"),
+            (ENV_IPC_IDLE_TIMEOUT_MS, "1.5"),
+            (ENV_IPC_MAX_CONNECTIONS, "many"),
+            (ENV_IPC_HELLO_TIMEOUT_MS, "99999999999999999999999"),
+        ] {
+            let msg = message(parse(&[(name, bad)]));
+            assert!(msg.contains(name), "'{msg}' should name {name}");
+        }
+    }
+
+    #[test]
+    fn out_of_range_values_are_rejected() {
+        for (name, bad, field) in [
+            (ENV_IPC_HELLO_TIMEOUT_MS, "0", "hello_timeout"),
+            (ENV_IPC_IDLE_TIMEOUT_MS, "0", "idle_timeout"),
+            (ENV_IPC_IDLE_TIMEOUT_MS, "3600001", "idle_timeout"),
+            (ENV_IPC_MAX_CONNECTIONS, "0", "max_connections"),
+            (ENV_IPC_MAX_CONNECTIONS, "4097", "max_connections"),
+        ] {
+            let msg = message(parse(&[(name, bad)]));
+            assert!(msg.contains(field), "'{msg}' should mention {field}");
+        }
+        // Boundary values are accepted.
+        parse(&[
+            (ENV_IPC_HELLO_TIMEOUT_MS, "1"),
+            (ENV_IPC_IDLE_TIMEOUT_MS, "3600000"),
+            (ENV_IPC_MAX_CONNECTIONS, "4096"),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_checks_programmatic_configs() {
+        assert!(IpcServerConfig::default().validate().is_ok());
+        let zero = IpcServerConfig {
+            idle_timeout: Duration::ZERO,
+            ..IpcServerConfig::default()
+        };
+        assert!(zero.validate().is_err());
+        let no_slots = IpcServerConfig {
+            max_connections: 0,
+            ..IpcServerConfig::default()
+        };
+        assert!(no_slots.validate().is_err());
+    }
+}
+
 #[cfg(unix)]
 mod liveness {
     //! Liveness: Hello timeout, idle timeout, superseded connections, connection limit and
@@ -132,7 +241,11 @@ mod liveness {
     use std::time::Duration;
 
     use kotoha_core::domain::{AudioInputEvent, DisconnectReason};
-    use kotoha_core::infrastructure::{connect_local_socket, IpcServerAdapter, IpcServerConfig};
+    use std::sync::{Arc, Mutex};
+
+    use kotoha_core::infrastructure::{
+        connect_local_socket, IpcDiagnostic, IpcServerAdapter, IpcServerConfig,
+    };
     use kotoha_protocol::{encode_frame, Message};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{mpsc, oneshot, watch};
@@ -217,9 +330,13 @@ mod liveness {
 
     #[tokio::test]
     async fn slow_consumer_does_not_cause_idle_timeout() {
-        // Channel capacity 1 and a consumer that stalls for 800ms (> idle_timeout 300ms) while the
+        // Channel capacity 1 and a consumer that stalls for 1000ms (> idle_timeout 600ms) while the
         // client keeps sending Heartbeats every 50ms: time blocked on the consumer is not idle time.
-        let mut h = Harness::start_with_capacity("slow", config(1000, 300, 16), 1).await;
+        // This only exercises select ordering; the deadline reset itself is covered by
+        // `idle_deadline_restarts_after_a_blocked_event_send`. Real socket I/O cannot run under
+        // `tokio::time::pause` (auto-advance would fire timers while I/O is pending), so the
+        // timing tests use real time with generous margins instead.
+        let mut h = Harness::start_with_capacity("slow", config(1000, 600, 16), 1).await;
         let mut c = connect_local_socket(&h.endpoint).await.expect("connect");
         c.write_all(&hello("mumble")).await.expect("hello");
         let hb = encode_frame(&Message::Heartbeat).expect("hb");
@@ -230,10 +347,10 @@ mod liveness {
             }
             c
         });
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         let mut seen = 0;
         while let Ok(Some(ev)) =
-            tokio::time::timeout(Duration::from_millis(250), h.events.recv()).await
+            tokio::time::timeout(Duration::from_millis(500), h.events.recv()).await
         {
             assert!(
                 !matches!(ev, AudioInputEvent::SourceDisconnected { .. }),
@@ -246,13 +363,56 @@ mod liveness {
         h.stop().await;
     }
 
+    #[tokio::test]
+    async fn idle_deadline_restarts_after_a_blocked_event_send() {
+        // The consumer stalls for longer than `idle_timeout` while the server is blocked inside
+        // `tx.send(..)` for a Heartbeat. Once the send completes the idle window must restart from
+        // that moment: the client was not silent, the server was busy. If the deadline were
+        // computed before the send (or not reset), the connection would be dropped immediately
+        // after the send, however the `select!` branches are ordered.
+        let idle = Duration::from_millis(1500);
+        let mut h = Harness::start_with_capacity("reset", config(1000, 1500, 16), 1).await;
+        let mut c = connect_local_socket(&h.endpoint).await.expect("connect");
+        c.write_all(&hello("mumble")).await.expect("hello");
+        // `SourceConnected` now occupies the only channel slot; nobody consumes it yet.
+        c.write_all(&encode_frame(&Message::Heartbeat).expect("hb"))
+            .await
+            .expect("heartbeat");
+        // The server reads the Heartbeat and blocks in `send`. Stall past the idle timeout.
+        tokio::time::sleep(idle + Duration::from_millis(500)).await;
+
+        assert!(matches!(
+            h.next_event().await,
+            AudioInputEvent::SourceConnected { .. }
+        ));
+        assert!(matches!(
+            h.next_event().await,
+            AudioInputEvent::Heartbeat { .. }
+        ));
+        // The send has now completed. The client stays silent, but well within a fresh idle
+        // window (idle_timeout 1500ms, observed for 500ms) the connection must still be alive.
+        let early = tokio::time::timeout(Duration::from_millis(500), h.events.recv()).await;
+        assert!(
+            early.is_err(),
+            "connection dropped right after the blocked send: {early:?}"
+        );
+        // ...and the restarted window does eventually expire.
+        match h.next_event().await {
+            AudioInputEvent::SourceDisconnected { reason, .. } => {
+                assert_eq!(reason, DisconnectReason::IdleTimeout);
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+        h.stop().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn near_simultaneous_hello_leaves_a_live_owner() {
         use kotoha_core::application::SourceSessionManager;
 
         let mut h = Harness::start("race", config(2000, 5000, 256)).await;
         let mut mgr = SourceSessionManager::new();
-        for i in 0..1000u32 {
+        for i in 0..3000u32 {
             let src = format!("race{i}");
             let (mut a, mut b) = (
                 connect_local_socket(&h.endpoint).await.expect("a"),
@@ -328,7 +488,7 @@ mod liveness {
 
     #[tokio::test]
     async fn heartbeats_keep_connection_alive() {
-        let mut h = Harness::start("hb", config(1000, 300, 16)).await;
+        let mut h = Harness::start("hb", config(1000, 600, 16)).await;
         let mut c = connect_local_socket(&h.endpoint).await.expect("connect");
         c.write_all(&hello("mumble")).await.expect("hello");
         let hb = encode_frame(&Message::Heartbeat).expect("hb");
@@ -336,7 +496,7 @@ mod liveness {
             tokio::time::sleep(Duration::from_millis(100)).await;
             c.write_all(&hb).await.expect("heartbeat");
         }
-        // 800ms elapsed (> idle_timeout) but only Connected + Heartbeat events, no disconnect.
+        // 800ms elapsed (> idle_timeout 600ms) but only Connected + Heartbeat events, no disconnect.
         let mut disconnects = 0;
         while let Ok(ev) = h.events.try_recv() {
             if matches!(ev, AudioInputEvent::SourceDisconnected { .. }) {
@@ -406,6 +566,76 @@ mod liveness {
                 .is_err()
         );
         h.stop().await;
+    }
+
+    #[tokio::test]
+    async fn closed_and_refused_connections_are_reported_to_the_diagnostics_hook() {
+        let endpoint = super::common::test_endpoint("live_diag");
+        let log: Arc<Mutex<Vec<IpcDiagnostic>>> = Arc::default();
+        let sink = Arc::clone(&log);
+        let server = IpcServerAdapter::with_config(endpoint.clone(), config(1000, 5000, 2))
+            .with_diagnostics(move |d| sink.lock().unwrap().push(d.clone()));
+        let (tx, mut events) = mpsc::channel(64);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            server
+                .run(tx, shutdown_rx, Some(ready_tx))
+                .await
+                .expect("server run");
+        });
+        ready_rx.await.expect("ready");
+
+        // One connection completes the handshake, one stays silent (hello timeout).
+        let mut named = connect_local_socket(&endpoint).await.expect("named");
+        named.write_all(&hello("mumble")).await.expect("hello");
+        let mut silent = connect_local_socket(&endpoint).await.expect("silent");
+        let _ = events.recv().await.expect("SourceConnected");
+        // Both slots are taken: the third connection is refused and dropped.
+        let mut refused = connect_local_socket(&endpoint).await.expect("refused");
+        expect_closed(&mut refused, Duration::from_secs(5)).await;
+        expect_closed(&mut silent, Duration::from_secs(5)).await;
+        drop(named);
+
+        let snapshot = loop {
+            let snapshot = log.lock().unwrap().clone();
+            let closed = snapshot
+                .iter()
+                .filter(|d| matches!(d, IpcDiagnostic::ConnectionClosed { .. }))
+                .count();
+            if closed >= 2 {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(
+            snapshot.contains(&IpcDiagnostic::ConnectionRefused {
+                active: 2,
+                max_connections: 2
+            }),
+            "missing refusal in {snapshot:?}"
+        );
+        assert!(
+            snapshot.iter().any(|d| matches!(
+                d,
+                IpcDiagnostic::ConnectionClosed { source: None, reason, .. }
+                    if *reason == DisconnectReason::HelloTimeout
+            )),
+            "missing hello timeout in {snapshot:?}"
+        );
+        assert!(
+            snapshot.iter().any(|d| matches!(
+                d,
+                IpcDiagnostic::ConnectionClosed { source: Some(s), reason, .. }
+                    if s == "mumble" && *reason == DisconnectReason::Eof
+            )),
+            "missing EOF of the named connection in {snapshot:?}"
+        );
+        let text = snapshot.iter().map(ToString::to_string).collect::<String>();
+        assert!(text.contains("limit of 2") && text.contains("HelloTimeout"));
+
+        let _ = shutdown.send(true);
+        task.await.expect("server task");
     }
 
     #[tokio::test]
@@ -557,6 +787,14 @@ mod endpoint_security {
         }
     }
 
+    /// Every private-directory refusal must tell the user how to pick another location.
+    fn assert_mentions_workaround(msg: &str) {
+        assert!(
+            msg.contains("KOTOHA_IPC_ENDPOINT") && msg.contains("XDG_RUNTIME_DIR"),
+            "error '{msg}' should suggest KOTOHA_IPC_ENDPOINT or XDG_RUNTIME_DIR"
+        );
+    }
+
     fn endpoint_str(path: &Path) -> String {
         path.to_str().expect("utf-8 path").to_owned()
     }
@@ -572,7 +810,7 @@ mod endpoint_security {
         std::fs::write(&endpoint, b"important user data").unwrap();
 
         let res = start(IpcServerAdapter::new(endpoint_str(&endpoint))).await;
-        expect_ipc_error(res, "a regular file");
+        expect_ipc_error(res, "existing path is a regular file, not a socket");
 
         assert_eq!(std::fs::read(&endpoint).unwrap(), b"important user data");
     }
@@ -585,7 +823,7 @@ mod endpoint_security {
         std::fs::write(endpoint.join("keep"), b"x").unwrap();
 
         let res = start(IpcServerAdapter::new(endpoint_str(&endpoint))).await;
-        expect_ipc_error(res, "a directory");
+        expect_ipc_error(res, "existing path is a directory, not a socket");
 
         assert!(endpoint.join("keep").exists());
     }
@@ -599,7 +837,7 @@ mod endpoint_security {
         std::os::unix::fs::symlink(&target, &endpoint).unwrap();
 
         let res = start(IpcServerAdapter::new(endpoint_str(&endpoint))).await;
-        expect_ipc_error(res, "a symlink");
+        expect_ipc_error(res, "existing path is a symlink, not a socket");
 
         let meta = std::fs::symlink_metadata(&endpoint).unwrap();
         assert!(meta.file_type().is_symlink());
@@ -613,7 +851,7 @@ mod endpoint_security {
         std::os::unix::fs::symlink(scratch.path("missing"), &endpoint).unwrap();
 
         let res = start(IpcServerAdapter::new(endpoint_str(&endpoint))).await;
-        expect_ipc_error(res, "a symlink");
+        expect_ipc_error(res, "existing path is a symlink, not a socket");
         assert!(std::fs::symlink_metadata(&endpoint).is_ok());
     }
 
@@ -720,7 +958,8 @@ mod endpoint_security {
 
             let res =
                 start(IpcServerAdapter::new(endpoint_str(&endpoint)).with_private_dir(&dir)).await;
-            expect_ipc_error(res, "grant group/other access");
+            let msg = expect_ipc_error(res, "grant group/other access");
+            assert_mentions_workaround(&msg);
             assert!(
                 std::fs::symlink_metadata(&endpoint).is_err(),
                 "no socket is created in an insecure dir (mode {mode:o})"
@@ -745,7 +984,8 @@ mod endpoint_security {
 
         let res =
             start(IpcServerAdapter::new(endpoint_str(&endpoint)).with_private_dir(&dir)).await;
-        expect_ipc_error(res, "not a directory");
+        let msg = expect_ipc_error(res, "not a directory");
+        assert_mentions_workaround(&msg);
         assert!(std::fs::read_dir(&real).unwrap().next().is_none());
     }
 
@@ -758,7 +998,8 @@ mod endpoint_security {
 
         let res =
             start(IpcServerAdapter::new(endpoint_str(&endpoint)).with_private_dir(&dir)).await;
-        expect_ipc_error(res, "not a directory");
+        let msg = expect_ipc_error(res, "not a directory");
+        assert_mentions_workaround(&msg);
         assert_eq!(std::fs::read(&dir).unwrap(), b"not a dir");
     }
 
@@ -776,7 +1017,8 @@ mod endpoint_security {
 
         let res =
             start(IpcServerAdapter::new(endpoint_str(&endpoint)).with_private_dir(&dir)).await;
-        expect_ipc_error(res, "owned by uid 65534");
+        let msg = expect_ipc_error(res, "owned by uid 65534");
+        assert_mentions_workaround(&msg);
     }
 
     #[test]

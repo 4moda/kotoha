@@ -67,6 +67,13 @@ void test_endpoint_resolution() {
     setenv("TMPDIR", "/var/folders/ab/cd/T/", 1);
     CHECK(resolve_ipc_endpoint() == "/var/folders/ab/cd/T/kotoha-" + uid_str + "/kotoha_v1.sock");
 
+    // A TMPDIR that is not valid UTF-8 is treated as unset (same as the Rust resolver), so both
+    // sides fall back to /tmp instead of diverging on raw bytes.
+    setenv("TMPDIR", "/var/\xff\xfe/T", 1);
+    CHECK(resolve_ipc_endpoint() == "/tmp/kotoha-" + uid_str + "/kotoha_v1.sock");
+    setenv("TMPDIR", "/var/t\xc3\xa9mp", 1);  // valid UTF-8 (e acute) is kept as is
+    CHECK(resolve_ipc_endpoint() == "/var/t\xc3\xa9mp/kotoha-" + uid_str + "/kotoha_v1.sock");
+
     if (had_tmpdir) {
         setenv("TMPDIR", saved_tmpdir.c_str(), 1);
     } else {
