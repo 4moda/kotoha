@@ -5,7 +5,6 @@
 mod common;
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use common::{sample_paraformer_config, sample_zipformer_config};
 use kotoha_core::domain::{ComputeDevice, SttDecodingMethod};
@@ -67,10 +66,6 @@ fn config_validation_provider_mapping_and_decoding_method() {
 
     bad = cfg.clone();
     bad.hotwords_score = f32::INFINITY;
-    assert!(bad.validate().is_err());
-
-    bad = cfg.clone();
-    bad.idle_timeout = Duration::ZERO;
     assert!(bad.validate().is_err());
 
     bad = cfg.clone();

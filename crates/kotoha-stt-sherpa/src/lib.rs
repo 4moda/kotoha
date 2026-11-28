@@ -14,9 +14,9 @@ pub use backend::native::{build_native_config, NativeSherpaBackend};
 pub use backend::{RecognizerBackend, RecognizerHypothesis, RecognizerStreamBackend};
 pub use config::{
     compute_device_to_provider, validate_hotwords_score, SherpaEndpointConfig, SherpaModelFamily,
-    SherpaModelingUnit, SherpaSttConfig, DEFAULT_FEATURE_DIM, DEFAULT_IDLE_TIMEOUT,
-    DEFAULT_MAX_ACTIVE_PATHS, DEFAULT_NUM_THREADS, DEFAULT_RULE1_MIN_TRAILING_SILENCE,
-    DEFAULT_RULE2_MIN_TRAILING_SILENCE, DEFAULT_RULE3_MIN_UTTERANCE_LENGTH, DEFAULT_SAMPLE_RATE,
+    SherpaModelingUnit, SherpaSttConfig, DEFAULT_FEATURE_DIM, DEFAULT_MAX_ACTIVE_PATHS,
+    DEFAULT_NUM_THREADS, DEFAULT_RULE1_MIN_TRAILING_SILENCE, DEFAULT_RULE2_MIN_TRAILING_SILENCE,
+    DEFAULT_RULE3_MIN_UTTERANCE_LENGTH, DEFAULT_SAMPLE_RATE,
 };
 pub use engine::{SherpaSttEngine, SherpaSttStream};
 pub use hotwords::{

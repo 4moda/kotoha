@@ -299,3 +299,173 @@ impl SubtitleSink for FailingSubtitleSink {
         Err(CoreError::Sink("UI detached".to_owned()))
     }
 }
+
+/// How a [`ScriptedSttEngine`] stream misbehaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SttScript {
+    /// Every `accept_audio` blocks the calling thread for the given time (CPU-bound decoder).
+    Slow(Duration),
+    /// The `n`-th `accept_audio` call across all streams panics (once).
+    PanicOnCall(usize),
+    /// `flush` forgets the open utterance and returns nothing (like a reaped backend stream).
+    ForgetOnFlush,
+}
+
+/// STT engine wrapping [`MockSttEngine`] whose streams follow an [`SttScript`].
+pub struct ScriptedSttEngine {
+    pub inner: MockSttEngine,
+    pub script: SttScript,
+    pub calls: Arc<AtomicUsize>,
+    pub streams_created: Arc<AtomicUsize>,
+}
+
+impl ScriptedSttEngine {
+    pub fn new(inner: MockSttEngine, script: SttScript) -> Self {
+        Self {
+            inner,
+            script,
+            calls: Arc::new(AtomicUsize::new(0)),
+            streams_created: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl SttEngine for ScriptedSttEngine {
+    fn name(&self) -> &'static str {
+        "scripted-stt"
+    }
+
+    fn create_stream(
+        &self,
+        speaker_key: SpeakerKey,
+        src_lang: &LanguageCode,
+    ) -> Result<Box<dyn SttStream>, CoreError> {
+        self.streams_created.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(ScriptedSttStream {
+            inner: self.inner.create_stream(speaker_key, src_lang)?,
+            script: self.script,
+            calls: Arc::clone(&self.calls),
+        }))
+    }
+}
+
+struct ScriptedSttStream {
+    inner: Box<dyn SttStream>,
+    script: SttScript,
+    calls: Arc<AtomicUsize>,
+}
+
+impl SttStream for ScriptedSttStream {
+    fn accept_audio(
+        &mut self,
+        samples_16k_mono: &[f32],
+        timestamp_ms: u64,
+    ) -> Result<Vec<TranscriptEvent>, CoreError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        match self.script {
+            SttScript::Slow(delay) => std::thread::sleep(delay),
+            SttScript::PanicOnCall(n) if n == call => panic!("scripted STT panic"),
+            SttScript::PanicOnCall(_) | SttScript::ForgetOnFlush => {}
+        }
+        self.inner.accept_audio(samples_16k_mono, timestamp_ms)
+    }
+
+    fn flush(&mut self, timestamp_ms: u64) -> Result<Vec<TranscriptEvent>, CoreError> {
+        if self.script == SttScript::ForgetOnFlush {
+            return Ok(Vec::new());
+        }
+        self.inner.flush(timestamp_ms)
+    }
+}
+
+/// STT engine whose `create_stream` always fails, counting the attempts.
+#[derive(Default)]
+pub struct UnavailableSttEngine {
+    pub attempts: Arc<AtomicUsize>,
+}
+
+impl SttEngine for UnavailableSttEngine {
+    fn name(&self) -> &'static str {
+        "unavailable-stt"
+    }
+
+    fn create_stream(
+        &self,
+        _speaker_key: SpeakerKey,
+        _src_lang: &LanguageCode,
+    ) -> Result<Box<dyn SttStream>, CoreError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Err(CoreError::Stt("model failed to load".to_owned()))
+    }
+}
+
+/// Translator whose latency depends on the utterance id and which records every request.
+pub struct DelayByUtteranceTranslator {
+    pub delay_for: fn(u64) -> Duration,
+    pub captured_requests: Arc<StdMutex<Vec<TranslationRequest>>>,
+    pub in_flight: Arc<AtomicUsize>,
+    pub peak_in_flight: Arc<AtomicUsize>,
+}
+
+impl DelayByUtteranceTranslator {
+    pub fn new(delay_for: fn(u64) -> Duration) -> Self {
+        Self {
+            delay_for,
+            captured_requests: Arc::new(StdMutex::new(Vec::new())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak_in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+/// Decrements the in-flight counter even when the call is cancelled.
+struct InFlightGuard(Arc<AtomicUsize>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Translator for DelayByUtteranceTranslator {
+    fn provider_id(&self) -> &'static str {
+        "delay-by-utterance"
+    }
+
+    async fn translate(&self, req: TranslationRequest) -> Result<TranslationResult, CoreError> {
+        self.captured_requests
+            .lock()
+            .expect("lock")
+            .push(req.clone());
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_in_flight.fetch_max(now, Ordering::SeqCst);
+        let _guard = InFlightGuard(Arc::clone(&self.in_flight));
+        tokio::time::sleep((self.delay_for)(req.utterance_id.0)).await;
+        Ok(TranslationResult {
+            // Deliberately wrong: the pipeline must correlate by the request's utterance id.
+            utterance_id: kotoha_core::domain::UtteranceId(u64::MAX),
+            original_text: req.text.clone(),
+            translated_text: format!("[ja] {}", req.text),
+            provider_id: "delay-by-utterance".to_owned(),
+            latency_ms: 0,
+        })
+    }
+}
+
+/// Sink recording every entry with the (real) instant it was emitted.
+#[derive(Default)]
+pub struct TimestampingSink {
+    pub entries: StdMutex<Vec<(std::time::Instant, SubtitleEntry)>>,
+}
+
+#[async_trait]
+impl SubtitleSink for TimestampingSink {
+    async fn emit(&self, entry: SubtitleEntry) -> Result<(), CoreError> {
+        self.entries
+            .lock()
+            .expect("lock")
+            .push((std::time::Instant::now(), entry));
+        Ok(())
+    }
+}

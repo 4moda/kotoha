@@ -2,9 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
 
 use kotoha_core::domain::{
     CoreError, LanguageCode, SpeakerKey, SttDecodingMethod, SttEngine, SttHotwordsConfig,
@@ -17,52 +16,14 @@ use crate::hotwords::{HotwordsRegistry, HotwordsSnapshot};
 
 type SharedStreamBackend = Arc<Mutex<Option<Box<dyn RecognizerStreamBackend>>>>;
 
-struct StreamActivityEntry {
-    speaker_key: SpeakerKey,
-    last_activity: Mutex<Instant>,
-    reaped: AtomicBool,
-    backend_stream: SharedStreamBackend,
-}
+/// Registry of live streams (`stream_id -> speaker`), used for introspection only.
+type StreamRegistry = Arc<Mutex<HashMap<u64, SpeakerKey>>>;
 
-impl std::fmt::Debug for StreamActivityEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamActivityEntry")
-            .field("speaker_key", &self.speaker_key)
-            .field("reaped", &self.reaped.load(Ordering::Acquire))
-            .finish_non_exhaustive()
-    }
-}
-
-impl StreamActivityEntry {
-    fn touch(&self, now: Instant) {
-        if let Ok(mut guard) = self.last_activity.lock() {
-            *guard = now;
-        }
-    }
-
-    fn is_idle_at(&self, now: Instant, timeout: std::time::Duration) -> bool {
-        self.last_activity
-            .lock()
-            .is_ok_and(|last| now.saturating_duration_since(*last) >= timeout)
-    }
-
-    fn mark_reaped(&self) {
-        self.reaped.store(true, Ordering::Release);
-    }
-
-    fn is_reaped(&self) -> bool {
-        self.reaped.load(Ordering::Acquire)
-    }
-
-    fn drop_backend_stream(&self) {
-        if let Ok(mut guard) = self.backend_stream.lock() {
-            drop(guard.take());
-        }
-    }
-}
-
-/// `sherpa-onnx` streaming [`SttEngine`] adapter supporting contextual hotwords and idle stream
-/// lifecycle management.
+/// `sherpa-onnx` streaming [`SttEngine`] adapter supporting contextual hotwords.
+///
+/// Stream lifecycle (including the idle timeout) is owned by the pipeline: each
+/// `PipelineService` speaker worker flushes and drops its stream after
+/// `PipelineConfig::speaker_idle_timeout`, so the engine does not reap streams itself.
 pub struct SherpaSttEngine {
     base_config: SherpaSttConfig,
     supports_hotwords: bool,
@@ -71,7 +32,7 @@ pub struct SherpaSttEngine {
     hotwords: Arc<HotwordsRegistry>,
     next_utterance_id: Arc<AtomicU64>,
     next_stream_id: AtomicU64,
-    active_streams: Arc<Mutex<HashMap<u64, Arc<StreamActivityEntry>>>>,
+    active_streams: StreamRegistry,
 }
 
 impl std::fmt::Debug for SherpaSttEngine {
@@ -200,58 +161,8 @@ impl SherpaSttEngine {
     pub fn active_speakers(&self) -> Vec<SpeakerKey> {
         self.active_streams.lock().map_or_else(
             |_| Vec::new(),
-            |streams| streams.values().map(|e| e.speaker_key.clone()).collect(),
+            |streams| streams.values().cloned().collect(),
         )
-    }
-
-    /// Reaps any tracked streams whose last activity exceeds [`SherpaSttConfig::idle_timeout`].
-    ///
-    /// Expired streams are removed from tracking and their underlying `RecognizerStreamBackend`
-    /// is immediately dropped outside the map lock. Returns the number of streams reaped.
-    pub fn reap_idle_streams(&self) -> Result<usize, CoreError> {
-        self.reap_idle_streams_at(Instant::now())
-    }
-
-    /// Reaps streams idle relative to `now` (deterministic helper for tests).
-    pub fn reap_idle_streams_at(&self, now: Instant) -> Result<usize, CoreError> {
-        let timeout = self.config()?.idle_timeout;
-        let expired_entries = {
-            let mut streams = self
-                .active_streams
-                .lock()
-                .map_err(|_| CoreError::Stt("active stream registry lock poisoned".to_owned()))?;
-            let idle_ids: Vec<u64> = streams
-                .iter()
-                .filter_map(|(&id, entry)| entry.is_idle_at(now, timeout).then_some(id))
-                .collect();
-            let mut expired = Vec::with_capacity(idle_ids.len());
-            for id in idle_ids {
-                if let Some(entry) = streams.remove(&id) {
-                    entry.mark_reaped();
-                    expired.push(entry);
-                }
-            }
-            drop(streams);
-            expired
-        };
-
-        let reaped_count = expired_entries.len();
-        for entry in expired_entries {
-            entry.drop_backend_stream();
-        }
-        Ok(reaped_count)
-    }
-
-    /// Backdates a tracked stream's last-activity timestamp for deterministic idle-timeout tests.
-    #[doc(hidden)]
-    pub fn set_stream_last_activity_for_test(&self, speaker_key: &SpeakerKey, instant: Instant) {
-        if let Ok(streams) = self.active_streams.lock() {
-            for entry in streams.values() {
-                if &entry.speaker_key == speaker_key {
-                    entry.touch(instant);
-                }
-            }
-        }
     }
 
     /// Creates a concrete [`SherpaSttStream`] directly (convenience wrapper over
@@ -266,18 +177,12 @@ impl SherpaSttEngine {
         let backend_stream: SharedStreamBackend = Arc::new(Mutex::new(Some(inner)));
 
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
-        let activity = Arc::new(StreamActivityEntry {
-            speaker_key: speaker_key.clone(),
-            last_activity: Mutex::new(Instant::now()),
-            reaped: AtomicBool::new(false),
-            backend_stream: Arc::clone(&backend_stream),
-        });
         {
             let mut streams = self
                 .active_streams
                 .lock()
                 .map_err(|_| CoreError::Stt("active stream registry lock poisoned".to_owned()))?;
-            streams.insert(stream_id, Arc::clone(&activity));
+            streams.insert(stream_id, speaker_key.clone());
         }
 
         Ok(SherpaSttStream {
@@ -291,7 +196,6 @@ impl SherpaSttEngine {
             next_utterance_id: Arc::clone(&self.next_utterance_id),
             active_utterance: None,
             last_interim_text: String::new(),
-            activity,
             active_streams: Arc::clone(&self.active_streams),
         })
     }
@@ -360,8 +264,7 @@ pub struct SherpaSttStream {
     next_utterance_id: Arc<AtomicU64>,
     active_utterance: Option<UtteranceId>,
     last_interim_text: String,
-    activity: Arc<StreamActivityEntry>,
-    active_streams: Arc<Mutex<HashMap<u64, Arc<StreamActivityEntry>>>>,
+    active_streams: StreamRegistry,
 }
 
 impl SherpaSttStream {
@@ -375,12 +278,6 @@ impl SherpaSttStream {
     #[must_use]
     pub const fn hotwords_generation(&self) -> u64 {
         self.hotwords_generation
-    }
-
-    /// Returns `true` if this stream has been reaped by [`SherpaSttEngine::reap_idle_streams`].
-    #[must_use]
-    pub fn is_reaped(&self) -> bool {
-        self.activity.is_reaped()
     }
 
     /// Convenience wrapper over [`SttStream::accept_audio`] with a caller-supplied timestamp (or `0`
@@ -403,17 +300,6 @@ impl SherpaSttStream {
     }
 
     fn ensure_active_stream(&mut self) -> Result<(), CoreError> {
-        if self.activity.is_reaped() {
-            if let Ok(mut guard) = self.backend_stream.lock() {
-                drop(guard.take());
-            }
-            self.clear_utterance_state();
-            self.activity.reaped.store(false, Ordering::Release);
-            if let Ok(mut streams) = self.active_streams.lock() {
-                streams.insert(self.stream_id, Arc::clone(&self.activity));
-            }
-        }
-
         let needs_rebuild = {
             let guard = self
                 .backend_stream
@@ -479,8 +365,6 @@ impl SttStream for SherpaSttStream {
         samples_16k_mono: &[f32],
         timestamp_ms: u64,
     ) -> Result<Vec<TranscriptEvent>, CoreError> {
-        self.activity.touch(Instant::now());
-
         if samples_16k_mono.is_empty() {
             return Ok(Vec::new());
         }
@@ -566,14 +450,6 @@ impl SttStream for SherpaSttStream {
     }
 
     fn flush(&mut self, timestamp_ms: u64) -> Result<Vec<TranscriptEvent>, CoreError> {
-        if self.activity.is_reaped() {
-            self.drop_backend_stream()?;
-            self.clear_utterance_state();
-            return Ok(Vec::new());
-        }
-
-        self.activity.touch(Instant::now());
-
         let flushed_text = {
             let mut guard = self
                 .backend_stream

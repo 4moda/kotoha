@@ -6,7 +6,6 @@ mod common;
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use common::{
     generate_speech_burst_wav_fixture, sample_zipformer_config, unique_temp_dir,
@@ -277,43 +276,25 @@ fn dynamic_hotwords_update_generation_reversibility_and_transactional_rollback()
 }
 
 #[test]
-fn idle_stream_reaping_drops_backend_immediately_and_cleans_on_drop() {
-    let mut cfg = sample_zipformer_config();
-    cfg.idle_timeout = Duration::from_secs(30);
-
+fn dropping_a_stream_releases_backend_and_registry_entry() {
+    // Idle timeouts are owned by the pipeline (it flushes and drops the stream); the engine only
+    // has to release resources promptly when a stream is dropped.
     let backend = Arc::new(MockRecognizerBackend::new(0.05, 2));
-    let engine = SherpaSttEngine::with_backend(cfg, backend.clone()).unwrap();
+    let engine = SherpaSttEngine::with_backend(sample_zipformer_config(), backend.clone()).unwrap();
 
-    let spk_idle = SpeakerKey::new("mumble", 10);
-    let spk_active = SpeakerKey::new("mumble", 11);
-    let mut stream_idle = engine.create_typed_stream(spk_idle.clone()).unwrap();
-    let stream_active = engine.create_typed_stream(spk_active).unwrap();
+    let spk_a = SpeakerKey::new("mumble", 10);
+    let spk_b = SpeakerKey::new("mumble", 11);
+    let stream_a = engine.create_typed_stream(spk_a).unwrap();
+    let stream_b = engine.create_typed_stream(spk_b.clone()).unwrap();
     assert_eq!(engine.active_stream_count(), 2);
     assert_eq!(backend.live_stream_count(), 2);
 
-    let now = Instant::now();
-    engine.set_stream_last_activity_for_test(
-        &spk_idle,
-        now.checked_sub(Duration::from_secs(31))
-            .expect("instant sub"),
-    );
-
-    let reaped = engine.reap_idle_streams_at(now).unwrap();
-    assert_eq!(reaped, 1);
-    assert!(stream_idle.is_reaped());
-    assert!(!stream_active.is_reaped());
+    drop(stream_a);
     assert_eq!(engine.active_stream_count(), 1);
-    // Underlying backend stream MUST be dropped immediately on reap, before dropping `stream_idle`!
+    assert_eq!(engine.active_speakers(), vec![spk_b]);
     assert_eq!(backend.live_stream_count(), 1);
 
-    // If reaped stream receives new audio later, it recovers cleanly with a fresh stream
-    let recovered = stream_idle.push_audio(&vec![0.3_f32; 1_600], 500).unwrap();
-    assert_eq!(recovered.len(), 1);
-    assert_eq!(engine.active_stream_count(), 2);
-    assert_eq!(backend.live_stream_count(), 2);
-
-    drop(stream_idle);
-    drop(stream_active);
+    drop(stream_b);
     assert_eq!(engine.active_stream_count(), 0);
     assert_eq!(backend.live_stream_count(), 0);
 }
@@ -408,55 +389,40 @@ async fn full_pipeline_integration_three_stage_subtitles_and_glossary_hotwords()
     assert_eq!(sample_rate, 16_000);
 
     let spk = SpeakerKey::new("mumble", 7);
-    let mut tasks = tokio::task::JoinSet::new();
-
-    pipeline
-        .process_event(
-            AudioInputEvent::SourceConnected {
-                conn_id: 1,
-                source: "mumble".to_owned(),
-                plugin_version: "0.1.0".to_owned(),
-            },
-            &mut tasks,
-        )
-        .await
-        .unwrap();
-    pipeline
-        .process_event(
-            AudioInputEvent::UserInfoUpdated {
-                conn_id: 1,
-                speaker_key: spk.clone(),
-                name: "FleetCommander".to_owned(),
-            },
-            &mut tasks,
-        )
-        .await
-        .unwrap();
-
+    let mut events = vec![
+        AudioInputEvent::SourceConnected {
+            conn_id: 1,
+            source: "mumble".to_owned(),
+            plugin_version: "0.1.0".to_owned(),
+        },
+        AudioInputEvent::UserInfoUpdated {
+            conn_id: 1,
+            speaker_key: spk.clone(),
+            name: "FleetCommander".to_owned(),
+        },
+    ];
     // Feed first two 100ms speech chunks from WAV fixture -> Interim (1) then Final + Translated (2)
     for (seq, chunk) in wav_samples[..3_200].chunks(1_600).enumerate() {
-        pipeline
-            .process_event(
-                AudioInputEvent::AudioFrame {
-                    conn_id: 1,
-                    chunk: AudioChunk {
-                        speaker_key: spk.clone(),
-                        seq: u32::try_from(seq).unwrap(),
-                        sample_rate: 16_000,
-                        channels: 1,
-                        is_local_user: false,
-                        samples: chunk.to_vec(),
-                    },
-                },
-                &mut tasks,
-            )
-            .await
-            .unwrap();
+        events.push(AudioInputEvent::AudioFrame {
+            conn_id: 1,
+            chunk: AudioChunk {
+                speaker_key: spk.clone(),
+                seq: u32::try_from(seq).unwrap(),
+                sample_rate: 16_000,
+                channels: 1,
+                is_local_user: false,
+                samples: chunk.to_vec(),
+            },
+        });
     }
 
-    while let Some(res) = tasks.join_next().await {
-        res.unwrap().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let pipeline_task = tokio::spawn(async move { pipeline.run(rx).await });
+    for event in events {
+        tx.send(event).await.unwrap();
     }
+    drop(tx);
+    pipeline_task.await.unwrap().unwrap();
 
     let entries = sink.entries().await;
     assert_eq!(entries.len(), 3, "expected 3-stage subtitle lifecycle");

@@ -9,7 +9,6 @@ use kotoha_core::domain::{AudioInputEvent, CoreError, SubtitleEntry, SubtitleSin
 use kotoha_core::infrastructure::{AudioPreprocessor, IpcServerAdapter, MockSttEngine};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinSet;
 
 pub use crate::state::EVENT_OVERLAY_STYLE_CHANGED;
 use crate::state::{
@@ -254,12 +253,9 @@ async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
 
 async fn run_pipeline_with_rx(
     pipeline: &mut PipelineService,
-    mut rx: mpsc::Receiver<AudioInputEvent>,
+    rx: mpsc::Receiver<AudioInputEvent>,
 ) {
-    let mut translation_tasks = JoinSet::new();
-    while let Some(event) = rx.recv().await {
-        let _ = pipeline.process_event(event, &mut translation_tasks).await;
-        while let Some(_res) = translation_tasks.try_join_next() {}
-    }
-    while let Some(_res) = translation_tasks.join_next().await {}
+    // `run` owns the per-speaker STT workers and the bounded translation queue, and recovers
+    // from every non-fatal error itself.
+    let _ = pipeline.run(rx).await;
 }
