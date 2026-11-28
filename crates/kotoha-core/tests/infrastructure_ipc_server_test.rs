@@ -200,6 +200,7 @@ mod config {
         for (name, bad, field) in [
             (ENV_IPC_HELLO_TIMEOUT_MS, "0", "hello_timeout"),
             (ENV_IPC_IDLE_TIMEOUT_MS, "0", "idle_timeout"),
+            (ENV_IPC_IDLE_TIMEOUT_MS, "1999", "idle_timeout"),
             (ENV_IPC_IDLE_TIMEOUT_MS, "3600001", "idle_timeout"),
             (ENV_IPC_MAX_CONNECTIONS, "0", "max_connections"),
             (ENV_IPC_MAX_CONNECTIONS, "4097", "max_connections"),
@@ -214,6 +215,8 @@ mod config {
             (ENV_IPC_MAX_CONNECTIONS, "4096"),
         ])
         .unwrap();
+        // The idle minimum is twice the plugin heartbeat interval (1000 ms).
+        parse(&[(ENV_IPC_IDLE_TIMEOUT_MS, "2000")]).unwrap();
     }
 
     #[test]
@@ -229,6 +232,28 @@ mod config {
             ..IpcServerConfig::default()
         };
         assert!(no_slots.validate().is_err());
+        let below_heartbeat = IpcServerConfig {
+            idle_timeout: Duration::from_millis(1999),
+            ..IpcServerConfig::default()
+        };
+        assert!(below_heartbeat.validate().is_err());
+    }
+
+    #[test]
+    fn adapter_constructors_validate_the_config() {
+        use kotoha_core::infrastructure::IpcServerAdapter;
+        let bad = IpcServerConfig {
+            max_connections: 0,
+            ..IpcServerConfig::default()
+        };
+        assert!(IpcServerAdapter::with_config("/tmp/x.sock", bad).is_err());
+        assert!(IpcServerAdapter::from_env_with_config(bad).is_err());
+        let short_idle = IpcServerConfig {
+            idle_timeout: Duration::from_millis(500),
+            ..IpcServerConfig::default()
+        };
+        assert!(IpcServerAdapter::with_config("/tmp/x.sock", short_idle).is_err());
+        assert!(IpcServerAdapter::with_config("/tmp/x.sock", IpcServerConfig::default()).is_ok());
     }
 }
 
@@ -265,7 +290,8 @@ mod liveness {
 
         async fn start_with_capacity(tag: &str, config: IpcServerConfig, capacity: usize) -> Self {
             let endpoint = super::common::test_endpoint(&format!("live_{tag}"));
-            let server = IpcServerAdapter::with_config(endpoint.clone(), config);
+            // Unchecked: these tests deliberately use idle timeouts below the production minimum.
+            let server = IpcServerAdapter::with_config_unchecked(endpoint.clone(), config);
             let (tx, events) = mpsc::channel(capacity);
             let (shutdown, shutdown_rx) = watch::channel(false);
             let (ready_tx, ready_rx) = oneshot::channel();
@@ -569,11 +595,92 @@ mod liveness {
     }
 
     #[tokio::test]
+    async fn panicking_diagnostics_hook_does_not_skip_disconnect_cleanup() {
+        let endpoint = super::common::test_endpoint("live_panic_close");
+        let server =
+            IpcServerAdapter::with_config_unchecked(endpoint.clone(), config(1000, 5000, 4))
+                .with_diagnostics(|_| panic!("hook panic"));
+        let (tx, mut events) = mpsc::channel(64);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            server
+                .run(tx, shutdown_rx, Some(ready_tx))
+                .await
+                .expect("server run");
+        });
+        ready_rx.await.expect("ready");
+
+        let mut client = connect_local_socket(&endpoint).await.expect("client");
+        client.write_all(&hello("mumble")).await.expect("hello");
+        assert!(matches!(
+            events.recv().await.expect("SourceConnected"),
+            AudioInputEvent::SourceConnected { .. }
+        ));
+        drop(client);
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("SourceDisconnected within 1s")
+            .expect("event channel open");
+        assert!(matches!(event, AudioInputEvent::SourceDisconnected { .. }));
+
+        // The owner registry was cleaned up: the same source can reconnect and is not superseded.
+        let mut again = connect_local_socket(&endpoint).await.expect("again");
+        again.write_all(&hello("mumble")).await.expect("hello");
+        assert!(matches!(
+            events.recv().await.expect("SourceConnected"),
+            AudioInputEvent::SourceConnected { .. }
+        ));
+
+        let _ = shutdown.send(true);
+        task.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn panicking_hook_on_refused_connection_does_not_stop_the_server() {
+        let endpoint = super::common::test_endpoint("live_panic_refuse");
+        let server =
+            IpcServerAdapter::with_config_unchecked(endpoint.clone(), config(5000, 5000, 1))
+                .with_diagnostics(|d| {
+                    if matches!(d, IpcDiagnostic::ConnectionRefused { .. }) {
+                        panic!("hook panic");
+                    }
+                });
+        let (tx, mut events) = mpsc::channel(64);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = tokio::spawn(async move { server.run(tx, shutdown_rx, Some(ready_tx)).await });
+        ready_rx.await.expect("ready");
+
+        let mut first = connect_local_socket(&endpoint).await.expect("first");
+        first.write_all(&hello("mumble")).await.expect("hello");
+        let _ = events.recv().await.expect("SourceConnected");
+        // Over the limit: refused, and the panicking hook must not kill the accept loop.
+        let mut refused = connect_local_socket(&endpoint).await.expect("refused");
+        expect_closed(&mut refused, Duration::from_secs(5)).await;
+        assert!(!task.is_finished(), "server stopped after hook panic");
+
+        // The server still accepts after a slot frees up.
+        drop(first);
+        let _ = events.recv().await.expect("SourceDisconnected");
+        let mut second = connect_local_socket(&endpoint).await.expect("second");
+        second.write_all(&hello("ts3")).await.expect("hello");
+        assert!(matches!(
+            events.recv().await.expect("SourceConnected"),
+            AudioInputEvent::SourceConnected { .. }
+        ));
+
+        let _ = shutdown.send(true);
+        task.await.expect("task").expect("server run");
+    }
+
+    #[tokio::test]
     async fn closed_and_refused_connections_are_reported_to_the_diagnostics_hook() {
         let endpoint = super::common::test_endpoint("live_diag");
         let log: Arc<Mutex<Vec<IpcDiagnostic>>> = Arc::default();
         let sink = Arc::clone(&log);
         let server = IpcServerAdapter::with_config(endpoint.clone(), config(1000, 5000, 2))
+            .unwrap()
             .with_diagnostics(move |d| sink.lock().unwrap().push(d.clone()));
         let (tx, mut events) = mpsc::channel(64);
         let (shutdown, shutdown_rx) = watch::channel(false);
@@ -1037,7 +1144,8 @@ mod endpoint_security {
             IpcServerAdapter::from_env_with_config(kotoha_core::infrastructure::IpcServerConfig {
                 max_connections: 3,
                 ..Default::default()
-            });
+            })
+            .unwrap();
         assert_eq!(cfg_server.endpoint(), resolved.endpoint);
         assert_eq!(
             cfg_server
@@ -1056,8 +1164,9 @@ mod endpoint_security {
             max_connections: 2,
             ..Default::default()
         };
-        let server =
-            IpcServerAdapter::with_config(endpoint_str(&endpoint), config).with_private_dir(&dir);
+        let server = IpcServerAdapter::with_config(endpoint_str(&endpoint), config)
+            .unwrap()
+            .with_private_dir(&dir);
         assert_eq!(server.private_dir(), Some(dir.as_path()));
 
         let running = start(server)

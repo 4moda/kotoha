@@ -71,21 +71,30 @@ pub const ENV_IPC_MAX_CONNECTIONS: &str = "KOTOHA_IPC_MAX_CONNECTIONS";
 pub const MAX_TIMEOUT_MS: u64 = 3_600_000;
 /// Largest accepted `max_connections`.
 pub const MAX_CONNECTIONS_LIMIT: usize = 4096;
+/// Interval at which the C++ plugin sends `Heartbeat` frames (milliseconds, `DESIGN.md` Section 3.2).
+pub const PLUGIN_HEARTBEAT_INTERVAL_MS: u64 = 1000;
+/// Smallest accepted `idle_timeout` (milliseconds): twice the plugin heartbeat interval, so a
+/// single late or lost heartbeat does not disconnect a healthy plugin.
+pub const MIN_IDLE_TIMEOUT_MS: u64 = 2 * PLUGIN_HEARTBEAT_INTERVAL_MS;
 
 impl IpcServerConfig {
-    /// Checks that every limit is inside its accepted range: both timeouts must be between 1 ms
-    /// and [`MAX_TIMEOUT_MS`], and `max_connections` between 1 and [`MAX_CONNECTIONS_LIMIT`].
+    /// Checks that every limit is inside its accepted range: `hello_timeout` must be between 1 ms
+    /// and [`MAX_TIMEOUT_MS`], `idle_timeout` between [`MIN_IDLE_TIMEOUT_MS`] (twice the plugin
+    /// heartbeat interval) and [`MAX_TIMEOUT_MS`], and `max_connections` between 1 and
+    /// [`MAX_CONNECTIONS_LIMIT`].
     ///
     /// # Errors
     /// Returns [`CoreError::Ipc`] (`invalid IPC server config: ...`) naming the first offending field.
     pub fn validate(&self) -> Result<(), CoreError> {
-        for (name, value) in [
-            ("hello_timeout", self.hello_timeout),
-            ("idle_timeout", self.idle_timeout),
+        for (name, value, min_ms) in [
+            ("hello_timeout", self.hello_timeout, 1),
+            ("idle_timeout", self.idle_timeout, MIN_IDLE_TIMEOUT_MS),
         ] {
-            if value.is_zero() || value > Duration::from_millis(MAX_TIMEOUT_MS) {
+            if value < Duration::from_millis(min_ms)
+                || value > Duration::from_millis(MAX_TIMEOUT_MS)
+            {
                 return Err(invalid_config(&format!(
-                    "{name} must be between 1 and {MAX_TIMEOUT_MS} ms (got {} ms)",
+                    "{name} must be between {min_ms} and {MAX_TIMEOUT_MS} ms (got {} ms)",
                     value.as_millis()
                 )));
             }
@@ -211,7 +220,8 @@ impl std::fmt::Display for IpcDiagnostic {
     }
 }
 
-/// Callback receiving [`IpcDiagnostic`]s. It runs on the server tasks, so it must not block.
+/// Callback receiving [`IpcDiagnostic`]s. It runs on the server tasks, so it must neither block
+/// nor panic (a panic is caught and ignored, but the diagnostic is lost).
 #[derive(Clone)]
 struct DiagnosticsHook(Arc<dyn Fn(&IpcDiagnostic) + Send + Sync>);
 
@@ -221,10 +231,12 @@ impl std::fmt::Debug for DiagnosticsHook {
     }
 }
 
-fn report(hook: Option<&DiagnosticsHook>, diagnostic: &IpcDiagnostic) {
-    if let Some(hook) = hook {
-        (hook.0)(diagnostic);
-    }
+/// Invokes the hook, containing any panic so a faulty callback can neither kill the accept loop
+/// nor skip connection cleanup. Returns `false` if the hook panicked.
+fn report(hook: Option<&DiagnosticsHook>, diagnostic: &IpcDiagnostic) -> bool {
+    hook.is_none_or(|hook| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (hook.0)(diagnostic))).is_ok()
+    })
 }
 
 /// `source -> (conn_id, cancel)` for the connection that currently owns each source.
@@ -250,12 +262,28 @@ impl IpcServerAdapter {
     /// Creates an [`IpcServerAdapter`] bound to `endpoint`.
     #[must_use]
     pub fn new(endpoint: impl Into<String>) -> Self {
-        Self::with_config(endpoint, IpcServerConfig::default())
+        Self::with_config_unchecked(endpoint, IpcServerConfig::default())
     }
 
-    /// Creates an [`IpcServerAdapter`] bound to `endpoint` with explicit liveness limits.
+    /// Creates an [`IpcServerAdapter`] bound to `endpoint` with explicit liveness limits, after
+    /// [`IpcServerConfig::validate`]-ing them.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Ipc`] if `config` is out of range.
+    pub fn with_config(
+        endpoint: impl Into<String>,
+        config: IpcServerConfig,
+    ) -> Result<Self, CoreError> {
+        config.validate()?;
+        Ok(Self::with_config_unchecked(endpoint, config))
+    }
+
+    /// Like [`IpcServerAdapter::with_config`] but skips validation. Only for tests that need
+    /// limits below the production minimums (e.g. an `idle_timeout` under
+    /// [`MIN_IDLE_TIMEOUT_MS`]); not part of the supported API.
+    #[doc(hidden)]
     #[must_use]
-    pub fn with_config(endpoint: impl Into<String>, config: IpcServerConfig) -> Self {
+    pub fn with_config_unchecked(endpoint: impl Into<String>, config: IpcServerConfig) -> Self {
         Self {
             endpoint: endpoint.into(),
             private_dir: None,
@@ -272,7 +300,9 @@ impl IpcServerAdapter {
     ///
     /// The workspace has no logging framework, so reasons are reported through this hook instead
     /// of a hard dependency on one (a `tracing` subscriber can be bridged here). The callback
-    /// runs on the server tasks and must not block.
+    /// runs on the server tasks and must not block or panic: it is invoked after the
+    /// connection's cleanup, and a panic is caught and discarded so it cannot take down the
+    /// server, but it blocks the task it runs on.
     #[must_use]
     pub fn with_diagnostics(
         mut self,
@@ -289,18 +319,26 @@ impl IpcServerAdapter {
     /// [`IpcServerAdapter::with_private_dir`].
     #[must_use]
     pub fn from_env() -> Self {
-        Self::from_env_with_config(IpcServerConfig::default())
-    }
-
-    /// Like [`IpcServerAdapter::from_env`], but with explicit liveness limits.
-    #[must_use]
-    pub fn from_env_with_config(config: IpcServerConfig) -> Self {
         let resolved = resolve_endpoint_details();
-        let server = Self::with_config(resolved.endpoint, config);
+        let server = Self::with_config_unchecked(resolved.endpoint, IpcServerConfig::default());
         match resolved.private_dir {
             Some(dir) => server.with_private_dir(dir),
             None => server,
         }
+    }
+
+    /// Like [`IpcServerAdapter::from_env`], but with explicit (validated) liveness limits.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Ipc`] if `config` is out of range.
+    pub fn from_env_with_config(config: IpcServerConfig) -> Result<Self, CoreError> {
+        config.validate()?;
+        let resolved = resolve_endpoint_details();
+        let server = Self::with_config_unchecked(resolved.endpoint, config);
+        Ok(match resolved.private_dir {
+            Some(dir) => server.with_private_dir(dir),
+            None => server,
+        })
     }
 
     /// Marks `dir` as the per-user private directory that must contain the endpoint (Unix only;
@@ -370,7 +408,8 @@ impl IpcServerAdapter {
                             if client_tasks.len() >= self.config.max_connections {
                                 // Over capacity: drop the new connection immediately.
                                 drop(stream);
-                                report(
+                                // A panicking hook is contained by `report`; the loop goes on.
+                                let _ = report(
                                     self.diagnostics.as_ref(),
                                     &IpcDiagnostic::ConnectionRefused {
                                         active: client_tasks.len(),
@@ -793,15 +832,7 @@ async fn handle_connection(
         }
     };
 
-    report(
-        diagnostics.as_ref(),
-        &IpcDiagnostic::ConnectionClosed {
-            conn_id,
-            source: source_name.clone(),
-            reason: reason.clone(),
-        },
-    );
-
+    let closed_source = source_name.clone();
     if let Some(source) = source_name {
         {
             let mut map = owners
@@ -815,10 +846,20 @@ async fn handle_connection(
             .send(AudioInputEvent::SourceDisconnected {
                 conn_id,
                 source,
-                reason,
+                reason: reason.clone(),
             })
             .await;
     }
+
+    // Reported last: cleanup above must never depend on the (possibly faulty) hook.
+    let _ = report(
+        diagnostics.as_ref(),
+        &IpcDiagnostic::ConnectionClosed {
+            conn_id,
+            source: closed_source,
+            reason,
+        },
+    );
 }
 
 /// Makes `conn_id` the owner of `source`, cancels the previous owner and enqueues
