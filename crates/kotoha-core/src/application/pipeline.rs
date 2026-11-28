@@ -75,6 +75,15 @@
 //! call stuck on the blocking pool) is abandoned: its task is aborted (a blocking call keeps its
 //! thread until it returns) and `run()` returns `Ok(())`.
 //!
+//! A timed-out shutdown still resolves every final card: before anything is aborted, the
+//! dispatcher reports each final that has not resolved yet (queued, in flight, or still in the
+//! job channel) as [`SubtitleStage::TranslationFailed`] with [`TRANSLATION_SKIPPED_REASON`],
+//! under the source gate, so a reset source is never revived and no final resolves twice. This
+//! happens even when the final's own `translation_deadline` has not passed yet (the deadline is
+//! counted from finalization, which can be late in the drain). The reports are given a short
+//! grace period after the timeout; only a sink that hangs past it can lose them. Timeouts are
+//! counted in [`PipelineStats::shutdown_timeouts`].
+//!
 //! Whenever a stream is dropped while an utterance is still open (idle timeout, STT error or
 //! panic), the last interim text is emitted as the utterance's final card so that no card stays
 //! stuck in [`SubtitleStage::Interim`].
@@ -99,7 +108,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc::{self, error::TrySendError};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use tokio::task::{AbortHandle, JoinError, JoinSet};
 use tokio::time::Instant;
 
@@ -132,6 +141,9 @@ const MAX_STT_BATCH: usize = 32;
 const CREATE_STREAM_BACKOFF_INITIAL: Duration = Duration::from_millis(100);
 /// Upper bound of the `create_stream` retry delay.
 const CREATE_STREAM_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// How long [`PipelineService::run`] waits, after [`PipelineConfig::shutdown_timeout`], for the
+/// dispatcher to report its unfinished finals as skipped before abandoning it.
+const SHUTDOWN_RESOLVE_GRACE: Duration = Duration::from_secs(1);
 
 /// Configuration for [`PipelineService`].
 #[derive(Debug, Clone)]
@@ -159,8 +171,10 @@ pub struct PipelineConfig {
     pub speaker_queue_capacity: usize,
     /// Upper bound on how long [`PipelineService::run`] waits, after its input channel closes,
     /// for workers and queued translations to drain. Work still running afterwards (e.g. a hung
-    /// adapter) is abandoned. Keep it above `translation_deadline` so that a normal drain is
-    /// never cut short.
+    /// adapter) is abandoned, and every final not translated yet is reported with
+    /// [`TRANSLATION_SKIPPED_REASON`] (`run()` gives those reports a further grace period of
+    /// about a second). Keep it above `translation_deadline` so that a normal drain is rarely cut
+    /// short.
     pub shutdown_timeout: Duration,
 }
 
@@ -211,6 +225,10 @@ pub struct PipelineStats {
     pub sink_errors: u64,
     /// Contained panics (translator, STT, resample, sink, or task panics).
     pub task_panics: u64,
+    /// Times [`PipelineService::run`] hit [`PipelineConfig::shutdown_timeout`] while draining.
+    /// The finals still waiting for translation at that point are reported with
+    /// [`TRANSLATION_SKIPPED_REASON`] (and counted in `translations_skipped`).
+    pub shutdown_timeouts: u64,
     /// Gauge: finals currently queued or being translated.
     pub pending_translations: u64,
     /// High-water mark of `pending_translations`.
@@ -231,6 +249,7 @@ struct StatsCounters {
     synthesized_finals: AtomicU64,
     sink_errors: AtomicU64,
     task_panics: AtomicU64,
+    shutdown_timeouts: AtomicU64,
     pending_translations: AtomicU64,
     peak_pending_translations: AtomicU64,
     active_speaker_workers: AtomicU64,
@@ -260,6 +279,7 @@ impl PipelineStatsHandle {
             synthesized_finals: load(&c.synthesized_finals),
             sink_errors: load(&c.sink_errors),
             task_panics: load(&c.task_panics),
+            shutdown_timeouts: load(&c.shutdown_timeouts),
             pending_translations: load(&c.pending_translations),
             peak_pending_translations: load(&c.peak_pending_translations),
             active_speaker_workers: load(&c.active_speaker_workers),
@@ -309,6 +329,10 @@ impl PipelineStatsHandle {
 
     fn task_panic(&self) {
         Self::incr(&self.0.task_panics);
+    }
+
+    fn shutdown_timeout(&self) {
+        Self::incr(&self.0.shutdown_timeouts);
     }
 
     fn set_pending_translations(&self, pending: usize) {
@@ -378,6 +402,11 @@ impl SourceGate {
         let seq = self.next_seq;
         self.next_seq += 1;
         seq
+    }
+
+    /// Returns `true` once the outcome of final `seq` has been recorded with [`Self::complete`].
+    fn is_resolved(&self, seq: u64) -> bool {
+        seq < self.next_commit || self.completed.contains_key(&seq)
     }
 
     /// Records the outcome of final `seq` and appends every turn that is now in order.
@@ -574,7 +603,8 @@ impl PipelineService {
     /// On close, every speaker worker processes its queued audio, flushes and finalizes its
     /// stream, and every queued final is translated (or skipped at its deadline) before this
     /// returns. That drain is bounded by [`PipelineConfig::shutdown_timeout`]: work still running
-    /// when it expires (a hung adapter) is abandoned and this returns anyway.
+    /// when it expires (a hung adapter) is abandoned and this returns anyway, after reporting
+    /// every final not resolved yet as skipped ([`PipelineStats::shutdown_timeouts`]).
     ///
     /// Returns `Ok(())` when the input channel closes. Every adapter error and panic is recovered
     /// from (see the module docs); `Err` is reserved for [`ErrorScope::Fatal`] pipeline
@@ -589,7 +619,8 @@ impl PipelineService {
             max_pending: self.config.max_pending_translations.max(1),
             deadline: self.config.translation_deadline,
         };
-        let dispatcher_task = tokio::spawn(dispatcher.run(job_rx));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let dispatcher_task = tokio::spawn(dispatcher.run(job_rx, shutdown_rx));
 
         let mut state = RunState {
             deps: Arc::new(WorkerDeps {
@@ -637,22 +668,39 @@ impl PipelineService {
         let mut dispatcher_task = dispatcher_task;
         let dispatcher_done = workers_done
             && match tokio::time::timeout_at(shutdown_deadline, &mut dispatcher_task).await {
-                Ok(Err(err)) => {
-                    if err.is_panic() {
-                        self.stats.task_panic();
-                        tracing::error!("translation dispatcher panicked");
-                    }
+                Ok(res) => {
+                    self.on_dispatcher_exit(res);
                     true
                 }
-                Ok(Ok(())) => true,
                 Err(_elapsed) => false,
             };
         if !dispatcher_done {
-            dispatcher_task.abort();
-            tracing::warn!("pipeline shutdown timed out; abandoning unfinished workers");
+            // Whatever is still unfinished (a hung adapter, or finals whose deadline lies past
+            // the shutdown deadline) is abandoned, but no final card may stay pending: the
+            // dispatcher reports every job that has not resolved yet as skipped, then stops.
+            self.stats.shutdown_timeout();
+            tracing::warn!("pipeline shutdown timed out; skipping unfinished translations");
+            // An `Err` means the dispatcher has already stopped; the wait below then returns.
+            let _ = shutdown_tx.send(());
+            match tokio::time::timeout(SHUTDOWN_RESOLVE_GRACE, &mut dispatcher_task).await {
+                Ok(res) => self.on_dispatcher_exit(res),
+                Err(_elapsed) => {
+                    dispatcher_task.abort();
+                    tracing::warn!("translation dispatcher did not stop in time; abandoning it");
+                }
+            }
         }
         self.stats.set_active_speaker_workers(0);
         Ok(())
+    }
+
+    fn on_dispatcher_exit(&self, res: Result<(), JoinError>) {
+        if let Err(err) = res {
+            if err.is_panic() {
+                self.stats.task_panic();
+                tracing::error!("translation dispatcher panicked");
+            }
+        }
     }
 
     async fn route_event(&mut self, event: AudioInputEvent, state: &mut RunState) {
@@ -1323,6 +1371,7 @@ impl SpeakerWorker {
 }
 
 /// One finalized utterance waiting for translation.
+#[derive(Clone)]
 struct TranslationJob {
     source: Arc<SourceShared>,
     epoch: u64,
@@ -1348,13 +1397,6 @@ enum JobOutcome {
     Skipped,
 }
 
-/// Identifies an in-flight job so that its commit slot is released even if its task panics.
-struct InFlightJob {
-    source: Arc<SourceShared>,
-    epoch: u64,
-    seq: u64,
-}
-
 /// Bounded, deadline-aware translation scheduler (see the module docs).
 struct TranslationDispatcher {
     translator_manager: Arc<TranslatorManager>,
@@ -1366,11 +1408,20 @@ struct TranslationDispatcher {
 }
 
 impl TranslationDispatcher {
-    async fn run(self, mut rx: mpsc::Receiver<TranslationJob>) {
+    /// Translates jobs from `rx` until it closes and every job has resolved, or until `shutdown`
+    /// fires: then every job not resolved yet is reported as skipped and this returns at once.
+    async fn run(
+        self,
+        mut rx: mpsc::Receiver<TranslationJob>,
+        mut shutdown: oneshot::Receiver<()>,
+    ) {
         let mut pending: VecDeque<TranslationJob> = VecDeque::new();
         let mut in_flight: JoinSet<()> = JoinSet::new();
-        let mut in_flight_jobs: HashMap<tokio::task::Id, InFlightJob> = HashMap::new();
+        // Copies of the in-flight jobs, so that a panicking task still releases its commit slot
+        // and a shutdown timeout can still report the job as skipped.
+        let mut in_flight_jobs: HashMap<tokio::task::Id, TranslationJob> = HashMap::new();
         let mut input_open = true;
+        let mut shutdown_armed = true;
 
         loop {
             self.expire_late(&mut pending).await;
@@ -1389,11 +1440,7 @@ impl TranslationDispatcher {
                     self.skip(job).await;
                     continue;
                 };
-                let meta = InFlightJob {
-                    source: Arc::clone(&job.source),
-                    epoch: job.epoch,
-                    seq: job.seq,
-                };
+                let meta = job.clone();
                 let handle = in_flight.spawn(translate_job(
                     job,
                     remaining,
@@ -1415,6 +1462,22 @@ impl TranslationDispatcher {
                 .map(|job| job.finalized_at + self.deadline)
                 .min();
             tokio::select! {
+                biased;
+                signal = &mut shutdown, if shutdown_armed => {
+                    if signal.is_ok() {
+                        self.resolve_all_as_skipped(
+                            &mut rx,
+                            std::mem::take(&mut pending),
+                            &mut in_flight_jobs,
+                        )
+                            .await;
+                        in_flight.abort_all();
+                        self.stats.set_pending_translations(0);
+                        return;
+                    }
+                    // The signal can no longer arrive; keep draining normally.
+                    shutdown_armed = false;
+                }
                 job = rx.recv(), if input_open => match job {
                     Some(job) => {
                         pending.push_back(job);
@@ -1450,6 +1513,28 @@ impl TranslationDispatcher {
                 () = tokio::time::sleep_until(next_expiry.unwrap_or_else(Instant::now)),
                     if next_expiry.is_some() => {}
             }
+        }
+    }
+
+    /// Reports every job that has not resolved yet (still in `rx`, queued, or in flight) as
+    /// skipped, for a shutdown that timed out.
+    ///
+    /// Each report goes through [`finish_job`] under the source gate, so a reset source stays
+    /// cleared and a job whose translation task resolves it concurrently is reported only once.
+    async fn resolve_all_as_skipped(
+        &self,
+        rx: &mut mpsc::Receiver<TranslationJob>,
+        mut pending: VecDeque<TranslationJob>,
+        in_flight_jobs: &mut HashMap<tokio::task::Id, TranslationJob>,
+    ) {
+        while let Ok(job) = rx.try_recv() {
+            pending.push_back(job);
+        }
+        for (_, job) in in_flight_jobs.drain() {
+            self.skip(job).await;
+        }
+        for job in pending {
+            self.skip(job).await;
         }
     }
 
@@ -1561,7 +1646,9 @@ async fn finish_job(
         finalized_at: _,
     } = job;
     let mut gate = source.gate.lock().await;
-    if gate.epoch != epoch {
+    // A reset source is never revived, and a final resolves only once: at shutdown the
+    // dispatcher may report a job as skipped while its translation task is still running.
+    if gate.epoch != epoch || gate.is_resolved(seq) {
         return;
     }
     let (turn, translated_text, stage, failure_reason) = match outcome {
