@@ -350,15 +350,27 @@ pub fn install_plugin_for_os(
 
 /// Returns `true` when an [`io::Error`] indicates a locked or permission-protected file.
 ///
-/// Recognizes Windows sharing violations (`ERROR_SHARING_VIOLATION = 32`,
-/// `ERROR_ACCESS_DENIED = 5`, lock violation `33`) as well as Unix `PermissionDenied` and
-/// `ETXTBSY` (`26`).
+/// `PermissionDenied` always counts. The raw OS codes are interpreted per platform: on Windows,
+/// `ERROR_ACCESS_DENIED` (5), `ERROR_SHARING_VIOLATION` (32) and `ERROR_LOCK_VIOLATION` (33); on
+/// Unix only `ETXTBSY` (26, "text file busy"). The Windows codes mean unrelated errors on Unix
+/// (`EIO`, `EPIPE`, `EDOM` on Linux) and are deliberately not treated as locks there.
 #[must_use]
 pub fn is_locked_file_io_error(err: &io::Error) -> bool {
     if err.kind() == ErrorKind::PermissionDenied {
         return true;
     }
-    matches!(err.raw_os_error(), Some(5 | 26 | 32 | 33))
+    #[cfg(windows)]
+    {
+        matches!(err.raw_os_error(), Some(5 | 32 | 33))
+    }
+    #[cfg(unix)]
+    {
+        matches!(err.raw_os_error(), Some(26))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        false
+    }
 }
 
 /// Builds a clear bilingual (Japanese & English) recovery message for locked plugin files.

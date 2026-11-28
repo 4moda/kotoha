@@ -8,9 +8,10 @@ pub mod settings_store;
 
 pub use error::SetupError;
 pub use model_downloader::{
-    part_path_for, DownloadPhase, DownloadProgress, DownloadedArtifact, ModelDownloader,
-    ModelDownloaderConfig, DEFAULT_DOWNLOAD_TIMEOUT_SECS, DEFAULT_MAX_DOWNLOAD_REDIRECTS,
-    PENDING_RELEASE_MANIFEST_SHA256,
+    cleanup_stale_part_files, part_path_for, DownloadPhase, DownloadProgress, DownloadedArtifact,
+    ModelDownloader, ModelDownloaderConfig, DEFAULT_DOWNLOAD_CONNECT_TIMEOUT_SECS,
+    DEFAULT_DOWNLOAD_READ_TIMEOUT_SECS, DEFAULT_MAX_DOWNLOAD_BYTES, DEFAULT_MAX_DOWNLOAD_REDIRECTS,
+    DOWNLOAD_SIZE_MARGIN_PERCENT, PENDING_RELEASE_MANIFEST_SHA256,
 };
 pub use plugin_installer::{
     discover_mumble_plugin_dirs, discover_mumble_plugin_dirs_for,
@@ -19,8 +20,8 @@ pub use plugin_installer::{
     MumblePluginDirCandidate, MumblePluginDirKind, PluginInstallOutcome, TargetPlatform,
 };
 pub use settings_store::{
-    AppSettings, FileSettingsStore, OverlayStyleSettings, DEFAULT_OVERLAY_FADE_OUT_SECONDS,
-    DEFAULT_OVERLAY_FONT_SIZE_PX, DEFAULT_OVERLAY_HEIGHT, DEFAULT_OVERLAY_MAX_LINES,
-    DEFAULT_OVERLAY_OPACITY, DEFAULT_OVERLAY_POSITION_X, DEFAULT_OVERLAY_POSITION_Y,
-    DEFAULT_OVERLAY_WIDTH, SETTINGS_FILENAME,
+    AppSettings, FileSettingsStore, OverlayStyleSettings, SettingsLoadOutcome,
+    DEFAULT_OVERLAY_FADE_OUT_SECONDS, DEFAULT_OVERLAY_FONT_SIZE_PX, DEFAULT_OVERLAY_HEIGHT,
+    DEFAULT_OVERLAY_MAX_LINES, DEFAULT_OVERLAY_OPACITY, DEFAULT_OVERLAY_POSITION_X,
+    DEFAULT_OVERLAY_POSITION_Y, DEFAULT_OVERLAY_WIDTH, SETTINGS_FILENAME,
 };

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use kotoha_core::domain::{ProviderSecretKind, TranslationProviderConfig};
-use kotoha_setup::{install_plugin, ModelDownloader, SetupError};
+use kotoha_setup::{install_plugin, ModelDownloader, PluginInstallOutcome, SetupError};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::bridge::emit_overlay_style_changed;
@@ -48,9 +48,6 @@ pub async fn install_mumble_plugin(
     state: State<'_, Arc<AppState>>,
     custom_dir: Option<String>,
 ) -> Result<PluginInstallResultDto, String> {
-    state
-        .record_custom_mumble_dir(custom_dir.as_deref())
-        .await?;
     let (detected_paths, is_flatpak) = state.detected_mumble_info().await;
     let platform = HostOsPlatform::current();
 
@@ -58,6 +55,27 @@ pub async fn install_mumble_plugin(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+
+    // A user-supplied directory must already exist and be a directory: the installer must not
+    // create arbitrary paths, and a bad path must never be persisted.
+    if let Some(dir) = trimmed_custom {
+        let candidate = PathBuf::from(dir);
+        let is_dir = tokio::task::spawn_blocking(move || candidate.is_dir())
+            .await
+            .map_err(|err| format!("failed to check custom plugin directory: {err}"))?;
+        if !is_dir {
+            return Ok(PluginInstallResultDto {
+                status: PluginInstallStatus::Error,
+                platform,
+                target_path: dir.to_owned(),
+                detected_paths,
+                is_flatpak,
+                flatpak_hint: None,
+                message: "The specified plugin directory does not exist or is not a directory."
+                    .to_owned(),
+            });
+        }
+    }
 
     let Some(target_dir_str) = trimmed_custom
         .map(str::to_owned)
@@ -95,12 +113,28 @@ pub async fn install_mumble_plugin(
         .map_err(|err| format!("plugin installation task failed: {err}"))?;
 
     match outcome {
-        Ok(result) => Ok(map_plugin_install_outcome(
-            &result,
-            platform,
-            detected_paths,
-            is_flatpak,
-        )),
+        Ok(result) => {
+            let succeeded = matches!(
+                result,
+                PluginInstallOutcome::Installed { .. }
+                    | PluginInstallOutcome::AlreadyUpToDate { .. }
+            );
+            let (detected_paths, is_flatpak) = if succeeded && trimmed_custom.is_some() {
+                // Persist the override only now that the install worked.
+                state
+                    .record_custom_mumble_dir(custom_dir.as_deref())
+                    .await?;
+                state.detected_mumble_info().await
+            } else {
+                (detected_paths, is_flatpak)
+            };
+            Ok(map_plugin_install_outcome(
+                &result,
+                platform,
+                detected_paths,
+                is_flatpak,
+            ))
+        }
         Err(SetupError::InvalidConfig(msg)) => Ok(PluginInstallResultDto {
             status: PluginInstallStatus::Error,
             platform,
@@ -144,11 +178,12 @@ pub async fn download_model_profile(
     let model_id_for_progress = profile.model_id.clone();
 
     let download_res = downloader
-        .download_file_for_model(
+        .download_file_with_expected_size(
             &profile.model_id,
             &profile.download_url,
             &dest_path,
             &profile.sha256,
+            Some(fallback_total_bytes),
             move |progress| {
                 let event =
                     DownloadProgressEventDto::from_setup_progress(&progress, fallback_total_bytes);

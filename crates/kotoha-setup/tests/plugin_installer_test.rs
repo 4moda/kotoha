@@ -206,9 +206,21 @@ fn install_plugin_handles_fresh_install_idempotent_skip_upgrade_and_invalid_inpu
 
 #[test]
 fn locked_plugin_file_detection_and_guidance_work_cross_platform() {
-    // Raw Windows ERROR_SHARING_VIOLATION (32) and ERROR_ACCESS_DENIED (5)
-    assert!(is_locked_file_io_error(&io::Error::from_raw_os_error(32)));
-    assert!(is_locked_file_io_error(&io::Error::from_raw_os_error(5)));
+    // Raw Windows ERROR_SHARING_VIOLATION (32) and ERROR_ACCESS_DENIED (5) only count on Windows.
+    #[cfg(windows)]
+    {
+        assert!(is_locked_file_io_error(&io::Error::from_raw_os_error(32)));
+        assert!(is_locked_file_io_error(&io::Error::from_raw_os_error(33)));
+        assert!(is_locked_file_io_error(&io::Error::from_raw_os_error(5)));
+    }
+    // On Unix these are EIO / EPIPE / EDOM, not lock conditions; ETXTBSY (26) is.
+    #[cfg(unix)]
+    {
+        assert!(!is_locked_file_io_error(&io::Error::from_raw_os_error(32)));
+        assert!(!is_locked_file_io_error(&io::Error::from_raw_os_error(33)));
+        assert!(!is_locked_file_io_error(&io::Error::from_raw_os_error(5)));
+        assert!(is_locked_file_io_error(&io::Error::from_raw_os_error(26)));
+    }
     // PermissionDenied ErrorKind
     assert!(is_locked_file_io_error(&io::Error::new(
         ErrorKind::PermissionDenied,

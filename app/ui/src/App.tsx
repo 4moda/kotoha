@@ -26,6 +26,7 @@ import type {
   SecretStatus,
   SubtitleEntry,
   TranslationProviderConfig,
+  TranslatorStatus,
 } from './types/kotoha';
 
 export type AppViewMode = 'overlay' | 'wizard' | 'settings';
@@ -104,6 +105,8 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
     createDefaultProviderConfig('local_model'),
   );
   const [secrets, setSecrets] = useState<SecretStatus>(() => ({ ...EMPTY_SECRET_STATUS }));
+  const [translatorStatus, setTranslatorStatus] = useState<TranslatorStatus>({ state: 'ok' });
+  const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
   const [overlayOptions, setOverlayOptions] = useState<OverlayDisplayOptions>(
     DEFAULT_OVERLAY_OPTIONS,
   );
@@ -198,6 +201,8 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
         setTgtLang(state.tgt_lang);
         setProvider(state.provider);
         setSecrets(state.secrets);
+        setTranslatorStatus(state.translator_status ?? { state: 'ok' });
+        setSettingsNotice(state.settings_notice ?? null);
         setOverlayOptions(state.overlay_options);
         setGlossarySettings(state.glossary);
         setConnection(state.connection);
@@ -296,6 +301,7 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
           if (isMountedRef.current && latestProviderRequestRef.current === requestId) {
             // Switching provider / origin may have deleted stored secrets on the Rust side.
             setSecrets(state.secrets);
+            setTranslatorStatus(state.translator_status ?? { state: 'ok' });
             setStatusError(null);
           }
         })
@@ -799,6 +805,9 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
             tgtLang={tgtLang}
             provider={provider}
             secrets={secrets}
+            translatorStatus={translatorStatus}
+            settingsNotice={settingsNotice}
+            onDismissSettingsNotice={() => setSettingsNotice(null)}
             overlayOptions={overlayOptions}
             glossarySettings={glossarySettings}
             onChangeLanguages={handleUpdateLanguages}

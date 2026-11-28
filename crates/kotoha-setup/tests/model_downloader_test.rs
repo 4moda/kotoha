@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use common::{sha256_hex, unique_temp_dir, LocalDownloadServer, ScriptedResponse};
 use kotoha_setup::{
-    part_path_for, DownloadPhase, DownloadProgress, ModelDownloader, ModelDownloaderConfig,
-    SetupError, PENDING_RELEASE_MANIFEST_SHA256,
+    cleanup_stale_part_files, part_path_for, DownloadPhase, DownloadProgress, ModelDownloader,
+    ModelDownloaderConfig, SetupError, PENDING_RELEASE_MANIFEST_SHA256,
 };
 
 #[tokio::test]
@@ -171,9 +171,11 @@ async fn deletes_part_file_on_checksum_mismatch_or_http_404_error() {
 
     // 5. Explicit allow_unverified_in_dev = true permits pending-release-manifest
     let dev_downloader = ModelDownloader::with_config(ModelDownloaderConfig {
-        timeout: Duration::from_secs(30),
+        connect_timeout: Duration::from_secs(30),
+        read_timeout: Duration::from_secs(30),
         max_redirects: 5,
         allow_unverified_in_dev: true,
+        ..ModelDownloaderConfig::default()
     });
     let dev_artifact = dev_downloader
         .download_file(
@@ -318,4 +320,65 @@ fn has_leftover_part_files(dir: &Path) -> bool {
                     .to_str()
                     .is_some_and(|name| name != "model.bin.part")
         })
+}
+
+#[tokio::test]
+async fn rejects_content_length_above_catalog_size_with_margin_before_streaming() {
+    let body = vec![7u8; 4096];
+    let sha = sha256_hex(&body);
+    let server =
+        LocalDownloadServer::start(move |_| ScriptedResponse::ok_bytes(body.clone())).await;
+
+    let root = unique_temp_dir("kotoha_dl_size");
+    let _ = fs::remove_dir_all(&root);
+    let dest = root.join("m/model.bin");
+    let url = format!("{}/m.bin", server.base_url);
+
+    // Catalog says 1000 bytes (limit 1250 with margin) but the server declares 4096.
+    let err = ModelDownloader::new()
+        .download_file_with_expected_size("m", &url, &dest, &sha, Some(1000), |_| {})
+        .await
+        .expect_err("oversized Content-Length must be rejected");
+    assert!(matches!(err, SetupError::Network(_)), "{err:?}");
+    assert!(!dest.exists());
+    assert!(!has_leftover_part_files(dest.parent().unwrap_or(&root)));
+
+    // A generous estimate lets the same download succeed.
+    let artifact = ModelDownloader::new()
+        .download_file_with_expected_size("m", &url, &dest, &sha, Some(4000), |_| {})
+        .await
+        .expect("within margin must succeed");
+    assert_eq!(artifact.bytes_downloaded, 4096);
+
+    // The hard cap applies even without a catalog estimate.
+    let capped = ModelDownloader::with_config(ModelDownloaderConfig {
+        max_download_bytes: 100,
+        ..ModelDownloaderConfig::default()
+    });
+    let err = capped
+        .download_file_for_model("m", &url, &root.join("c/model.bin"), &sha, |_| {})
+        .await
+        .expect_err("hard cap must be enforced");
+    assert!(matches!(err, SetupError::Network(_)), "{err:?}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cleanup_stale_part_files_removes_only_part_files() {
+    let root = unique_temp_dir("kotoha_dl_cleanup");
+    let _ = fs::remove_dir_all(&root);
+    let model_dir = root.join("fugumt");
+    fs::create_dir_all(&model_dir).unwrap();
+    fs::write(model_dir.join("model.bin.123.1.part"), b"partial").unwrap();
+    fs::write(model_dir.join("model.bin"), b"done").unwrap();
+    fs::write(root.join("stray.part"), b"x").unwrap();
+
+    assert_eq!(cleanup_stale_part_files(&root), 2);
+    assert!(model_dir.join("model.bin").exists());
+    assert!(!model_dir.join("model.bin.123.1.part").exists());
+    assert!(!root.join("stray.part").exists());
+    assert_eq!(cleanup_stale_part_files(&root.join("missing")), 0);
+
+    let _ = fs::remove_dir_all(&root);
 }

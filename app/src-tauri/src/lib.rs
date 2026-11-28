@@ -76,13 +76,29 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() == "settings" {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            match window.label() {
+                "settings" => {
                     api.prevent_close();
                     if let Err(err) = window.hide() {
                         eprintln!("warning: failed to hide settings window on close: {err}");
                     }
                 }
+                // Alt+F4 must not destroy the overlay (the tray toggle could not bring it
+                // back): hide it and record the hidden state instead.
+                "overlay" => {
+                    api.prevent_close();
+                    if let Err(err) = window.hide() {
+                        eprintln!("warning: failed to hide overlay window on close: {err}");
+                    }
+                    let state = window.app_handle().state::<Arc<AppState>>().inner().clone();
+                    tauri::async_runtime::spawn(async move {
+                        state.set_overlay_visible(Some(false)).await;
+                    });
+                }
+                _ => {}
             }
         });
 

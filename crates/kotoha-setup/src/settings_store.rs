@@ -50,11 +50,11 @@ const LEGACY_SECRET_SENTINEL: &str = "__KOTOHA_SECRET_STORE__";
 /// Persistent styling and geometry preferences for the transparent subtitle overlay window.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OverlayStyleSettings {
-    /// Background / window opacity in `0.15..=1.0`.
+    /// Background / window opacity in `0.1..=1.0`.
     pub opacity: f32,
-    /// Subtitle font size in pixels (`12..=48`).
+    /// Subtitle font size in pixels (`10..=72`).
     pub font_size_px: u16,
-    /// Maximum visible subtitle lines/cards (`1..=12`).
+    /// Maximum visible subtitle lines/cards (`1..=20`).
     pub max_lines: u8,
     /// Whether to display original source speech alongside translated text.
     pub show_source_text: bool,
@@ -289,6 +289,66 @@ impl FileSettingsStore {
             self.save(&loaded)?;
         }
         Ok(loaded)
+    }
+}
+
+/// Result of [`FileSettingsStore::load_or_recover`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsLoadOutcome {
+    /// Loaded settings, or [`AppSettings::default`] when the file had to be set aside.
+    pub settings: AppSettings,
+    /// User-safe notice (no file contents or secrets) when the stored file was unusable.
+    pub notice: Option<String>,
+}
+
+impl FileSettingsStore {
+    /// Like [`Self::load`], but never fails startup: a corrupt, out-of-range or otherwise
+    /// unreadable/unmigratable settings file is moved to `<file>.bak-<unix-seconds>` and
+    /// [`AppSettings::default`] is returned together with a notice for the UI. Provider secrets
+    /// are not recoverable from such a file, so the user is asked to re-enter them.
+    #[must_use]
+    pub fn load_or_recover(&self, secrets: &dyn SecretWriter) -> SettingsLoadOutcome {
+        let err = match self.load(secrets) {
+            Ok(settings) => {
+                return SettingsLoadOutcome {
+                    settings,
+                    notice: None,
+                }
+            }
+            Err(err) => err,
+        };
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let mut backup_name = self.settings_path.as_os_str().to_os_string();
+        backup_name.push(format!(".bak-{stamp}"));
+        let backup_path = PathBuf::from(backup_name);
+        let backed_up = fs::rename(&self.settings_path, &backup_path).is_ok();
+
+        let reason = match err {
+            SetupError::Io(_) => "could not be read",
+            _ => "was corrupted or contained invalid values",
+        };
+        let backup_text = if backed_up {
+            format!(
+                "The old file was kept as '{}'.",
+                backup_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("backup")
+            )
+        } else {
+            "The old file could not be backed up and will be overwritten on the next save."
+                .to_owned()
+        };
+        SettingsLoadOutcome {
+            settings: AppSettings::default(),
+            notice: Some(format!(
+                "The settings file {reason}, so Kotoha started with default settings. \
+                 {backup_text} Please review your settings and re-enter any API keys."
+            )),
+        }
     }
 }
 

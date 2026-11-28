@@ -183,11 +183,17 @@ export interface SecretStatus {
   gas_bearer_token: boolean;
 }
 
+/** Whether the configured translation provider is active (`error` = placeholder translator in use). */
+export type TranslatorStatus = { state: 'ok' } | { state: 'error'; reason: string };
+
 export interface AppRuntimeState {
   src_lang: string;
   tgt_lang: string;
   provider: TranslationProviderConfig;
   secrets: SecretStatus;
+  translator_status: TranslatorStatus;
+  /** Set when the settings file was unusable and defaults were loaded instead. */
+  settings_notice: string | null;
   overlay_options: OverlayDisplayOptions;
   overlay_visible: boolean;
   glossary: GlossarySettingsState;

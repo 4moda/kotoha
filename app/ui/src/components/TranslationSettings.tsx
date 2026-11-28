@@ -14,6 +14,7 @@ import type {
   SecretStatus,
   TranslationProviderConfig,
   TranslationProviderType,
+  TranslatorStatus,
 } from '../types/kotoha';
 
 export interface TranslationSettingsProps {
@@ -21,6 +22,11 @@ export interface TranslationSettingsProps {
   tgtLang: string;
   provider: TranslationProviderConfig;
   secrets: SecretStatus;
+  /** `error` means a placeholder translator is active instead of the configured provider. */
+  translatorStatus?: TranslatorStatus;
+  /** Shown when the settings file was unusable and defaults were loaded. */
+  settingsNotice?: string | null;
+  onDismissSettingsNotice?: () => void;
   overlayOptions: OverlayDisplayOptions;
   glossarySettings: GlossarySettingsState;
   onChangeLanguages: (srcLang: string, tgtLang: string) => void;
@@ -129,6 +135,9 @@ export function TranslationSettings({
   tgtLang,
   provider,
   secrets,
+  translatorStatus,
+  settingsNotice,
+  onDismissSettingsNotice,
   overlayOptions,
   glossarySettings,
   onChangeLanguages,
@@ -169,6 +178,26 @@ export function TranslationSettings({
       aria-label="Translation and overlay settings"
       data-testid="translation-settings"
     >
+      {settingsNotice && (
+        <div className="app-error-banner" data-testid="settings-notice" role="alert">
+          <span className="app-error-message">{settingsNotice}</span>
+          {onDismissSettingsNotice && (
+            <button
+              type="button"
+              className="btn btn-subtle btn-compact"
+              data-testid="dismiss-settings-notice-btn"
+              onClick={onDismissSettingsNotice}
+            >
+              Dismiss
+            </button>
+          )}
+        </div>
+      )}
+      {translatorStatus?.state === 'error' && (
+        <div className="app-error-banner" data-testid="translator-status-error" role="alert">
+          <span className="app-error-message">{translatorStatus.reason}</span>
+        </div>
+      )}
       <div className="settings-section">
         <h2 className="section-title">Language Pair</h2>
         <div className="field-grid two-col">

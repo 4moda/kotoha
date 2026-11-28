@@ -287,3 +287,50 @@ fn settings_store_handles_missing_file_defaults_corrupt_json_and_validation() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn load_or_recover_backs_up_corrupt_or_out_of_range_files_and_uses_defaults() {
+    let root = unique_temp_dir("kotoha_settings_recover");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let store = FileSettingsStore::in_dir(&root);
+    let secrets = InMemorySecretStore::new();
+
+    // Missing file: defaults, no notice.
+    let outcome = store.load_or_recover(&secrets);
+    assert_eq!(outcome.settings, AppSettings::default());
+    assert!(outcome.notice.is_none());
+
+    // Corrupt JSON is backed up and replaced by defaults with a notice.
+    fs::write(store.path(), "{ not json").unwrap();
+    let outcome = store.load_or_recover(&secrets);
+    assert_eq!(outcome.settings, AppSettings::default());
+    assert!(outcome.notice.is_some());
+    assert!(!store.path().exists());
+    let backups = || {
+        fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("kotoha-settings.json.bak-")
+            })
+            .count()
+    };
+    assert_eq!(backups(), 1);
+
+    // Out-of-range values (valid JSON) take the same path.
+    let mut bad = serde_json::to_value(AppSettings::default()).unwrap();
+    bad["overlay"]["font_size_px"] = serde_json::json!(500);
+    fs::write(store.path(), bad.to_string()).unwrap();
+    let outcome = store.load_or_recover(&secrets);
+    assert_eq!(outcome.settings, AppSettings::default());
+    assert!(!outcome.notice.unwrap().contains("500"));
+
+    // A valid file still loads untouched.
+    store.save(&AppSettings::default()).unwrap();
+    assert!(store.load_or_recover(&secrets).notice.is_none());
+
+    let _ = fs::remove_dir_all(&root);
+}
