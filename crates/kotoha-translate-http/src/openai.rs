@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use kotoha_core::domain::{
-    CoreError, TranslateContext, TranslationRequest, TranslationResult, Translator,
+    CoreError, Secret, TranslateContext, TranslationRequest, TranslationResult, Translator,
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
@@ -18,27 +18,16 @@ use crate::client::{
 };
 
 /// Configuration for [`OpenAiCompatibleTranslator`].
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct OpenAiCompatibleConfig {
     /// Base URL such as `"https://api.openai.com/v1"` or `"http://localhost:11434/v1"`.
     pub base_url: String,
     /// Model identifier such as `"gpt-4o-mini"`, `"gemini-2.5-flash"`, or `"qwen2.5:7b"`.
     pub model: String,
     /// Optional API key (`None` or blank omits `Authorization` header for local Ollama/LM Studio).
-    pub api_key: Option<String>,
+    pub api_key: Option<Secret>,
     /// HTTP timeout in milliseconds (`100..=120_000`).
     pub timeout_ms: u64,
-}
-
-impl std::fmt::Debug for OpenAiCompatibleConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OpenAiCompatibleConfig")
-            .field("base_url", &self.base_url)
-            .field("model", &self.model)
-            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
-            .field("timeout_ms", &self.timeout_ms)
-            .finish()
-    }
 }
 
 impl OpenAiCompatibleConfig {
@@ -131,8 +120,8 @@ impl OpenAiCompatibleTranslator {
 
         let auth_header = config
             .api_key
-            .as_deref()
-            .map(str::trim)
+            .as_ref()
+            .map(|k| k.expose().trim())
             .filter(|k| !k.is_empty())
             .map(|key| {
                 validate_sensitive_header_value(

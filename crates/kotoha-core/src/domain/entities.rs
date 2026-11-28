@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::error::CoreError;
+use crate::domain::secret::SecretRef;
 
 const SPEAKER_COLOR_PALETTE: [&str; 12] = [
     "#38BDF8", // sky
@@ -743,7 +744,14 @@ pub fn default_model_catalog() -> Vec<ModelProfile> {
 }
 
 /// Runtime-selectable translation provider configuration.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Holds **no secrets and no secret references**. Credentials (API keys, bearer tokens and the GAS
+/// endpoint URL, which acts as a bearer capability) live in a
+/// [`SecretStore`](crate::domain::ports::SecretStore) under fixed keys derived from the provider
+/// variant (see [`TranslationProviderConfig::required_secret_refs`]). Because the key names are not
+/// user-chosen, one provider's secret can never be sent to another provider's host. Both `Debug`
+/// and `Serialize` are therefore safe on this type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TranslationProviderConfig {
     /// Local `CTranslate2` NMT model selected by `model_id` and compute target.
@@ -756,40 +764,42 @@ pub enum TranslationProviderConfig {
         threads: Option<usize>,
     },
     /// OpenAI-compatible chat completions endpoint (cloud LLM or local Ollama / LM Studio).
+    ///
+    /// Optional secret: `translation.openai_compatible.api_key`.
+    #[serde(rename = "openai_compatible", alias = "open_ai_compatible")]
     OpenAiCompatible {
         /// Base URL such as `"https://api.openai.com/v1"` or `"http://localhost:11434/v1"`.
         base_url: String,
         /// Model name such as `"gpt-4o-mini"` or `"qwen2.5:7b"`.
         model: String,
-        /// Optional API key (local endpoints like Ollama may omit it).
-        api_key: Option<String>,
         /// Request timeout in milliseconds.
         timeout_ms: u64,
     },
     /// Official `DeepL` API (Free or Pro endpoint).
+    ///
+    /// Required secret: `translation.deepl.api_key`.
+    #[serde(rename = "deepl", alias = "deep_l")]
     DeepL {
-        /// `DeepL` authentication key.
-        api_key: String,
         /// Whether to target `api-free.deepl.com` (`true`) or `api.deepl.com` (`false`).
         use_free_endpoint: bool,
         /// Request timeout in milliseconds.
         timeout_ms: u64,
     },
     /// Official Google Cloud Translation API (v2/v3).
+    ///
+    /// Required secret: `translation.google_cloud.api_key`.
     GoogleCloud {
-        /// Google Cloud API key or credential token.
-        api_key: String,
         /// Optional GCP project ID (used by v3 endpoints).
         project_id: Option<String>,
         /// Request timeout in milliseconds.
         timeout_ms: u64,
     },
     /// User-deployed Google Apps Script (`LanguageApp.translate()`) or custom HTTP webhook.
+    ///
+    /// Required secret: `translation.gas_webhook.endpoint_url` (a GAS deployment URL works as a
+    /// bearer capability, so it is never part of the settings). Optional secret:
+    /// `translation.gas_webhook.bearer_token`.
     GasWebhook {
-        /// Deployed webhook URL.
-        endpoint_url: String,
-        /// Optional bearer authorization token.
-        bearer_token: Option<String>,
         /// Request timeout in milliseconds.
         timeout_ms: u64,
     },
@@ -800,62 +810,94 @@ pub enum TranslationProviderConfig {
     },
 }
 
-impl std::fmt::Debug for TranslationProviderConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl TranslationProviderConfig {
+    /// Secrets without which this provider cannot be constructed.
+    #[must_use]
+    pub fn required_secret_refs(&self) -> Vec<SecretRef> {
         match self {
-            Self::LocalModel {
-                model_id,
-                device,
-                threads,
-            } => f
-                .debug_struct("LocalModel")
-                .field("model_id", model_id)
-                .field("device", device)
-                .field("threads", threads)
-                .finish(),
-            Self::OpenAiCompatible {
-                base_url,
-                model,
-                api_key,
-                timeout_ms,
-            } => f
-                .debug_struct("OpenAiCompatible")
-                .field("base_url", base_url)
-                .field("model", model)
-                .field("api_key", &api_key.as_ref().map(|_| "[REDACTED]"))
-                .field("timeout_ms", timeout_ms)
-                .finish(),
-            Self::DeepL {
-                api_key: _,
-                use_free_endpoint,
-                timeout_ms,
-            } => f
-                .debug_struct("DeepL")
-                .field("api_key", &"[REDACTED]")
-                .field("use_free_endpoint", use_free_endpoint)
-                .field("timeout_ms", timeout_ms)
-                .finish(),
-            Self::GoogleCloud {
-                api_key: _,
-                project_id,
-                timeout_ms,
-            } => f
-                .debug_struct("GoogleCloud")
-                .field("api_key", &"[REDACTED]")
-                .field("project_id", project_id)
-                .field("timeout_ms", timeout_ms)
-                .finish(),
-            Self::GasWebhook {
-                endpoint_url,
-                bearer_token,
-                timeout_ms,
-            } => f
-                .debug_struct("GasWebhook")
-                .field("endpoint_url", endpoint_url)
-                .field("bearer_token", &bearer_token.as_ref().map(|_| "[REDACTED]"))
-                .field("timeout_ms", timeout_ms)
-                .finish(),
-            Self::Mock { prefix } => f.debug_struct("Mock").field("prefix", prefix).finish(),
+            Self::DeepL { .. } => vec![SecretRef::deepl_api_key()],
+            Self::GoogleCloud { .. } => vec![SecretRef::google_cloud_api_key()],
+            Self::GasWebhook { .. } => vec![SecretRef::gas_endpoint_url()],
+            Self::LocalModel { .. } | Self::OpenAiCompatible { .. } | Self::Mock { .. } => {
+                Vec::new()
+            }
         }
     }
+
+    /// Secrets this provider uses when present (e.g. an API key for a local Ollama is optional).
+    #[must_use]
+    pub fn optional_secret_refs(&self) -> Vec<SecretRef> {
+        match self {
+            Self::OpenAiCompatible { .. } => vec![SecretRef::openai_api_key()],
+            Self::GasWebhook { .. } => vec![SecretRef::gas_bearer_token()],
+            Self::LocalModel { .. }
+            | Self::DeepL { .. }
+            | Self::GoogleCloud { .. }
+            | Self::Mock { .. } => Vec::new(),
+        }
+    }
+
+    /// Every secret this provider can use (required first, then optional).
+    #[must_use]
+    pub fn secret_refs(&self) -> Vec<SecretRef> {
+        let mut refs = self.required_secret_refs();
+        refs.extend(self.optional_secret_refs());
+        refs
+    }
+
+    /// Secrets that must be deleted when switching from `previous` to `self`, because the
+    /// credential would otherwise be sent to a host it was not entered for.
+    ///
+    /// The OpenAI-compatible API key is bound to the origin (`scheme://host[:port]`) of
+    /// `base_url`: it is cleared unless `previous` was an OpenAI-compatible config with the same
+    /// origin, so the key has to be re-entered after pointing the provider at a new host.
+    #[must_use]
+    pub fn secrets_invalidated_by_change_from(&self, previous: &Self) -> Vec<SecretRef> {
+        let Self::OpenAiCompatible { base_url, .. } = self else {
+            return Vec::new();
+        };
+        let same_origin = matches!(
+            previous,
+            Self::OpenAiCompatible { base_url: prev_url, .. }
+                if prev_url == base_url
+                    || matches!((url_origin(prev_url), url_origin(base_url)), (Some(a), Some(b)) if a == b)
+        );
+        if same_origin {
+            Vec::new()
+        } else {
+            vec![SecretRef::openai_api_key()]
+        }
+    }
+}
+
+/// Returns the lower-cased `scheme://host[:port]` of `url`, or `None` when the URL cannot be
+/// reliably attributed to a single host.
+///
+/// This is deliberately strict and fail-closed: it is used to decide whether a stored credential
+/// may keep being sent to a (possibly changed) endpoint. The real HTTP client follows the WHATWG
+/// URL rules (for example `\` ends the authority in http/https URLs), so a hand-written parser
+/// that disagrees could be tricked into reporting the wrong host. Any authority containing a
+/// character outside `[A-Za-z0-9.\-:\[\]]` (userinfo `@`, `\`, `%`, whitespace, control
+/// characters, ...) is therefore treated as unparseable.
+#[must_use]
+pub fn url_origin(url: &str) -> Option<String> {
+    let trimmed = url.trim().to_ascii_lowercase();
+    let (scheme, rest) = trimmed.split_once("://")?;
+    if scheme.is_empty()
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return None;
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty()
+        || !authority
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+    {
+        return None;
+    }
+    Some(format!("{scheme}://{authority}"))
 }

@@ -107,7 +107,6 @@ async fn translator_manager_runtime_hot_swap_and_validation() {
         TranslationProviderConfig::OpenAiCompatible {
             base_url: "http://localhost:11434/v1".to_owned(),
             model: "qwen2.5:7b".to_owned(),
-            api_key: None,
             timeout_ms: 5_000,
         },
         Arc::clone(&factory),
@@ -116,45 +115,10 @@ async fn translator_manager_runtime_hot_swap_and_validation() {
     .expect("switch to local ollama");
     assert_eq!(mgr.current_provider_id().await, "openai:qwen2.5:7b");
 
-    // Verify Debug redacts secrets on TranslationProviderConfig
-    let deepl_dbg = format!(
-        "{:?}",
-        TranslationProviderConfig::DeepL {
-            api_key: "super-secret-deepl-key".to_owned(),
-            use_free_endpoint: true,
-            timeout_ms: 5_000,
-        }
-    );
-    assert!(!deepl_dbg.contains("super-secret-deepl-key"));
-    assert!(deepl_dbg.contains("[REDACTED]"));
-
-    let gc_dbg = format!(
-        "{:?}",
-        TranslationProviderConfig::GoogleCloud {
-            api_key: "super-secret-gc-key".to_owned(),
-            project_id: Some("proj".to_owned()),
-            timeout_ms: 5_000,
-        }
-    );
-    assert!(!gc_dbg.contains("super-secret-gc-key"));
-    assert!(gc_dbg.contains("[REDACTED]"));
-
-    let gas_dbg = format!(
-        "{:?}",
-        TranslationProviderConfig::GasWebhook {
-            endpoint_url: "https://script.google.com/macros/s/1/exec".to_owned(),
-            bearer_token: Some("super-secret-bearer".to_owned()),
-            timeout_ms: 5_000,
-        }
-    );
-    assert!(!gas_dbg.contains("super-secret-bearer"));
-    assert!(gas_dbg.contains("[REDACTED]"));
-
-    // DefaultTranslatorFactory returns NotConfigured for empty DeepL key
-    let empty_deepl = DefaultTranslatorFactory.create(&TranslationProviderConfig::DeepL {
-        api_key: String::new(),
+    // Phase 1 factory reports Phase 2 providers as unsupported (no secrets involved).
+    let deepl = DefaultTranslatorFactory.create(&TranslationProviderConfig::DeepL {
         use_free_endpoint: true,
         timeout_ms: 5_000,
     });
-    assert!(matches!(empty_deepl, Err(CoreError::NotConfigured(_))));
+    assert!(matches!(deepl, Err(CoreError::UnsupportedInPhase1(_))));
 }

@@ -53,7 +53,7 @@ async fn openai_compatible_injects_context_glossary_hardens_prompt_and_omits_aut
     let cloud_cfg = OpenAiCompatibleConfig {
         base_url: format!("{}/v1", server.base_url),
         model: "gpt-4o-mini".to_owned(),
-        api_key: Some("sk-secret-key".to_owned()),
+        api_key: Some("sk-secret-key".into()),
         timeout_ms: 5_000,
     };
     let cloud = OpenAiCompatibleTranslator::new(&cloud_cfg).expect("create cloud openai");

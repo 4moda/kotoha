@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import {
   COMPUTE_DEVICES,
   MODEL_CATALOG,
@@ -9,6 +10,8 @@ import type {
   ComputeDevice,
   GlossarySettingsState,
   OverlayDisplayOptions,
+  ProviderSecretKind,
+  SecretStatus,
   TranslationProviderConfig,
   TranslationProviderType,
 } from '../types/kotoha';
@@ -17,10 +20,14 @@ export interface TranslationSettingsProps {
   srcLang: string;
   tgtLang: string;
   provider: TranslationProviderConfig;
+  secrets: SecretStatus;
   overlayOptions: OverlayDisplayOptions;
   glossarySettings: GlossarySettingsState;
   onChangeLanguages: (srcLang: string, tgtLang: string) => void;
   onChangeProvider: (config: TranslationProviderConfig) => void;
+  /** Write-only: resolves once stored. Rejects (after reporting) if it could not be stored. */
+  onSetSecret: (kind: ProviderSecretKind, value: string) => Promise<void>;
+  onClearSecret: (kind: ProviderSecretKind) => Promise<void>;
   onChangeOverlayOptions: (options: OverlayDisplayOptions) => void;
   onChangeGlossarySettings: (next: {
     enabled_profiles: string[];
@@ -35,14 +42,99 @@ const LANGUAGE_OPTIONS = [
   { code: 'ko', label: 'Korean (ko)' },
 ] as const;
 
+interface SecretFieldProps {
+  id: string;
+  label: string;
+  kind: ProviderSecretKind;
+  configured: boolean;
+  placeholder?: string;
+  onSet: (kind: ProviderSecretKind, value: string) => Promise<void>;
+  onClear: (kind: ProviderSecretKind) => Promise<void>;
+}
+
+/** Write-only secret input: the stored value is never shown, only a configured badge. */
+function SecretField({
+  id,
+  label,
+  kind,
+  configured,
+  placeholder,
+  onSet,
+  onClear,
+}: SecretFieldProps) {
+  const [draft, setDraft] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const run = async (action: () => Promise<void>, clearDraft: boolean) => {
+    setBusy(true);
+    try {
+      await action();
+      if (clearDraft) {
+        setDraft('');
+      }
+    } catch {
+      // The caller already reported the error; keep the draft so the user can retry.
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="field secret-field" data-testid={`secret-field-${kind}`}>
+      <label className="field-label" htmlFor={id}>
+        {label}
+      </label>
+      <div className="secret-field-row">
+        <input
+          id={id}
+          type="password"
+          autoComplete="off"
+          value={draft}
+          placeholder={placeholder}
+          onChange={(e) => setDraft(e.target.value)}
+        />
+        <button
+          type="button"
+          className="secret-field-button"
+          data-testid={`secret-set-${kind}`}
+          aria-label={`Set ${label}`}
+          disabled={busy || draft.trim() === ''}
+          onClick={() => void run(() => onSet(kind, draft), true)}
+        >
+          設定
+        </button>
+        <button
+          type="button"
+          className="secret-field-button"
+          data-testid={`secret-clear-${kind}`}
+          aria-label={`Clear ${label}`}
+          disabled={busy || !configured}
+          onClick={() => void run(() => onClear(kind), false)}
+        >
+          削除
+        </button>
+        <span
+          className={`secret-badge ${configured ? 'is-configured' : ''}`}
+          data-testid={`secret-badge-${kind}`}
+        >
+          {configured ? '設定済み' : '未設定'}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export function TranslationSettings({
   srcLang,
   tgtLang,
   provider,
+  secrets,
   overlayOptions,
   glossarySettings,
   onChangeLanguages,
   onChangeProvider,
+  onSetSecret,
+  onClearSecret,
   onChangeOverlayOptions,
   onChangeGlossarySettings,
 }: TranslationSettingsProps) {
@@ -283,21 +375,15 @@ export function TranslationSettings({
               </label>
             </div>
             <div className="field-grid two-col">
-              <label className="field">
-                <span className="field-label">API Key (Optional for Local Ollama)</span>
-                <input
-                  id="openai-api-key"
-                  type="password"
-                  value={provider.api_key ?? ''}
-                  placeholder="Stored in OS keychain at runtime"
-                  onChange={(e) =>
-                    onChangeProvider({
-                      ...provider,
-                      api_key: e.target.value === '' ? null : e.target.value,
-                    })
-                  }
-                />
-              </label>
+              <SecretField
+                id="openai-api-key"
+                label="API Key (Optional for Local Ollama)"
+                kind="open_ai_api_key"
+                configured={secrets.openai_api_key}
+                placeholder="Stored in OS keychain at runtime"
+                onSet={onSetSecret}
+                onClear={onClearSecret}
+              />
               <label className="field">
                 <span className="field-label">Request Timeout (ms)</span>
                 <input
@@ -354,18 +440,15 @@ export function TranslationSettings({
                 />
               </label>
             </div>
-            <label className="field">
-              <span className="field-label">DeepL API Key</span>
-              <input
+            <SecretField
                 id="deepl-api-key"
-                type="password"
-                value={provider.api_key}
+                label="DeepL API Key"
+                kind="deep_l_api_key"
+                configured={secrets.deepl_api_key}
                 placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:fx"
-                onChange={(e) =>
-                  onChangeProvider({ ...provider, api_key: e.target.value })
-                }
+                onSet={onSetSecret}
+                onClear={onClearSecret}
               />
-            </label>
           </div>
         )}
 
@@ -404,51 +487,39 @@ export function TranslationSettings({
                 />
               </label>
             </div>
-            <label className="field">
-              <span className="field-label">Google Cloud API Key</span>
-              <input
+            <SecretField
                 id="google-api-key"
-                type="password"
-                value={provider.api_key}
+                label="Google Cloud API Key"
+                kind="google_cloud_api_key"
+                configured={secrets.google_cloud_api_key}
                 placeholder="AIza..."
-                onChange={(e) =>
-                  onChangeProvider({ ...provider, api_key: e.target.value })
-                }
+                onSet={onSetSecret}
+                onClear={onClearSecret}
               />
-            </label>
           </div>
         )}
 
         {provider.type === 'gas_webhook' && (
           <div className="provider-config" data-testid="config-gas-webhook">
-            <label className="field">
-              <span className="field-label">GAS Web App / HTTP Proxy URL</span>
-              <input
+            <SecretField
                 id="gas-endpoint-url"
-                type="url"
-                value={provider.endpoint_url}
+                label="GAS Web App / HTTP Proxy URL"
+                kind="gas_endpoint_url"
+                configured={secrets.gas_endpoint_url}
                 placeholder="https://script.google.com/macros/s/.../exec"
-                onChange={(e) =>
-                  onChangeProvider({ ...provider, endpoint_url: e.target.value })
-                }
+                onSet={onSetSecret}
+                onClear={onClearSecret}
               />
-            </label>
             <div className="field-grid two-col">
-              <label className="field">
-                <span className="field-label">Bearer Token (Optional)</span>
-                <input
-                  id="gas-bearer-token"
-                  type="password"
-                  value={provider.bearer_token ?? ''}
-                  placeholder="Optional shared secret"
-                  onChange={(e) =>
-                    onChangeProvider({
-                      ...provider,
-                      bearer_token: e.target.value === '' ? null : e.target.value,
-                    })
-                  }
-                />
-              </label>
+              <SecretField
+                id="gas-bearer-token"
+                label="Bearer Token (Optional)"
+                kind="gas_bearer_token"
+                configured={secrets.gas_bearer_token}
+                placeholder="Optional shared secret"
+                onSet={onSetSecret}
+                onClear={onClearSecret}
+              />
               <label className="field">
                 <span className="field-label">Request Timeout (ms)</span>
                 <input

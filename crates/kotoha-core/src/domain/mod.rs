@@ -6,11 +6,12 @@ pub mod entities;
 pub mod error;
 pub mod logic;
 pub mod ports;
+pub mod secret;
 
 pub use entities::{
-    default_model_catalog, AudioChunk, AudioInputEvent, ComputeDevice, DisconnectReason,
-    GlossaryEntry, GlossaryProfile, GlossarySettings, HistoryEntry, LanguageCode, MergedGlossary,
-    ModelBackend, ModelProfile, PreprocessedAudio, SpeakerKey, SttDecodingMethod,
+    default_model_catalog, url_origin, AudioChunk, AudioInputEvent, ComputeDevice,
+    DisconnectReason, GlossaryEntry, GlossaryProfile, GlossarySettings, HistoryEntry, LanguageCode,
+    MergedGlossary, ModelBackend, ModelProfile, PreprocessedAudio, SpeakerKey, SttDecodingMethod,
     SttHotwordsConfig, SubtitleEntry, SubtitleStage, TalkingState, TranscriptEvent,
     TranslateContext, TranslationProviderConfig, TranslationRequest, TranslationResult,
     UtteranceId, DEFAULT_HOTWORDS_SCORE,
@@ -21,5 +22,7 @@ pub use logic::{
     DEFAULT_CONTEXT_WINDOW_CAPACITY,
 };
 pub use ports::{
-    GlossaryRepository, SttEngine, SttStream, SubtitleSink, Translator, TranslatorFactory,
+    GlossaryRepository, SecretStore, SecretWriter, SttEngine, SttStream, SubtitleSink, Translator,
+    TranslatorFactory,
 };
+pub use secret::{ProviderSecretKind, Secret, SecretRef, MAX_SECRET_REF_LEN, REDACTED};

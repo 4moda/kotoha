@@ -15,7 +15,7 @@ use kotoha_app_lib::state::{
     EVENT_OVERLAY_LOCK_CHANGED, EVENT_OVERLAY_STYLE_CHANGED, EVENT_SUBTITLE,
 };
 use kotoha_core::domain::{
-    AudioInputEvent, ComputeDevice, SpeakerKey, SubtitleEntry, SubtitleStage,
+    AudioInputEvent, ComputeDevice, ProviderSecretKind, SpeakerKey, SubtitleEntry, SubtitleStage,
     TranslationProviderConfig, UtteranceId,
 };
 use kotoha_setup::{DownloadPhase, DownloadProgress, PluginInstallOutcome};
@@ -96,30 +96,40 @@ async fn app_state_persists_sanitized_provider_secrets_glossary_overlay_and_wiza
 
     let state = AppState::new(&data_dir).expect("AppState::new should succeed");
 
-    // 1. Switch provider to DeepL with secret API key; returned snapshot and disk JSON must redact secret.
+    // 1. Switch provider to DeepL and store the key through the write-only command path;
+    //    the snapshot only exposes booleans and the settings file never contains the key.
+    let deepl_config = TranslationProviderConfig::DeepL {
+        use_free_endpoint: true,
+        timeout_ms: 10_000,
+    };
     let updated = state
         .switch_translation_provider(
-            TranslationProviderConfig::DeepL {
-                api_key: "super-secret-deepl-key".to_owned(),
-                use_free_endpoint: true,
-                timeout_ms: 10_000,
-            },
+            deepl_config.clone(),
             Some("en".to_owned()),
             Some("ja".to_owned()),
         )
         .await
         .expect("switch_translation_provider should succeed");
-
+    assert_eq!(updated.provider, deepl_config);
+    assert!(!updated.secrets.deepl_api_key);
+    let status = state
+        .set_provider_secret(
+            ProviderSecretKind::DeepLApiKey,
+            "super-secret-deepl-key".to_owned(),
+        )
+        .await
+        .expect("set_provider_secret");
+    assert!(status.deepl_api_key);
+    assert!(state.snapshot().await.secrets.deepl_api_key);
     assert_eq!(
-        updated.provider,
-        TranslationProviderConfig::DeepL {
-            api_key: String::new(),
-            use_free_endpoint: true,
-            timeout_ms: 10_000,
-        }
+        state.translator_manager().current_provider_id().await,
+        "deepl"
     );
+    let snapshot_json = serde_json::to_string(&state.snapshot().await).unwrap();
+    assert!(!snapshot_json.contains("super-secret-deepl-key"));
     let disk_json = fs::read_to_string(state.settings_path()).expect("settings JSON must exist");
     assert!(!disk_json.contains("super-secret-deepl-key"));
+    assert!(!format!("{:?}", state.snapshot().await).contains("super-secret-deepl-key"));
 
     // 2. Switch to Mock provider and test active hot-swap + overlay style + glossary update.
     let mock_state = state
@@ -454,6 +464,202 @@ async fn non_ascii_glossary_profile_names_receive_distinct_deterministic_ids_and
         .find(|p| p.name == "一般")
         .unwrap();
     assert_eq!(general_reloaded.id, general.id);
+
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+fn openai_config(base_url: &str) -> TranslationProviderConfig {
+    TranslationProviderConfig::OpenAiCompatible {
+        base_url: base_url.to_owned(),
+        model: "gpt-4o-mini".to_owned(),
+        timeout_ms: 5_000,
+    }
+}
+
+#[tokio::test]
+async fn provider_secrets_are_write_only_scoped_to_the_active_provider_and_host_bound() {
+    let data_dir = unique_temp_dir("kotoha_tauri_secrets");
+    let state = AppState::new(&data_dir).expect("AppState::new");
+
+    // A secret that does not belong to the active provider is rejected (default: local model).
+    let err = state
+        .set_provider_secret(ProviderSecretKind::DeepLApiKey, "k".to_owned())
+        .await
+        .expect_err("wrong provider");
+    assert!(!err.contains('k') || err.contains("active translation provider"));
+    assert!(state
+        .set_provider_secret(ProviderSecretKind::DeepLApiKey, "  ".to_owned())
+        .await
+        .is_err());
+
+    // DeepL without a key is saved but not hot-swapped (is_configured gate).
+    state
+        .switch_translation_provider(
+            TranslationProviderConfig::DeepL {
+                use_free_endpoint: true,
+                timeout_ms: 5_000,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        state.translator_manager().current_provider_id().await,
+        "deepl"
+    );
+
+    // OpenAI-compatible: key bound to the origin of base_url.
+    state
+        .switch_translation_provider(openai_config("https://api.openai.com/v1"), None, None)
+        .await
+        .unwrap();
+    let status = state
+        .set_provider_secret(
+            ProviderSecretKind::OpenAiApiKey,
+            "sk-openai-secret".to_owned(),
+        )
+        .await
+        .unwrap();
+    assert!(status.openai_api_key);
+
+    // Same origin (different path): key kept.
+    let snap = state
+        .switch_translation_provider(openai_config("https://api.openai.com/v2"), None, None)
+        .await
+        .unwrap();
+    assert!(snap.secrets.openai_api_key);
+
+    // Different host: the key is cleared and must be re-entered (N1).
+    let snap = state
+        .switch_translation_provider(openai_config("https://evil.example/v1"), None, None)
+        .await
+        .unwrap();
+    assert!(!snap.secrets.openai_api_key);
+
+    // Re-enter, then switching away and back also requires re-entry.
+    state
+        .set_provider_secret(
+            ProviderSecretKind::OpenAiApiKey,
+            "sk-openai-secret".to_owned(),
+        )
+        .await
+        .unwrap();
+    state
+        .switch_translation_provider(
+            TranslationProviderConfig::Mock {
+                prefix: "[ja] ".to_owned(),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let snap = state
+        .switch_translation_provider(openai_config("https://evil.example/v1"), None, None)
+        .await
+        .unwrap();
+    assert!(!snap.secrets.openai_api_key);
+
+    // GAS: replacing the endpoint clears the bearer token; clear is idempotent.
+    state
+        .switch_translation_provider(
+            TranslationProviderConfig::GasWebhook { timeout_ms: 5_000 },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let url_a = "https://script.google.com/macros/s/CAP-A/exec";
+    state
+        .set_provider_secret(ProviderSecretKind::GasEndpointUrl, url_a.to_owned())
+        .await
+        .unwrap();
+    let status = state
+        .set_provider_secret(ProviderSecretKind::GasBearerToken, "tok".to_owned())
+        .await
+        .unwrap();
+    assert!(status.gas_endpoint_url && status.gas_bearer_token);
+    assert_eq!(
+        state.translator_manager().current_provider_id().await,
+        "gas-webhook"
+    );
+    let status = state
+        .set_provider_secret(
+            ProviderSecretKind::GasEndpointUrl,
+            "https://script.google.com/macros/s/CAP-B/exec".to_owned(),
+        )
+        .await
+        .unwrap();
+    assert!(status.gas_endpoint_url && !status.gas_bearer_token);
+
+    // An invalid endpoint is rejected without leaking it and the previous value is restored.
+    let err = state
+        .set_provider_secret(
+            ProviderSecretKind::GasEndpointUrl,
+            "ftp://script.google.com/macros/s/CAP-C/exec".to_owned(),
+        )
+        .await
+        .expect_err("invalid scheme");
+    assert!(
+        !err.contains("CAP-C"),
+        "error must not contain the GAS capability id"
+    );
+    assert!(state.secret_status().gas_endpoint_url);
+
+    let status = state
+        .clear_provider_secret(ProviderSecretKind::GasEndpointUrl)
+        .await
+        .unwrap();
+    assert!(!status.gas_endpoint_url);
+    state
+        .clear_provider_secret(ProviderSecretKind::GasEndpointUrl)
+        .await
+        .unwrap();
+
+    // Nothing secret was ever persisted.
+    let disk_json = fs::read_to_string(state.settings_path()).unwrap();
+    for needle in [
+        "sk-openai-secret",
+        "CAP-A",
+        "CAP-B",
+        "tok\"",
+        "script.google.com",
+    ] {
+        assert!(!disk_json.contains(needle), "{needle} in {disk_json}");
+    }
+
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[tokio::test]
+async fn legacy_settings_file_with_plaintext_gas_url_loads_and_is_rewritten() {
+    let data_dir = unique_temp_dir("kotoha_tauri_legacy");
+    fs::create_dir_all(&data_dir).unwrap();
+    let mut doc = serde_json::to_value(kotoha_setup::AppSettings::default()).unwrap();
+    doc["translation_provider"] = serde_json::json!({
+        "type": "gas_webhook",
+        "endpoint_url": "https://script.google.com/macros/s/LEGACY-CAP/exec",
+        "bearer_token": "__KOTOHA_SECRET_STORE__",
+        "timeout_ms": 5000
+    });
+    fs::write(
+        data_dir.join("kotoha-settings.json"),
+        serde_json::to_string(&doc).unwrap(),
+    )
+    .unwrap();
+
+    let state = AppState::new(&data_dir).expect("legacy settings must load");
+    let snap = state.snapshot().await;
+    assert_eq!(
+        snap.provider,
+        TranslationProviderConfig::GasWebhook { timeout_ms: 5_000 }
+    );
+    assert!(snap.secrets.gas_endpoint_url);
+    assert!(!snap.secrets.gas_bearer_token);
+    let rewritten = fs::read_to_string(state.settings_path()).unwrap();
+    assert!(!rewritten.contains("LEGACY-CAP"));
+    assert!(!rewritten.contains("endpoint_url"));
 
     let _ = fs::remove_dir_all(&data_dir);
 }

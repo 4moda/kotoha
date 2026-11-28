@@ -33,25 +33,20 @@ describe('modelCatalog', () => {
       type: 'openai_compatible',
       base_url: 'http://localhost:11434/v1',
       model: 'qwen2.5:7b',
-      api_key: null,
       timeout_ms: 15_000,
     });
     expect(createDefaultProviderConfig('deepl')).toEqual({
       type: 'deepl',
-      api_key: '',
       use_free_endpoint: true,
       timeout_ms: 10_000,
     });
     expect(createDefaultProviderConfig('google_cloud')).toEqual({
       type: 'google_cloud',
-      api_key: '',
       project_id: null,
       timeout_ms: 10_000,
     });
     expect(createDefaultProviderConfig('gas_webhook')).toEqual({
       type: 'gas_webhook',
-      endpoint_url: '',
-      bearer_token: null,
       timeout_ms: 10_000,
     });
     expect(createDefaultProviderConfig('mock')).toEqual({

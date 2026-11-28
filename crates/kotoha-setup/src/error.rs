@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use kotoha_core::domain::CoreError;
 use thiserror::Error;
 
 /// Unified error type across Mumble plugin installation, model downloading, and settings persistence.
@@ -42,6 +43,10 @@ pub enum SetupError {
     /// Current or requested operating system / platform is unsupported.
     #[error("unsupported platform: {0}")]
     UnsupportedPlatform(String),
+
+    /// Error from the `kotoha-core` domain (e.g. the secret store).
+    #[error("core error: {0}")]
+    Core(#[from] CoreError),
 
     /// Security policy violation (e.g., plaintext HTTP on non-loopback, SSRF metadata IP, downgrade redirect, or secret leakage).
     #[error("security policy violation: {0}")]

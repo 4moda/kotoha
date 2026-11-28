@@ -1,13 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { clearMocks, mockIPC } from '@tauri-apps/api/mocks';
 import { emit } from '@tauri-apps/api/event';
+import { createDefaultProviderConfig } from '../data/modelCatalog';
 import {
+  SECRET_STATUS_FIELD,
   TAURI_EVENTS,
   createMockBridge,
   createTauriBridge,
   getKotohaBridge,
   isTauriRuntime,
   resetDefaultMockBridgeForTesting,
+  urlOrigin,
 } from './tauriBridge';
 import type {
   ConnectionStatus,
@@ -169,6 +172,15 @@ describe('tauriBridge', () => {
               status: 'verified',
               sha256_verified: true,
             };
+          case 'set_provider_secret':
+          case 'clear_provider_secret':
+            return {
+              openai_api_key: false,
+              deepl_api_key: true,
+              google_cloud_api_key: false,
+              gas_endpoint_url: false,
+              gas_bearer_token: false,
+            };
           case 'switch_translation_provider':
           case 'complete_first_run_wizard':
             return { wizard_completed: true };
@@ -206,6 +218,9 @@ describe('tauriBridge', () => {
     await bridge.installMumblePlugin('/custom/path');
     await bridge.downloadModelProfile('fugumt-en-ja-int8');
     await bridge.switchTranslationProvider({ type: 'mock', prefix: '[ja] ' }, 'en', 'ja');
+    const setStatus = await bridge.setProviderSecret('deep_l_api_key', 'abc');
+    expect(setStatus.deepl_api_key).toBe(true);
+    await bridge.clearProviderSecret('deep_l_api_key');
     await bridge.updateGlossarySettings({
       enabled_profiles: ['My Profile'],
       hotwords_score: 2.0,
@@ -220,10 +235,19 @@ describe('tauriBridge', () => {
       'install_mumble_plugin',
       'download_model_profile',
       'switch_translation_provider',
+      'set_provider_secret',
+      'clear_provider_secret',
       'update_glossary_settings',
       'update_overlay_style',
       'complete_first_run_wizard',
     ]);
+
+    expect(
+      invokedCommands.find((entry) => entry.cmd === 'set_provider_secret')?.payload,
+    ).toEqual({ kind: 'deep_l_api_key', value: 'abc' });
+    expect(
+      invokedCommands.find((entry) => entry.cmd === 'clear_provider_secret')?.payload,
+    ).toEqual({ kind: 'deep_l_api_key' });
 
     const onSubtitle = vi.fn();
     const onConnectionStatus = vi.fn();
@@ -321,5 +345,115 @@ describe('tauriBridge', () => {
     expect(styleEvents[0]?.show_source_text).toBe(false);
 
     unlisten();
+  });
+  describe('mock bridge secret handling', () => {
+    const openAi = (base_url: string) => ({
+      type: 'openai_compatible' as const,
+      base_url,
+      model: 'm',
+      timeout_ms: 15000,
+    });
+
+    it('starts with no secrets and rejects kinds of other providers', async () => {
+      const bridge = createMockBridge();
+      const state = await bridge.getAppState();
+      expect(Object.values(state.secrets)).toEqual([false, false, false, false, false]);
+      await expect(bridge.setProviderSecret('deep_l_api_key', 'k')).rejects.toThrow(
+        /active translation provider/,
+      );
+      await expect(bridge.setProviderSecret('open_ai_api_key', '  ')).rejects.toThrow(/empty/);
+    });
+
+    it('stores booleans only and never returns the value', async () => {
+      const bridge = createMockBridge();
+      await bridge.switchTranslationProvider(openAi('http://localhost:11434/v1'));
+      const status = await bridge.setProviderSecret('open_ai_api_key', 'sk-very-secret');
+      expect(status.openai_api_key).toBe(true);
+      expect(JSON.stringify(await bridge.getAppState())).not.toContain('sk-very-secret');
+      expect((await bridge.clearProviderSecret('open_ai_api_key')).openai_api_key).toBe(false);
+    });
+
+    it('clears the OpenAI key on origin change or provider switch, not on path change', async () => {
+      const bridge = createMockBridge();
+      await bridge.switchTranslationProvider(openAi('http://localhost:11434/v1'));
+      await bridge.setProviderSecret('open_ai_api_key', 'k');
+
+      let state = await bridge.switchTranslationProvider(openAi('http://LOCALHOST:11434/other'));
+      expect(state.secrets.openai_api_key).toBe(true);
+
+      state = await bridge.switchTranslationProvider(openAi('https://api.example.com/v1'));
+      expect(state.secrets.openai_api_key).toBe(false);
+
+      await bridge.setProviderSecret('open_ai_api_key', 'k');
+      await bridge.switchTranslationProvider({ type: 'mock', prefix: '' });
+      state = await bridge.switchTranslationProvider(openAi('https://api.example.com/v1'));
+      expect(state.secrets.openai_api_key).toBe(false);
+    });
+
+    it('fails closed on ambiguous base URLs (backslash, userinfo, escapes)', async () => {
+      expect(urlOrigin('HTTPS://API.OpenAI.com:8443/v1?x#y')).toBe('https://api.openai.com:8443');
+      for (const bad of [
+        'https://evil.example\\@api.openai.com/v1',
+        'https://api.openai.com@evil.example/v1',
+        'https://a%40b/',
+        'https://a b/',
+        'localhost:11434/v1',
+      ]) {
+        expect(urlOrigin(bad)).toBeNull();
+      }
+
+      const bridge = createMockBridge();
+      await bridge.switchTranslationProvider(openAi('https://api.openai.com/v1'));
+      await bridge.setProviderSecret('open_ai_api_key', 'k');
+      const state = await bridge.switchTranslationProvider(
+        openAi('https://evil.example\\@api.openai.com/v1'),
+      );
+      expect(state.secrets.openai_api_key).toBe(false);
+    });
+
+    it('keeps the key when nothing changed, even for an unparseable URL', async () => {
+      const bridge = createMockBridge();
+      await bridge.switchTranslationProvider(openAi('http://localhost:11434\\v1'));
+      await bridge.setProviderSecret('open_ai_api_key', 'k');
+      const state = await bridge.switchTranslationProvider(openAi('http://localhost:11434\\v1'));
+      expect(state.secrets.openai_api_key).toBe(true);
+    });
+
+    it('clears the GAS bearer token when the endpoint is replaced', async () => {
+      const bridge = createMockBridge();
+      await bridge.switchTranslationProvider({
+        type: 'gas_webhook',
+        timeout_ms: 10000,
+      });
+      await bridge.setProviderSecret('gas_endpoint_url', 'https://script.example/exec');
+      await bridge.setProviderSecret('gas_bearer_token', 't');
+      expect((await bridge.getAppState()).secrets.gas_bearer_token).toBe(true);
+      const status = await bridge.setProviderSecret('gas_endpoint_url', 'https://other/exec');
+      expect(status.gas_endpoint_url).toBe(true);
+      expect(status.gas_bearer_token).toBe(false);
+    });
+  });
+
+  it('uses the same provider and secret-kind wire tags as the Rust serde format', async () => {
+    // Keep in sync with provider_and_secret_kind_wire_tags_match_the_ui (domain_secret_test.rs).
+    const providerTags = [
+      'local_model',
+      'openai_compatible',
+      'deepl',
+      'google_cloud',
+      'gas_webhook',
+      'mock',
+    ] as const;
+    for (const tag of providerTags) {
+      expect(createDefaultProviderConfig(tag).type).toBe(tag);
+    }
+    const kindTags = [
+      'open_ai_api_key',
+      'deep_l_api_key',
+      'google_cloud_api_key',
+      'gas_endpoint_url',
+      'gas_bearer_token',
+    ] as const;
+    expect(Object.keys(SECRET_STATUS_FIELD)).toEqual([...kindTags]);
   });
 });

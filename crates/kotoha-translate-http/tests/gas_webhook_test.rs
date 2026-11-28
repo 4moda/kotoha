@@ -39,8 +39,8 @@ async fn gas_webhook_follows_302_redirect_handles_auto_and_blocks_ssrf_redirects
     .await;
 
     let gas = GasWebhookTranslator::new(&GasWebhookConfig {
-        endpoint_url: format!("{}/macros/s/abc/exec", server.base_url),
-        bearer_token: Some("gas-bearer-tok".to_owned()),
+        endpoint_url: format!("{}/macros/s/abc/exec", server.base_url).into(),
+        bearer_token: Some("gas-bearer-tok".into()),
         timeout_ms: 5_000,
     })
     .unwrap();
@@ -83,7 +83,7 @@ async fn gas_webhook_follows_302_redirect_handles_auto_and_blocks_ssrf_redirects
 
     // Verify JSON {"error": "..."} payload on 200 OK maps cleanly to CoreError::Translation
     let gas_err = GasWebhookTranslator::new(&GasWebhookConfig {
-        endpoint_url: format!("{}/macros/s/err/exec", server.base_url),
+        endpoint_url: format!("{}/macros/s/err/exec", server.base_url).into(),
         bearer_token: None,
         timeout_ms: 5_000,
     })
@@ -99,7 +99,7 @@ async fn gas_webhook_follows_302_redirect_handles_auto_and_blocks_ssrf_redirects
 
     // Verify redirect to cloud metadata link-local IP is blocked cleanly
     let ssrf_gas = GasWebhookTranslator::new(&GasWebhookConfig {
-        endpoint_url: format!("{}/macros/s/ssrf-metadata/exec", server.base_url),
+        endpoint_url: format!("{}/macros/s/ssrf-metadata/exec", server.base_url).into(),
         bearer_token: None,
         timeout_ms: 5_000,
     })
@@ -124,7 +124,7 @@ async fn gas_webhook_redirect_limit_is_per_request_not_per_client() {
     .await;
 
     let gas = GasWebhookTranslator::new(&GasWebhookConfig {
-        endpoint_url: format!("{}/macros/s/abc/exec", server.base_url),
+        endpoint_url: format!("{}/macros/s/abc/exec", server.base_url).into(),
         bearer_token: None,
         timeout_ms: 5_000,
     })
@@ -170,7 +170,7 @@ async fn gas_webhook_rejects_more_than_max_redirects_within_a_single_request() {
 
     let make = |path: &str| {
         GasWebhookTranslator::new(&GasWebhookConfig {
-            endpoint_url: format!("{}{path}", server.base_url),
+            endpoint_url: format!("{}{path}", server.base_url).into(),
             bearer_token: None,
             timeout_ms: 5_000,
         })

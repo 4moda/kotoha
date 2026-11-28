@@ -9,16 +9,17 @@ use std::sync::Arc;
 use kotoha_core::application::{GlossaryManager, TranslatorManager};
 use kotoha_core::domain::{
     default_model_catalog, GlossaryProfile, GlossaryRepository, GlossarySettings, LanguageCode,
-    ModelProfile, SubtitleEntry, TranslationProviderConfig, TranslatorFactory,
+    ModelProfile, ProviderSecretKind, Secret, SecretStore, SecretWriter, SubtitleEntry,
+    TranslationProviderConfig, TranslatorFactory,
 };
 use kotoha_core::infrastructure::{
-    DefaultTranslatorFactory, MockTranslator, TomlGlossaryRepository,
+    DefaultTranslatorFactory, InMemorySecretStore, MockTranslator, TomlGlossaryRepository,
 };
 use kotoha_protocol::resolve_endpoint;
 use kotoha_setup::{
     discover_mumble_plugin_dirs, plugin_filename, AppSettings, DownloadPhase, DownloadProgress,
-    FileSettingsStore, InMemorySecretStore, MumblePluginDirKind, OverlayStyleSettings,
-    PluginInstallOutcome, TargetPlatform,
+    FileSettingsStore, MumblePluginDirKind, OverlayStyleSettings, PluginInstallOutcome,
+    TargetPlatform,
 };
 use kotoha_translate_http::HttpTranslatorFactory;
 use kotoha_translate_local::{CompositeTranslatorFactory, LocalNmtTranslatorFactory};
@@ -309,6 +310,36 @@ impl DownloadProgressEventDto {
     }
 }
 
+/// "Is configured" flags for every provider secret. The UI never receives secret values; it can
+/// only write them (`set_provider_secret`) or clear them (`clear_provider_secret`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct SecretStatusDto {
+    /// OpenAI-compatible API key is stored.
+    pub openai_api_key: bool,
+    /// `DeepL` API key is stored.
+    pub deepl_api_key: bool,
+    /// Google Cloud API key is stored.
+    pub google_cloud_api_key: bool,
+    /// GAS / webhook endpoint URL is stored.
+    pub gas_endpoint_url: bool,
+    /// GAS / webhook bearer token is stored.
+    pub gas_bearer_token: bool,
+}
+
+impl SecretStatusDto {
+    fn from_store(store: &dyn SecretStore) -> Self {
+        let flag = |kind: ProviderSecretKind| store.is_configured(&kind.secret_ref());
+        Self {
+            openai_api_key: flag(ProviderSecretKind::OpenAiApiKey),
+            deepl_api_key: flag(ProviderSecretKind::DeepLApiKey),
+            google_cloud_api_key: flag(ProviderSecretKind::GoogleCloudApiKey),
+            gas_endpoint_url: flag(ProviderSecretKind::GasEndpointUrl),
+            gas_bearer_token: flag(ProviderSecretKind::GasBearerToken),
+        }
+    }
+}
+
 /// Full runtime snapshot matching `AppRuntimeState` in `app/ui/src/types/kotoha.ts`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppRuntimeStateDto {
@@ -316,8 +347,10 @@ pub struct AppRuntimeStateDto {
     pub src_lang: String,
     /// Active target language code.
     pub tgt_lang: String,
-    /// Active translation provider configuration (secrets redacted before leaving Rust).
+    /// Active translation provider configuration (contains no secrets).
     pub provider: TranslationProviderConfig,
+    /// Which provider secrets are stored (booleans only; values are write-only).
+    pub secrets: SecretStatusDto,
     /// Current overlay display configuration.
     pub overlay_options: OverlayDisplayOptionsDto,
     /// Whether the overlay window is currently visible.
@@ -390,7 +423,7 @@ impl AppState {
 
         // Attempt immediate provider hydration when configured (e.g., HTTP or downloaded local NMT).
         // Fall back gracefully to MockTranslator if local model weights have not been downloaded yet.
-        let factory = build_composite_factory(&models_root_dir);
+        let factory = build_composite_factory(&models_root_dir, secret_store.clone());
         if let Ok(translator) = factory.create(&settings.translation_provider) {
             // Recreate with the hydrated translator when available.
             let hydrated =
@@ -490,16 +523,19 @@ impl AppState {
         &self.default_glossary_dir
     }
 
-    /// Builds a [`CompositeTranslatorFactory`] targeting `self.models_root_dir`.
+    /// Builds a [`CompositeTranslatorFactory`] targeting `self.models_root_dir` that resolves
+    /// provider secrets from this state's secret store.
     #[must_use]
     pub fn translator_factory(&self) -> Arc<CompositeTranslatorFactory> {
-        Arc::new(build_composite_factory(&self.models_root_dir))
+        Arc::new(build_composite_factory(
+            &self.models_root_dir,
+            self.secret_store.clone(),
+        ))
     }
 
     /// Returns the full runtime snapshot serialized for the React UI (`get_app_state`).
     pub async fn snapshot(&self) -> AppRuntimeStateDto {
         let settings = self.settings.read().await.clone();
-        let sanitized_provider = settings.sanitized_for_disk().translation_provider;
         let overlay_options = OverlayDisplayOptionsDto::from(&settings.overlay);
         let overlay_visible = *self.overlay_visible.read().await;
         let glossary = self.glossary_snapshot(&settings).await;
@@ -511,7 +547,8 @@ impl AppState {
         AppRuntimeStateDto {
             src_lang: settings.src_lang.as_str().to_owned(),
             tgt_lang: settings.tgt_lang.as_str().to_owned(),
-            provider: sanitized_provider,
+            provider: settings.translation_provider.clone(),
+            secrets: SecretStatusDto::from_store(self.secret_store.as_ref()),
             overlay_options,
             overlay_visible,
             glossary,
@@ -609,9 +646,17 @@ impl AppState {
             }
         }
 
-        // Preserve previously persisted secret when UI submits a redacted/empty key field
-        // (e.g., when only changing language pair or timeout).
-        let effective_config = rehydrate_if_redacted(&config, &current.translation_provider);
+        // A credential is bound to the host it was entered for: switching providers or pointing
+        // the OpenAI-compatible provider at another origin drops the stored key so it can never
+        // be sent to the new host.
+        let effective_config = config;
+        for secret_ref in
+            effective_config.secrets_invalidated_by_change_from(&current.translation_provider)
+        {
+            self.secret_store
+                .delete(&secret_ref)
+                .map_err(|err| format!("failed to clear provider secret: {err}"))?;
+        }
         next.translation_provider = effective_config.clone();
 
         let factory = self.translator_factory();
@@ -634,11 +679,12 @@ impl AppState {
             TranslationProviderConfig::OpenAiCompatible {
                 base_url, model, ..
             } => !base_url.trim().is_empty() && !model.trim().is_empty(),
-            TranslationProviderConfig::DeepL { api_key, .. }
-            | TranslationProviderConfig::GoogleCloud { api_key, .. } => !api_key.trim().is_empty(),
-            TranslationProviderConfig::GasWebhook { endpoint_url, .. } => {
-                !endpoint_url.trim().is_empty()
-            }
+            TranslationProviderConfig::DeepL { .. }
+            | TranslationProviderConfig::GoogleCloud { .. }
+            | TranslationProviderConfig::GasWebhook { .. } => effective_config
+                .required_secret_refs()
+                .iter()
+                .all(|r| self.secret_store.is_configured(r)),
             TranslationProviderConfig::Mock { .. } => true,
         };
 
@@ -661,6 +707,99 @@ impl AppState {
         }
 
         Ok(self.snapshot().await)
+    }
+
+    /// Returns which provider secrets are stored (booleans only).
+    #[must_use]
+    pub fn secret_status(&self) -> SecretStatusDto {
+        SecretStatusDto::from_store(self.secret_store.as_ref())
+    }
+
+    /// Stores a provider secret (write-only). `kind` must belong to the active provider; the
+    /// value is never echoed back. Replacing the GAS endpoint also clears the GAS bearer token,
+    /// and the active translator is rebuilt when the provider becomes usable.
+    pub async fn set_provider_secret(
+        &self,
+        kind: ProviderSecretKind,
+        value: String,
+    ) -> Result<SecretStatusDto, String> {
+        let secret = Secret::new(value.trim());
+        if secret.is_blank() {
+            return Err("secret value must not be empty (use clear to remove it)".to_owned());
+        }
+        let _write_tx = self.settings_write_mutex.lock().await;
+        let config = self.settings.read().await.translation_provider.clone();
+        if !kind.applies_to(&config) {
+            return Err(
+                "this secret does not belong to the active translation provider".to_owned(),
+            );
+        }
+
+        let secret_ref = kind.secret_ref();
+        let dependents = kind.dependent_refs_to_clear();
+        let mut backup: Vec<(kotoha_core::domain::SecretRef, Option<Secret>)> = Vec::new();
+        for r in std::iter::once(&secret_ref).chain(dependents.iter()) {
+            backup.push((
+                r.clone(),
+                self.secret_store
+                    .resolve_if_set(r)
+                    .map_err(|err| format!("failed to read secret store: {err}"))?,
+            ));
+        }
+        for dep in &dependents {
+            self.secret_store
+                .delete(dep)
+                .map_err(|err| format!("failed to clear dependent secret: {err}"))?;
+        }
+        self.secret_store
+            .set(&secret_ref, secret)
+            .map_err(|err| format!("failed to store secret: {err}"))?;
+
+        if let Err(err) = self.rebuild_active_provider(&config).await {
+            // Roll back so an invalid value never replaces a working one.
+            for (r, old) in backup {
+                let _ = old.map_or_else(
+                    || self.secret_store.delete(&r),
+                    |v| self.secret_store.set(&r, v),
+                );
+            }
+            return Err(err);
+        }
+        Ok(self.secret_status())
+    }
+
+    /// Deletes a provider secret (idempotent).
+    pub async fn clear_provider_secret(
+        &self,
+        kind: ProviderSecretKind,
+    ) -> Result<SecretStatusDto, String> {
+        let _write_tx = self.settings_write_mutex.lock().await;
+        self.secret_store
+            .delete(&kind.secret_ref())
+            .map_err(|err| format!("failed to clear secret: {err}"))?;
+        for dep in kind.dependent_refs_to_clear() {
+            self.secret_store
+                .delete(&dep)
+                .map_err(|err| format!("failed to clear dependent secret: {err}"))?;
+        }
+        Ok(self.secret_status())
+    }
+
+    async fn rebuild_active_provider(
+        &self,
+        config: &TranslationProviderConfig,
+    ) -> Result<(), String> {
+        let ready = config
+            .required_secret_refs()
+            .iter()
+            .all(|r| self.secret_store.is_configured(r));
+        if !ready || matches!(config, TranslationProviderConfig::LocalModel { .. }) {
+            return Ok(());
+        }
+        self.translator_manager
+            .switch_provider(config.clone(), self.translator_factory())
+            .await
+            .map_err(|err| format!("failed to switch translation provider: {err}"))
     }
 
     /// Updates glossary selection, `hotwords_score`, and optional custom glossary directory.
@@ -850,9 +989,9 @@ impl AppState {
             .find(|profile| profile.model_id == model_id)
     }
 
-    /// Returns a clone of current persisted settings (with secrets redacted).
+    /// Returns a clone of the current persisted settings (they contain no secrets).
     pub async fn sanitized_settings(&self) -> AppSettings {
-        self.settings.read().await.sanitized_for_disk()
+        self.settings.read().await.clone()
     }
 
     /// Returns the path where `kotoha-settings.json` is stored.
@@ -908,10 +1047,9 @@ impl AppState {
 
     async fn persist_settings_async(&self, settings: AppSettings) -> Result<(), String> {
         let store = self.settings_store.clone();
-        let secret_store = Arc::clone(&self.secret_store);
         spawn_blocking(move || {
             store
-                .save_sanitized(&settings, secret_store.as_ref())
+                .save(&settings)
                 .map_err(|err| format!("failed to persist settings: {err}"))
         })
         .await
@@ -1105,9 +1243,12 @@ pub fn resolve_app_data_dir() -> PathBuf {
     PathBuf::from(".kotoha")
 }
 
-fn build_composite_factory(models_root_dir: &Path) -> CompositeTranslatorFactory {
+fn build_composite_factory(
+    models_root_dir: &Path,
+    secrets: Arc<dyn SecretStore>,
+) -> CompositeTranslatorFactory {
     let local_factory = LocalNmtTranslatorFactory::new(models_root_dir);
-    let http_factory = HttpTranslatorFactory::new();
+    let http_factory = HttpTranslatorFactory::with_secret_store(secrets);
     CompositeTranslatorFactory::new(local_factory, http_factory)
 }
 
@@ -1302,80 +1443,5 @@ fn slugify_profile_id(name: &str) -> String {
         format!("{trimmed}-{}", fnv1a_64_hex(trimmed_input))
     } else {
         trimmed.to_owned()
-    }
-}
-
-fn rehydrate_if_redacted(
-    incoming: &TranslationProviderConfig,
-    existing: &TranslationProviderConfig,
-) -> TranslationProviderConfig {
-    match (incoming, existing) {
-        (
-            TranslationProviderConfig::OpenAiCompatible {
-                base_url,
-                model,
-                api_key: None,
-                timeout_ms,
-            },
-            TranslationProviderConfig::OpenAiCompatible {
-                api_key: Some(existing_key),
-                ..
-            },
-        ) => TranslationProviderConfig::OpenAiCompatible {
-            base_url: base_url.clone(),
-            model: model.clone(),
-            api_key: Some(existing_key.clone()),
-            timeout_ms: *timeout_ms,
-        },
-        (
-            TranslationProviderConfig::DeepL {
-                api_key,
-                use_free_endpoint,
-                timeout_ms,
-            },
-            TranslationProviderConfig::DeepL {
-                api_key: existing_key,
-                ..
-            },
-        ) if api_key.trim().is_empty() && !existing_key.trim().is_empty() => {
-            TranslationProviderConfig::DeepL {
-                api_key: existing_key.clone(),
-                use_free_endpoint: *use_free_endpoint,
-                timeout_ms: *timeout_ms,
-            }
-        }
-        (
-            TranslationProviderConfig::GoogleCloud {
-                api_key,
-                project_id,
-                timeout_ms,
-            },
-            TranslationProviderConfig::GoogleCloud {
-                api_key: existing_key,
-                ..
-            },
-        ) if api_key.trim().is_empty() && !existing_key.trim().is_empty() => {
-            TranslationProviderConfig::GoogleCloud {
-                api_key: existing_key.clone(),
-                project_id: project_id.clone(),
-                timeout_ms: *timeout_ms,
-            }
-        }
-        (
-            TranslationProviderConfig::GasWebhook {
-                endpoint_url,
-                bearer_token: None,
-                timeout_ms,
-            },
-            TranslationProviderConfig::GasWebhook {
-                bearer_token: Some(existing_token),
-                ..
-            },
-        ) => TranslationProviderConfig::GasWebhook {
-            endpoint_url: endpoint_url.clone(),
-            bearer_token: Some(existing_token.clone()),
-            timeout_ms: *timeout_ms,
-        },
-        _ => incoming.clone(),
     }
 }

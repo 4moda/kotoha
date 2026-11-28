@@ -57,28 +57,23 @@ export interface OpenAiCompatibleProviderConfig {
   type: 'openai_compatible';
   base_url: string;
   model: string;
-  api_key: string | null;
   timeout_ms: number;
 }
 
 export interface DeepLProviderConfig {
   type: 'deepl';
-  api_key: string;
   use_free_endpoint: boolean;
   timeout_ms: number;
 }
 
 export interface GoogleCloudProviderConfig {
   type: 'google_cloud';
-  api_key: string;
   project_id: string | null;
   timeout_ms: number;
 }
 
 export interface GasWebhookProviderConfig {
   type: 'gas_webhook';
-  endpoint_url: string;
-  bearer_token: string | null;
   timeout_ms: number;
 }
 
@@ -167,10 +162,27 @@ export interface DownloadProgressEvent {
   error_message?: string;
 }
 
+export type ProviderSecretKind =
+  | 'open_ai_api_key'
+  | 'deep_l_api_key'
+  | 'google_cloud_api_key'
+  | 'gas_endpoint_url'
+  | 'gas_bearer_token';
+
+/** Which provider secrets are stored. Booleans only: secret values are write-only. */
+export interface SecretStatus {
+  openai_api_key: boolean;
+  deepl_api_key: boolean;
+  google_cloud_api_key: boolean;
+  gas_endpoint_url: boolean;
+  gas_bearer_token: boolean;
+}
+
 export interface AppRuntimeState {
   src_lang: string;
   tgt_lang: string;
   provider: TranslationProviderConfig;
+  secrets: SecretStatus;
   overlay_options: OverlayDisplayOptions;
   overlay_visible: boolean;
   glossary: GlossarySettingsState;

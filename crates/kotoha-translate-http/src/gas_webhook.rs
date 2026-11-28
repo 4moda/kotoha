@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use kotoha_core::domain::{
-    CoreError, GlossaryPlaceholderGuard, TranslationRequest, TranslationResult, Translator,
+    CoreError, GlossaryPlaceholderGuard, Secret, TranslationRequest, TranslationResult, Translator,
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, Url};
@@ -17,33 +17,23 @@ use crate::client::{
 };
 
 /// Configuration for [`GasWebhookTranslator`].
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct GasWebhookConfig {
     /// Deployed Google Apps Script Web App URL or custom webhook endpoint.
-    pub endpoint_url: String,
+    ///
+    /// Held as a [`Secret`]: a GAS deployment URL works as a bearer capability, so it is
+    /// redacted in `Debug` and never included in error messages.
+    pub endpoint_url: Secret,
     /// Optional Bearer authorization token.
-    pub bearer_token: Option<String>,
+    pub bearer_token: Option<Secret>,
     /// HTTP timeout in milliseconds (`100..=120_000`).
     pub timeout_ms: u64,
-}
-
-impl std::fmt::Debug for GasWebhookConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GasWebhookConfig")
-            .field("endpoint_url", &self.endpoint_url)
-            .field(
-                "bearer_token",
-                &self.bearer_token.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("timeout_ms", &self.timeout_ms)
-            .finish()
-    }
 }
 
 impl GasWebhookConfig {
     /// Creates a [`GasWebhookConfig`] with [`DEFAULT_HTTP_TIMEOUT_MS`].
     #[must_use]
-    pub fn new(endpoint_url: impl Into<String>, bearer_token: Option<String>) -> Self {
+    pub fn new(endpoint_url: impl Into<Secret>, bearer_token: Option<Secret>) -> Self {
         Self {
             endpoint_url: endpoint_url.into(),
             bearer_token,
@@ -56,7 +46,7 @@ impl GasWebhookConfig {
 #[derive(Clone)]
 pub struct GasWebhookTranslator {
     client: Client,
-    endpoint_url: String,
+    endpoint_url: Secret,
     auth_header: Option<HeaderValue>,
 }
 
@@ -95,8 +85,8 @@ impl GasWebhookTranslator {
     pub fn new(config: &GasWebhookConfig) -> Result<Self, CoreError> {
         let auth_header = config
             .bearer_token
-            .as_deref()
-            .map(str::trim)
+            .as_ref()
+            .map(|t| t.expose().trim())
             .filter(|t| !t.is_empty())
             .map(|token| {
                 validate_sensitive_header_value(
@@ -108,7 +98,7 @@ impl GasWebhookTranslator {
 
         let endpoint_url = validate_http_url(
             "GasWebhook.endpoint_url",
-            &config.endpoint_url,
+            config.endpoint_url.expose(),
             auth_header.is_some(),
         )?;
 
@@ -125,15 +115,9 @@ impl GasWebhookTranslator {
 
         Ok(Self {
             client,
-            endpoint_url,
+            endpoint_url: Secret::new(endpoint_url),
             auth_header,
         })
-    }
-
-    /// Returns the validated webhook endpoint URL.
-    #[must_use]
-    pub fn endpoint_url(&self) -> &str {
-        &self.endpoint_url
     }
 }
 
@@ -174,7 +158,7 @@ impl Translator for GasWebhookTranslator {
 
         let response = self
             .client
-            .post(&self.endpoint_url)
+            .post(self.endpoint_url.expose())
             .headers(headers)
             .json(&payload)
             .send()

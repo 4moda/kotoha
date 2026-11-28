@@ -1,10 +1,12 @@
 import { useState } from 'react';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { createDefaultProviderConfig } from '../data/modelCatalog';
 import type {
   GlossarySettingsState,
   OverlayDisplayOptions,
+  ProviderSecretKind,
+  SecretStatus,
   TranslationProviderConfig,
 } from '../types/kotoha';
 import { TranslationSettings } from './TranslationSettings';
@@ -43,10 +45,24 @@ const defaultGlossarySettings: GlossarySettingsState = {
   glossary_dir: 'glossaries',
 };
 
+const NO_SECRETS: SecretStatus = {
+  openai_api_key: false,
+  deepl_api_key: false,
+  google_cloud_api_key: false,
+  gas_endpoint_url: false,
+  gas_bearer_token: false,
+};
+
 function StatefulTranslationSettings({
   initialProvider = createDefaultProviderConfig('local_model'),
+  secrets = NO_SECRETS,
+  onSetSecret = () => Promise.resolve(),
+  onClearSecret = () => Promise.resolve(),
 }: {
   initialProvider?: TranslationProviderConfig;
+  secrets?: SecretStatus;
+  onSetSecret?: (kind: ProviderSecretKind, value: string) => Promise<void>;
+  onClearSecret?: (kind: ProviderSecretKind) => Promise<void>;
 }) {
   const [srcLang, setSrcLang] = useState('en');
   const [tgtLang, setTgtLang] = useState('ja');
@@ -61,6 +77,7 @@ function StatefulTranslationSettings({
       srcLang={srcLang}
       tgtLang={tgtLang}
       provider={provider}
+      secrets={secrets}
       overlayOptions={overlayOptions}
       glossarySettings={glossarySettings}
       onChangeLanguages={(nextSrc, nextTgt) => {
@@ -68,6 +85,8 @@ function StatefulTranslationSettings({
         setTgtLang(nextTgt);
       }}
       onChangeProvider={setProvider}
+      onSetSecret={onSetSecret}
+      onClearSecret={onClearSecret}
       onChangeOverlayOptions={setOverlayOptions}
       onChangeGlossarySettings={(next) =>
         setGlossarySettings((prev) => ({
@@ -124,10 +143,13 @@ describe('TranslationSettings', () => {
         srcLang="en"
         tgtLang="ja"
         provider={createDefaultProviderConfig('local_model')}
+        secrets={NO_SECRETS}
         overlayOptions={defaultOverlayOptions}
         glossarySettings={defaultGlossarySettings}
         onChangeLanguages={vi.fn()}
         onChangeProvider={onChangeProvider}
+        onSetSecret={vi.fn()}
+        onClearSecret={vi.fn()}
         onChangeOverlayOptions={vi.fn()}
         onChangeGlossarySettings={vi.fn()}
       />,
@@ -157,10 +179,13 @@ describe('TranslationSettings', () => {
           device: 'cuda',
           threads: null,
         }}
+        secrets={NO_SECRETS}
         overlayOptions={defaultOverlayOptions}
         glossarySettings={defaultGlossarySettings}
         onChangeLanguages={vi.fn()}
         onChangeProvider={onChangeProvider}
+        onSetSecret={vi.fn()}
+        onClearSecret={vi.fn()}
         onChangeOverlayOptions={vi.fn()}
         onChangeGlossarySettings={vi.fn()}
       />,
@@ -192,10 +217,13 @@ describe('TranslationSettings', () => {
         srcLang="en"
         tgtLang="ja"
         provider={createDefaultProviderConfig('local_model')}
+        secrets={NO_SECRETS}
         overlayOptions={defaultOverlayOptions}
         glossarySettings={defaultGlossarySettings}
         onChangeLanguages={onChangeLanguages}
         onChangeProvider={vi.fn()}
+        onSetSecret={vi.fn()}
+        onClearSecret={vi.fn()}
         onChangeOverlayOptions={onChangeOverlayOptions}
         onChangeGlossarySettings={vi.fn()}
       />,
@@ -234,10 +262,13 @@ describe('TranslationSettings', () => {
         srcLang="en"
         tgtLang="ja"
         provider={createDefaultProviderConfig('local_model')}
+        secrets={NO_SECRETS}
         overlayOptions={defaultOverlayOptions}
         glossarySettings={defaultGlossarySettings}
         onChangeLanguages={vi.fn()}
         onChangeProvider={vi.fn()}
+        onSetSecret={vi.fn()}
+        onClearSecret={vi.fn()}
         onChangeOverlayOptions={vi.fn()}
         onChangeGlossarySettings={onChangeGlossarySettings}
       />,
@@ -276,5 +307,71 @@ describe('TranslationSettings', () => {
       enabled_profiles: ['My Profile'],
       hotwords_score: 2.4,
     });
+  });
+  it('renders write-only secret fields that never show a stored value', async () => {
+    const onSetSecret = vi.fn(() => Promise.resolve());
+    render(
+      <StatefulTranslationSettings
+        initialProvider={createDefaultProviderConfig('deepl')}
+        onSetSecret={onSetSecret}
+      />,
+    );
+
+    const input = document.getElementById('deepl-api-key') as HTMLInputElement;
+    expect(input.type).toBe('password');
+    expect(input.value).toBe('');
+    expect(screen.getByTestId('secret-badge-deep_l_api_key')).toHaveTextContent('未設定');
+    expect(screen.getByTestId('secret-set-deep_l_api_key')).toBeDisabled();
+    expect(screen.getByTestId('secret-clear-deep_l_api_key')).toBeDisabled();
+
+    fireEvent.change(input, { target: { value: 'super-secret-key' } });
+    fireEvent.click(screen.getByTestId('secret-set-deep_l_api_key'));
+    expect(onSetSecret).toHaveBeenCalledWith('deep_l_api_key', 'super-secret-key');
+
+    // The typed value is wiped from the field once stored and appears nowhere in the DOM.
+    await waitFor(() => expect(input.value).toBe(''));
+    expect(document.body.innerHTML).not.toContain('super-secret-key');
+  });
+
+  it('keeps the draft when storing fails and clears via the clear button', async () => {
+    const onSetSecret = vi.fn(() => Promise.reject(new Error('nope')));
+    const onClearSecret = vi.fn(() => Promise.resolve());
+    render(
+      <StatefulTranslationSettings
+        initialProvider={createDefaultProviderConfig('google_cloud')}
+        secrets={{ ...NO_SECRETS, google_cloud_api_key: true }}
+        onSetSecret={onSetSecret}
+        onClearSecret={onClearSecret}
+      />,
+    );
+
+    expect(screen.getByTestId('secret-badge-google_cloud_api_key')).toHaveTextContent(
+      '設定済み',
+    );
+    const input = document.getElementById('google-api-key') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: 'AIza-bad' } });
+    fireEvent.click(screen.getByTestId('secret-set-google_cloud_api_key'));
+    await waitFor(() => expect(onSetSecret).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(screen.getByTestId('secret-set-google_cloud_api_key')).not.toBeDisabled(),
+    );
+    expect(input.value).toBe('AIza-bad');
+
+    fireEvent.click(screen.getByTestId('secret-clear-google_cloud_api_key'));
+    expect(onClearSecret).toHaveBeenCalledWith('google_cloud_api_key');
+  });
+
+  it('shows endpoint and optional bearer token fields for the GAS provider', () => {
+    render(
+      <StatefulTranslationSettings
+        initialProvider={createDefaultProviderConfig('gas_webhook')}
+        secrets={{ ...NO_SECRETS, gas_endpoint_url: true }}
+      />,
+    );
+    expect(screen.getByTestId('secret-badge-gas_endpoint_url')).toHaveTextContent('設定済み');
+    expect(screen.getByTestId('secret-badge-gas_bearer_token')).toHaveTextContent('未設定');
+    expect((document.getElementById('gas-endpoint-url') as HTMLInputElement).type).toBe(
+      'password',
+    );
   });
 });

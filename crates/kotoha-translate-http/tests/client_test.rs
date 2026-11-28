@@ -4,10 +4,14 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::{sample_request, MockHttpServer, ScriptedHttpResponse};
-use kotoha_core::domain::{CoreError, TranslationProviderConfig, Translator, TranslatorFactory};
+use kotoha_core::domain::{
+    CoreError, SecretRef, TranslationProviderConfig, Translator, TranslatorFactory,
+};
+use kotoha_core::infrastructure::InMemorySecretStore;
 use kotoha_translate_http::{
     DeepLConfig, DeepLTranslator, GasWebhookConfig, GasWebhookTranslator, GoogleCloudConfig,
     GoogleCloudTranslator, HttpTranslatorFactory, OpenAiCompatibleConfig,
@@ -90,7 +94,7 @@ async fn http_translators_block_redirects_on_api_key_endpoints_bound_response_si
 
     // [C2] API-key endpoints MUST NOT follow 302 redirects (non-2xx 302 fails without second hop)
     let deepl_redir = DeepLTranslator::new(&DeepLConfig {
-        api_key: "super-secret-dl".to_owned(),
+        api_key: "super-secret-dl".into(),
         use_free_endpoint: true,
         base_url: Some(format!("{}/redirect-api", server.base_url)),
         timeout_ms: 5_000,
@@ -125,7 +129,7 @@ async fn http_translators_block_redirects_on_api_key_endpoints_bound_response_si
         OpenAiCompatibleTranslator::new(&OpenAiCompatibleConfig {
             base_url: "http://api.openai.com/v1".to_owned(),
             model: "gpt-4o-mini".to_owned(),
-            api_key: Some("sk-secret".to_owned()),
+            api_key: Some("sk-secret".into()),
             timeout_ms: 5_000,
         }),
         Err(CoreError::NotConfigured(_))
@@ -157,14 +161,23 @@ async fn http_translators_block_redirects_on_api_key_endpoints_bound_response_si
 
     let gas_cfg = GasWebhookConfig::new(
         "https://script.google.com/macros/s/1/exec",
-        Some("ultra-secret-gas".to_owned()),
+        Some("ultra-secret-gas".into()),
     );
     let gas_t = GasWebhookTranslator::new(&gas_cfg).unwrap();
     assert!(!format!("{gas_cfg:?}").contains("ultra-secret-gas"));
     assert!(!format!("{gas_t:?}").contains("ultra-secret-gas"));
 
     // Factory constructs all HTTP providers and rejects invalid config cleanly
-    let factory = HttpTranslatorFactory::new()
+    let secrets = Arc::new(
+        InMemorySecretStore::new()
+            .with(&SecretRef::deepl_api_key(), "key")
+            .with(&SecretRef::google_cloud_api_key(), "key")
+            .with(
+                &SecretRef::gas_endpoint_url(),
+                format!("{}/macros/s/abc/exec", server.base_url),
+            ),
+    );
+    let factory = HttpTranslatorFactory::with_secret_store(secrets)
         .with_deepl_base_url(&server.base_url)
         .with_google_cloud_base_url(&server.base_url);
     assert!(factory
@@ -176,37 +189,31 @@ async fn http_translators_block_redirects_on_api_key_endpoints_bound_response_si
         .create(&TranslationProviderConfig::OpenAiCompatible {
             base_url: format!("{}/rate-limit/v1", server.base_url),
             model: "gpt-4o-mini".to_owned(),
-            api_key: None,
             timeout_ms: 2_000,
         })
         .is_ok());
     assert!(factory
         .create(&TranslationProviderConfig::DeepL {
-            api_key: "key".to_owned(),
             use_free_endpoint: true,
             timeout_ms: 2_000,
         })
         .is_ok());
     assert!(factory
         .create(&TranslationProviderConfig::GoogleCloud {
-            api_key: "key".to_owned(),
             project_id: None,
             timeout_ms: 2_000,
         })
         .is_ok());
     assert!(factory
-        .create(&TranslationProviderConfig::GasWebhook {
-            endpoint_url: format!("{}/macros/s/abc/exec", server.base_url),
-            bearer_token: None,
-            timeout_ms: 2_000,
-        })
+        .create(&TranslationProviderConfig::GasWebhook { timeout_ms: 2_000 })
         .is_ok());
     assert!(matches!(
-        factory.create(&TranslationProviderConfig::DeepL {
-            api_key: String::new(),
-            use_free_endpoint: true,
-            timeout_ms: 2_000,
-        }),
-        Err(CoreError::NotConfigured(_))
+        HttpTranslatorFactory::with_secret_store(Arc::new(InMemorySecretStore::new())).create(
+            &TranslationProviderConfig::DeepL {
+                use_free_endpoint: true,
+                timeout_ms: 2_000,
+            }
+        ),
+        Err(CoreError::SecretMissing(_))
     ));
 }

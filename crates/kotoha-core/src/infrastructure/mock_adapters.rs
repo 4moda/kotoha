@@ -194,8 +194,8 @@ impl Translator for MockTranslator {
 
 /// Phase 1 [`TranslatorFactory`] for mock translation.
 ///
-/// Supports [`TranslationProviderConfig::Mock`] and validates Phase 2 provider configurations
-/// with clear [`CoreError::NotConfigured`] / [`CoreError::UnsupportedInPhase1`] diagnostics.
+/// Supports [`TranslationProviderConfig::Mock`] and reports Phase 2 providers as
+/// [`CoreError::UnsupportedInPhase1`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultTranslatorFactory;
 
@@ -227,37 +227,16 @@ impl TranslatorFactory for DefaultTranslatorFactory {
                     "OpenAI-compatible provider '{model}' at '{base_url}' requires kotoha-translate-http (Phase 2)"
                 )))
             }
-            TranslationProviderConfig::DeepL { api_key, .. } => {
-                if api_key.trim().is_empty() {
-                    return Err(CoreError::NotConfigured(
-                        "DeepL requires a non-empty api_key".to_owned(),
-                    ));
-                }
-                Err(CoreError::UnsupportedInPhase1(
-                    "DeepL provider requires kotoha-translate-http (Phase 2)".to_owned(),
-                ))
-            }
-            TranslationProviderConfig::GoogleCloud { api_key, .. } => {
-                if api_key.trim().is_empty() {
-                    return Err(CoreError::NotConfigured(
-                        "GoogleCloud Translation requires a non-empty api_key".to_owned(),
-                    ));
-                }
-                Err(CoreError::UnsupportedInPhase1(
-                    "Google Cloud Translation provider requires kotoha-translate-http (Phase 2)"
-                        .to_owned(),
-                ))
-            }
-            TranslationProviderConfig::GasWebhook { endpoint_url, .. } => {
-                if endpoint_url.trim().is_empty() {
-                    return Err(CoreError::NotConfigured(
-                        "GasWebhook requires a non-empty endpoint_url".to_owned(),
-                    ));
-                }
-                Err(CoreError::UnsupportedInPhase1(
-                    "GAS Webhook provider requires kotoha-translate-http (Phase 2)".to_owned(),
-                ))
-            }
+            TranslationProviderConfig::DeepL { .. } => Err(CoreError::UnsupportedInPhase1(
+                "DeepL provider requires kotoha-translate-http (Phase 2)".to_owned(),
+            )),
+            TranslationProviderConfig::GoogleCloud { .. } => Err(CoreError::UnsupportedInPhase1(
+                "Google Cloud Translation provider requires kotoha-translate-http (Phase 2)"
+                    .to_owned(),
+            )),
+            TranslationProviderConfig::GasWebhook { .. } => Err(CoreError::UnsupportedInPhase1(
+                "GAS Webhook provider requires kotoha-translate-http (Phase 2)".to_owned(),
+            )),
         }
     }
 }

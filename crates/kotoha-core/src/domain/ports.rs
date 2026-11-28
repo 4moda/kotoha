@@ -10,6 +10,7 @@ use crate::domain::entities::{
     TranslationProviderConfig, TranslationRequest, TranslationResult,
 };
 use crate::domain::error::CoreError;
+use crate::domain::secret::{Secret, SecretRef};
 
 /// Per-speaker stateful streaming speech-to-text recognizer.
 pub trait SttStream: Send {
@@ -55,6 +56,39 @@ pub trait Translator: Send + Sync {
 
     /// Translates the text in `req` into `req.tgt_lang`.
     async fn translate(&self, req: TranslationRequest) -> Result<TranslationResult, CoreError>;
+}
+
+/// Port resolving a persisted [`SecretRef`] into a [`Secret`] value.
+///
+/// Implementations: in-memory (tests), environment variables (CLI / E2E) and, as a follow-up,
+/// the OS keychain. Implementations must never include secret values in errors or `Debug`.
+pub trait SecretStore: Send + Sync + std::fmt::Debug {
+    /// Resolves `secret_ref`, returning [`CoreError::SecretMissing`] if it is not set.
+    fn resolve(&self, secret_ref: &SecretRef) -> Result<Secret, CoreError>;
+
+    /// Returns `true` if `secret_ref` resolves to a non-blank value (never exposes the value).
+    fn is_configured(&self, secret_ref: &SecretRef) -> bool {
+        self.resolve(secret_ref).is_ok_and(|s| !s.is_blank())
+    }
+
+    /// Resolves `secret_ref`, mapping "not set" to `Ok(None)` (for optional secrets).
+    fn resolve_if_set(&self, secret_ref: &SecretRef) -> Result<Option<Secret>, CoreError> {
+        match self.resolve(secret_ref) {
+            Ok(secret) => Ok(Some(secret)),
+            Err(CoreError::SecretMissing(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+/// Write side of a [`SecretStore`] (set / delete). Not implemented by read-only stores such as the
+/// environment-variable store.
+pub trait SecretWriter: SecretStore {
+    /// Stores `value` under `secret_ref`, replacing any previous value.
+    fn set(&self, secret_ref: &SecretRef, value: Secret) -> Result<(), CoreError>;
+
+    /// Deletes the value under `secret_ref` (idempotent when absent).
+    fn delete(&self, secret_ref: &SecretRef) -> Result<(), CoreError>;
 }
 
 /// Factory constructing a [`Translator`] instance from a runtime [`TranslationProviderConfig`].

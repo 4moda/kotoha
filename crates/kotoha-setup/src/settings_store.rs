@@ -1,15 +1,17 @@
-//! Sanitized application settings store with secret separation and atomic JSON persistence.
+//! Application settings store with atomic JSON persistence.
+//!
+//! Settings contain no secrets at all (see `kotoha_core::domain::SecretStore`), so they are
+//! serialized as-is. Settings files written by older builds that embedded plaintext keys are
+//! migrated on load: the values move into the secret store and the file is rewritten.
 
-use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
 
 use kotoha_core::domain::{
-    ComputeDevice, GlossarySettings, LanguageCode, TranslationProviderConfig,
-    DEFAULT_HOTWORDS_SCORE,
+    ComputeDevice, GlossarySettings, LanguageCode, ProviderSecretKind, Secret, SecretWriter,
+    TranslationProviderConfig, DEFAULT_HOTWORDS_SCORE,
 };
 use serde::{Deserialize, Serialize};
 
@@ -42,14 +44,8 @@ pub const DEFAULT_OVERLAY_HEIGHT: u32 = 260;
 /// Default settings JSON filename.
 pub const SETTINGS_FILENAME: &str = "kotoha-settings.json";
 
-/// Redaction sentinel stored on disk or rejected if misconfigured, ensuring secrets are kept out of
-/// `kotoha-settings.json`.
-pub const SECRET_STORE_SENTINEL: &str = "__KOTOHA_SECRET_STORE__";
-
-const SECRET_KEY_OPENAI_API_KEY: &str = "translation.openai_compatible.api_key";
-const SECRET_KEY_DEEPL_API_KEY: &str = "translation.deepl.api_key";
-const SECRET_KEY_GOOGLE_CLOUD_API_KEY: &str = "translation.google_cloud.api_key";
-const SECRET_KEY_GAS_BEARER_TOKEN: &str = "translation.gas_webhook.bearer_token";
+/// Placeholder older builds wrote instead of a real secret; never migrated as a value.
+const LEGACY_SECRET_SENTINEL: &str = "__KOTOHA_SECRET_STORE__";
 
 /// Persistent styling and geometry preferences for the transparent subtitle overlay window.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -176,87 +172,10 @@ impl AppSettings {
         self.overlay.validate()?;
         Ok(())
     }
-
-    /// Returns a copy of `self` with all API keys / bearer tokens stripped or replaced with
-    /// non-secret placeholders so secrets are never written to plaintext JSON files.
-    #[must_use]
-    pub fn sanitized_for_disk(&self) -> Self {
-        let mut cloned = self.clone();
-        cloned.translation_provider = redact_provider_secrets(&cloned.translation_provider);
-        cloned
-    }
 }
 
-/// Abstract secret storage port (implemented by OS keychain in Tauri or [`InMemorySecretStore`] in tests).
-pub trait SecretStore: Send + Sync {
-    /// Retrieves a stored secret for `key`, or `Ok(None)` if absent.
-    fn get_secret(&self, key: &str) -> Result<Option<String>, SetupError>;
-
-    /// Persists or updates a secret under `key`.
-    fn set_secret(&self, key: &str, value: &str) -> Result<(), SetupError>;
-
-    /// Deletes any secret stored under `key` (idempotent when absent).
-    fn delete_secret(&self, key: &str) -> Result<(), SetupError>;
-}
-
-/// Thread-safe in-memory [`SecretStore`] implementation for unit/integration testing and fallback runs.
-#[derive(Debug, Default)]
-pub struct InMemorySecretStore {
-    secrets: RwLock<HashMap<String, String>>,
-}
-
-impl InMemorySecretStore {
-    /// Creates an empty [`InMemorySecretStore`].
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns the number of currently stored secret entries.
-    pub fn len(&self) -> Result<usize, SetupError> {
-        let guard = self.secrets.read().map_err(|_| {
-            SetupError::InvalidConfig("in-memory secret store lock poisoned".to_owned())
-        })?;
-        Ok(guard.len())
-    }
-
-    /// Returns `true` if no secrets are currently stored.
-    pub fn is_empty(&self) -> Result<bool, SetupError> {
-        Ok(self.len()? == 0)
-    }
-}
-
-impl SecretStore for InMemorySecretStore {
-    fn get_secret(&self, key: &str) -> Result<Option<String>, SetupError> {
-        let guard = self.secrets.read().map_err(|_| {
-            SetupError::InvalidConfig("in-memory secret store lock poisoned".to_owned())
-        })?;
-        Ok(guard.get(key).cloned())
-    }
-
-    fn set_secret(&self, key: &str, value: &str) -> Result<(), SetupError> {
-        self.secrets
-            .write()
-            .map_err(|_| {
-                SetupError::InvalidConfig("in-memory secret store lock poisoned".to_owned())
-            })?
-            .insert(key.to_owned(), value.to_owned());
-        Ok(())
-    }
-
-    fn delete_secret(&self, key: &str) -> Result<(), SetupError> {
-        self.secrets
-            .write()
-            .map_err(|_| {
-                SetupError::InvalidConfig("in-memory secret store lock poisoned".to_owned())
-            })?
-            .remove(key);
-        Ok(())
-    }
-}
-
-/// Persistent JSON settings store writing sanitized settings atomically to `kotoha-settings.json`
-/// (`0600` on Unix) while delegating API keys / bearer tokens to a [`SecretStore`].
+/// Persistent JSON settings store writing settings atomically to `kotoha-settings.json`
+/// (`0600` on Unix).
 #[derive(Debug, Clone)]
 pub struct FileSettingsStore {
     settings_path: PathBuf,
@@ -283,28 +202,14 @@ impl FileSettingsStore {
         &self.settings_path
     }
 
-    /// Saves `settings` safely:
-    /// 1. Validates `settings`.
-    /// 2. Persists any API keys / bearer tokens via `secret_store` (or deletes cleared secrets).
-    /// 3. Strips/redacts all secret fields from the JSON representation and refuses serialization
-    ///    if any secret check fails.
-    /// 4. Writes atomically via unique `.tmp` sibling + `sync_all` + `0600` permissions (Unix) +
-    ///    `rename`.
-    pub fn save_sanitized(
-        &self,
-        settings: &AppSettings,
-        secret_store: &dyn SecretStore,
-    ) -> Result<(), SetupError> {
+    /// Saves `settings` safely: validates, serializes (settings hold no secrets) and writes
+    /// atomically via unique `.tmp` sibling + `sync_all` + `0600` permissions (Unix) + `rename`.
+    pub fn save(&self, settings: &AppSettings) -> Result<(), SetupError> {
         settings.validate()?;
 
-        sync_provider_secrets(&settings.translation_provider, secret_store)?;
-
-        let sanitized = settings.sanitized_for_disk();
-        let json = serde_json::to_string_pretty(&sanitized).map_err(|err| {
-            SetupError::InvalidConfig(format!("failed to serialize sanitized settings: {err}"))
+        let json = serde_json::to_string_pretty(settings).map_err(|err| {
+            SetupError::InvalidConfig(format!("failed to serialize settings: {err}"))
         })?;
-
-        verify_no_plaintext_secrets_in_json(&settings.translation_provider, &json)?;
 
         if let Some(parent) = self.settings_path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -356,25 +261,99 @@ impl FileSettingsStore {
     }
 
     /// Loads `kotoha-settings.json` (returning [`AppSettings::default`] if the file does not yet
-    /// exist) and re-hydrates API keys / bearer tokens from `secret_store`.
-    pub fn load(&self, secret_store: &dyn SecretStore) -> Result<AppSettings, SetupError> {
+    /// exist).
+    ///
+    /// Files written by older builds may embed plaintext `api_key` / `bearer_token` /
+    /// `endpoint_url` values inside `translation_provider`. Those values are moved into
+    /// `secrets` (placeholders and empty values are dropped) and the file is rewritten in the
+    /// current secret-free shape, so loading never fails because of the legacy layout.
+    pub fn load(&self, secrets: &dyn SecretWriter) -> Result<AppSettings, SetupError> {
         let raw = match fs::read_to_string(&self.settings_path) {
             Ok(contents) => contents,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(AppSettings::default()),
             Err(err) => return Err(SetupError::Io(err)),
         };
 
-        let mut loaded: AppSettings = serde_json::from_str(&raw).map_err(|err| {
+        let corrupted = |err: serde_json::Error| {
             SetupError::InvalidConfig(format!(
                 "corrupted settings JSON at '{}': {err}",
                 self.settings_path.display()
             ))
-        })?;
+        };
+        let mut value: serde_json::Value = serde_json::from_str(&raw).map_err(corrupted)?;
+        let migrated = migrate_legacy_provider_secrets(&mut value, secrets)?;
+        let loaded: AppSettings = serde_json::from_value(value).map_err(corrupted)?;
         loaded.validate()?;
 
-        rehydrate_provider_secrets(&mut loaded.translation_provider, secret_store)?;
+        if migrated {
+            self.save(&loaded)?;
+        }
         Ok(loaded)
     }
+}
+
+/// Moves legacy plaintext secret fields out of `translation_provider` into `secrets`.
+/// Returns `true` if any legacy field was present (the caller then rewrites the file).
+fn migrate_legacy_provider_secrets(
+    value: &mut serde_json::Value,
+    secrets: &dyn SecretWriter,
+) -> Result<bool, SetupError> {
+    let Some(provider) = value
+        .get_mut("translation_provider")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(false);
+    };
+    let kind = provider
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+
+    let mappings: &[(&str, Option<ProviderSecretKind>)] = match kind.as_str() {
+        "open_ai_compatible" | "openai_compatible" => &[
+            ("api_key", Some(ProviderSecretKind::OpenAiApiKey)),
+            ("bearer_token", None),
+            ("endpoint_url", None),
+        ],
+        "deep_l" | "deepl" => &[
+            ("api_key", Some(ProviderSecretKind::DeepLApiKey)),
+            ("bearer_token", None),
+            ("endpoint_url", None),
+        ],
+        "google_cloud" => &[
+            ("api_key", Some(ProviderSecretKind::GoogleCloudApiKey)),
+            ("bearer_token", None),
+            ("endpoint_url", None),
+        ],
+        "gas_webhook" => &[
+            ("api_key", None),
+            ("bearer_token", Some(ProviderSecretKind::GasBearerToken)),
+            ("endpoint_url", Some(ProviderSecretKind::GasEndpointUrl)),
+        ],
+        _ => &[
+            ("api_key", None),
+            ("bearer_token", None),
+            ("endpoint_url", None),
+        ],
+    };
+
+    let mut migrated = false;
+    // Endpoint first, so a legacy bearer token written afterwards is not cleared by the
+    // "new endpoint invalidates the token" rule applied by the application layer.
+    for (field, target) in mappings.iter().rev() {
+        let Some(old) = provider.remove(*field) else {
+            continue;
+        };
+        migrated = true;
+        let text = old.as_str().map(str::trim).unwrap_or_default();
+        if let Some(kind) = target {
+            if !text.is_empty() && text != LEGACY_SECRET_SENTINEL {
+                secrets.set(&kind.secret_ref(), Secret::new(text))?;
+            }
+        }
+    }
+    Ok(migrated)
 }
 
 fn default_lang(code: &str) -> LanguageCode {
@@ -388,163 +367,6 @@ fn default_lang(code: &str) -> LanguageCode {
                 .unwrap_or_else(|| default_lang("en"))
         })
     })
-}
-
-fn redact_provider_secrets(provider: &TranslationProviderConfig) -> TranslationProviderConfig {
-    match provider {
-        TranslationProviderConfig::LocalModel {
-            model_id,
-            device,
-            threads,
-        } => TranslationProviderConfig::LocalModel {
-            model_id: model_id.clone(),
-            device: *device,
-            threads: *threads,
-        },
-        TranslationProviderConfig::OpenAiCompatible {
-            base_url,
-            model,
-            api_key: _,
-            timeout_ms,
-        } => TranslationProviderConfig::OpenAiCompatible {
-            base_url: base_url.clone(),
-            model: model.clone(),
-            api_key: None,
-            timeout_ms: *timeout_ms,
-        },
-        TranslationProviderConfig::DeepL {
-            api_key: _,
-            use_free_endpoint,
-            timeout_ms,
-        } => TranslationProviderConfig::DeepL {
-            api_key: String::new(),
-            use_free_endpoint: *use_free_endpoint,
-            timeout_ms: *timeout_ms,
-        },
-        TranslationProviderConfig::GoogleCloud {
-            api_key: _,
-            project_id,
-            timeout_ms,
-        } => TranslationProviderConfig::GoogleCloud {
-            api_key: String::new(),
-            project_id: project_id.clone(),
-            timeout_ms: *timeout_ms,
-        },
-        TranslationProviderConfig::GasWebhook {
-            endpoint_url,
-            bearer_token: _,
-            timeout_ms,
-        } => TranslationProviderConfig::GasWebhook {
-            endpoint_url: endpoint_url.clone(),
-            bearer_token: None,
-            timeout_ms: *timeout_ms,
-        },
-        TranslationProviderConfig::Mock { prefix } => TranslationProviderConfig::Mock {
-            prefix: prefix.clone(),
-        },
-    }
-}
-
-fn sync_provider_secrets(
-    provider: &TranslationProviderConfig,
-    secret_store: &dyn SecretStore,
-) -> Result<(), SetupError> {
-    match provider {
-        TranslationProviderConfig::OpenAiCompatible { api_key, .. } => {
-            upsert_or_delete_secret(secret_store, SECRET_KEY_OPENAI_API_KEY, api_key.as_deref())
-        }
-        TranslationProviderConfig::DeepL { api_key, .. } => {
-            upsert_or_delete_secret(secret_store, SECRET_KEY_DEEPL_API_KEY, Some(api_key))
-        }
-        TranslationProviderConfig::GoogleCloud { api_key, .. } => {
-            upsert_or_delete_secret(secret_store, SECRET_KEY_GOOGLE_CLOUD_API_KEY, Some(api_key))
-        }
-        TranslationProviderConfig::GasWebhook { bearer_token, .. } => upsert_or_delete_secret(
-            secret_store,
-            SECRET_KEY_GAS_BEARER_TOKEN,
-            bearer_token.as_deref(),
-        ),
-        TranslationProviderConfig::LocalModel { .. } | TranslationProviderConfig::Mock { .. } => {
-            Ok(())
-        }
-    }
-}
-
-fn upsert_or_delete_secret(
-    secret_store: &dyn SecretStore,
-    key: &str,
-    maybe_secret: Option<&str>,
-) -> Result<(), SetupError> {
-    match maybe_secret.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(secret) if secret != SECRET_STORE_SENTINEL => secret_store.set_secret(key, secret),
-        Some(_) => Ok(()),
-        None => secret_store.delete_secret(key),
-    }
-}
-
-fn rehydrate_provider_secrets(
-    provider: &mut TranslationProviderConfig,
-    secret_store: &dyn SecretStore,
-) -> Result<(), SetupError> {
-    match provider {
-        TranslationProviderConfig::OpenAiCompatible { api_key, .. } => {
-            let stored = secret_store.get_secret(SECRET_KEY_OPENAI_API_KEY)?;
-            if let Some(secret) = stored.filter(|s| !s.trim().is_empty()) {
-                *api_key = Some(secret);
-            } else if api_key.as_deref() == Some(SECRET_STORE_SENTINEL) {
-                *api_key = None;
-            }
-        }
-        TranslationProviderConfig::DeepL { api_key, .. } => {
-            if let Some(secret) = secret_store.get_secret(SECRET_KEY_DEEPL_API_KEY)? {
-                *api_key = secret;
-            } else if api_key == SECRET_STORE_SENTINEL {
-                api_key.clear();
-            }
-        }
-        TranslationProviderConfig::GoogleCloud { api_key, .. } => {
-            if let Some(secret) = secret_store.get_secret(SECRET_KEY_GOOGLE_CLOUD_API_KEY)? {
-                *api_key = secret;
-            } else if api_key == SECRET_STORE_SENTINEL {
-                api_key.clear();
-            }
-        }
-        TranslationProviderConfig::GasWebhook { bearer_token, .. } => {
-            let stored = secret_store.get_secret(SECRET_KEY_GAS_BEARER_TOKEN)?;
-            if let Some(secret) = stored.filter(|s| !s.trim().is_empty()) {
-                *bearer_token = Some(secret);
-            } else if bearer_token.as_deref() == Some(SECRET_STORE_SENTINEL) {
-                *bearer_token = None;
-            }
-        }
-        TranslationProviderConfig::LocalModel { .. } | TranslationProviderConfig::Mock { .. } => {}
-    }
-    Ok(())
-}
-
-fn verify_no_plaintext_secrets_in_json(
-    original_provider: &TranslationProviderConfig,
-    serialized_json: &str,
-) -> Result<(), SetupError> {
-    let maybe_secret = match original_provider {
-        TranslationProviderConfig::OpenAiCompatible { api_key, .. } => api_key.as_deref(),
-        TranslationProviderConfig::DeepL { api_key, .. }
-        | TranslationProviderConfig::GoogleCloud { api_key, .. } => Some(api_key.as_str()),
-        TranslationProviderConfig::GasWebhook { bearer_token, .. } => bearer_token.as_deref(),
-        TranslationProviderConfig::LocalModel { .. } | TranslationProviderConfig::Mock { .. } => {
-            None
-        }
-    };
-
-    if let Some(secret) = maybe_secret.map(str::trim).filter(|s| !s.is_empty()) {
-        if serialized_json.contains(secret) {
-            return Err(SetupError::SecurityViolation(
-                "refusing to write settings JSON containing an unredacted API key or bearer token"
-                    .to_owned(),
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn next_temp_id() -> u64 {

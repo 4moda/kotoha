@@ -373,7 +373,6 @@ async fn real_english_wav_through_cpp_ipc_sherpa_stt_and_http_translation() {
         TranslationProviderConfig::OpenAiCompatible {
             base_url: llm_server.base_url.clone(),
             model: "kotoha-e2e-llm".to_owned(),
-            api_key: None,
             timeout_ms: 10_000,
         },
     ));
