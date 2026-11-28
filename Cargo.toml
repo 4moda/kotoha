@@ -50,3 +50,4 @@ sherpa-onnx = "2.0.3"
 thiserror = "2.0"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.8"
+tracing = { version = "0.1", default-features = false, features = ["std"] }

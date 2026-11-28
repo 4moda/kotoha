@@ -10,10 +10,14 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use common::{
-    test_endpoint, CapturingTranslator, DelayedFailingOrTaggedTranslator, FailingSubtitleSink,
-    FlakySttEngine, HotwordTrackingSttEngine, ScriptedTranslator, TranslatorScript,
+    test_endpoint, CapturingTranslator, DelayByUtteranceTranslator,
+    DelayedFailingOrTaggedTranslator, FailingSubtitleSink, FlakySttEngine,
+    HotwordTrackingSttEngine, RendezvousSttEngine, ScriptedSttEngine, ScriptedTranslator,
+    SttScript, TranslatorScript, UnavailableSttEngine,
 };
-use kotoha_core::application::{PipelineConfig, PipelineService, TranslatorManager};
+use kotoha_core::application::{
+    PipelineConfig, PipelineService, TranslatorManager, TRANSLATION_SKIPPED_REASON,
+};
 use kotoha_core::domain::{
     AudioChunk, AudioInputEvent, CoreError, LanguageCode, MergedGlossary, SpeakerKey,
     SttDecodingMethod, SubtitleStage, TranslationProviderConfig, UtteranceId,
@@ -278,40 +282,26 @@ async fn pipeline_passes_active_glossary_to_translation_context_and_stt_hotwords
     }
 
     // Drive an audio frame through the pipeline and verify TranslationRequest.context.glossary
-    let mut tasks = tokio::task::JoinSet::new();
-    pipeline
-        .process_event(
-            AudioInputEvent::SourceConnected {
-                conn_id: 1,
-                source: "mumble".to_owned(),
-                plugin_version: "0.1.0".to_owned(),
+    let events = vec![
+        AudioInputEvent::SourceConnected {
+            conn_id: 1,
+            source: "mumble".to_owned(),
+            plugin_version: "0.1.0".to_owned(),
+        },
+        AudioInputEvent::AudioFrame {
+            conn_id: 1,
+            chunk: AudioChunk {
+                speaker_key: SpeakerKey::new("mumble", 5),
+                seq: 0,
+                sample_rate: 16_000,
+                channels: 1,
+                is_local_user: false,
+                samples: vec![0.2; 320],
             },
-            &mut tasks,
-        )
-        .await
-        .expect("connect");
-
-    pipeline
-        .process_event(
-            AudioInputEvent::AudioFrame {
-                conn_id: 1,
-                chunk: AudioChunk {
-                    speaker_key: SpeakerKey::new("mumble", 5),
-                    seq: 0,
-                    sample_rate: 16_000,
-                    channels: 1,
-                    is_local_user: false,
-                    samples: vec![0.2; 320],
-                },
-            },
-            &mut tasks,
-        )
-        .await
-        .expect("audio frame");
-
-    while let Some(res) = tasks.join_next().await {
-        res.expect("task join").expect("task ok");
-    }
+        },
+    ];
+    let (_pipeline, result) = run_with_events(pipeline, events).await;
+    result.expect("run");
 
     let reqs = captured_requests.lock().expect("lock");
     assert_eq!(reqs.len(), 1);
@@ -531,10 +521,13 @@ async fn run_with_events(
 #[tokio::test]
 async fn pipeline_keeps_streaming_stt_subtitles_when_every_translation_fails() {
     let sink = Arc::new(CollectingSubtitleSink::new());
-    let pipeline = pipeline_with(
+    // 100 finals arrive in one burst; a queue that holds them all keeps every one translatable
+    // (overflow skipping is covered by `slow_translator_keeps_pending_bounded_...`).
+    let pipeline = pipeline_with_config(
         Arc::new(MockSttEngine::new(0.005, 2)),
         Arc::new(ScriptedTranslator::new(TranslatorScript::AlwaysFail)),
         sink.clone(),
+        |c| c.max_pending_translations = 100,
     );
 
     let mut events = vec![connected(1)];
@@ -586,23 +579,20 @@ async fn pipeline_records_only_successful_turns_in_context_window() {
         translator,
         sink.clone(),
     );
+    let stats = pipeline.stats_handle();
 
-    let mut tasks = tokio::task::JoinSet::new();
-    pipeline
-        .process_event(connected(1), &mut tasks)
-        .await
-        .unwrap();
-    // 10 utterances of 2 frames each; settle translations between utterances so each request's
-    // context snapshot is deterministic.
-    for seq in 0..20 {
-        pipeline
-            .process_event(sine_frame(1, seq), &mut tasks)
-            .await
-            .expect("frame");
-        while let Some(res) = tasks.join_next().await {
-            res.expect("join").expect("task");
-        }
+    let (tx, rx) = mpsc::channel(16);
+    let task = tokio::spawn(async move { pipeline.run(rx).await });
+    tx.send(connected(1)).await.unwrap();
+    // 10 utterances of 2 frames each; settle each translation before the next utterance so each
+    // request's context snapshot is deterministic.
+    for utterance in 0..10_u32 {
+        tx.send(sine_frame(1, utterance * 2)).await.unwrap();
+        tx.send(sine_frame(1, utterance * 2 + 1)).await.unwrap();
+        wait_for_phase_c(&sink, usize::try_from(utterance).unwrap() + 1).await;
     }
+    drop(tx);
+    task.await.expect("join").expect("run");
 
     let entries = sink.entries().await;
     let translated: Vec<u64> = entries
@@ -635,7 +625,7 @@ async fn pipeline_records_only_successful_turns_in_context_window() {
         .recent_history
         .iter()
         .all(|turn| turn.translated_text.starts_with("[ja] ")));
-    assert_eq!(pipeline.stats().translation_failures, 5);
+    assert_eq!(stats.snapshot().translation_failures, 5);
 }
 
 #[tokio::test]
@@ -654,7 +644,8 @@ async fn pipeline_recreates_speaker_stream_after_stt_error() {
     let (pipeline, result) = run_with_events(pipeline, events).await;
     result.expect("an STT error must not end the pipeline");
 
-    // Stream A: frames 0-1 (one final), frame 2 fails. Stream B: frames 3-9 (three finals).
+    // Stream A: frames 0-1 (one final), frame 2 fails. Stream B: frames 3-9 (three finals plus
+    // the trailing interim of frame 9, finalized by the shutdown flush).
     assert_eq!(streams_created.load(AtomicOrdering::SeqCst), 2);
     let entries = sink.entries().await;
     let finals = entries
@@ -665,14 +656,22 @@ async fn pipeline_recreates_speaker_stream_after_stt_error() {
         .iter()
         .filter(|e| e.stage == SubtitleStage::Translated)
         .count();
-    assert_eq!(finals, 4);
-    assert_eq!(translated, 4);
+    assert_eq!(finals, 5);
+    assert_eq!(translated, 5);
 
     let stats = pipeline.stats();
     assert_eq!(stats.stt_errors, 1);
     assert_eq!(stats.stt_stream_resets, 1);
     assert_eq!(stats.dropped_chunks, 1);
-    assert_eq!(pipeline.active_stream_count(), 1);
+    assert_eq!(
+        stats.synthesized_finals, 0,
+        "the shutdown flush finalized normally"
+    );
+    assert_eq!(
+        pipeline.active_stream_count(),
+        0,
+        "workers stop when run() returns"
+    );
 }
 
 #[tokio::test]
@@ -697,8 +696,9 @@ async fn pipeline_keeps_running_when_subtitle_sink_fails() {
 
     let emits = sink.emit_attempts.load(AtomicOrdering::SeqCst);
     let clears = sink.clear_attempts.load(AtomicOrdering::SeqCst);
-    // 5 Interim + 5 Final per half are always emitted; translations may be suppressed by the reset.
-    assert!(emits >= 20, "emit attempts: {emits}");
+    // The second half (after the reset) always emits 5 Interim + 5 Final; the first half may be
+    // discarded by the reset before its worker has processed it.
+    assert!(emits >= 10, "emit attempts: {emits}");
     assert_eq!(clears, 1);
     assert_eq!(
         pipeline.stats().sink_errors,
@@ -792,4 +792,415 @@ async fn pipeline_drops_chunk_when_resample_fails() {
         .filter(|e| e.stage == SubtitleStage::FinalPendingTranslation)
         .count();
     assert_eq!(finals, 2, "the 4 surviving chunks still form 2 utterances");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Execution model (#27): per-speaker workers, bounded deadline-aware translation, idle timeout.
+// ---------------------------------------------------------------------------------------------
+
+/// Waits until `count` utterances have reached Phase C (Translated or `TranslationFailed`).
+async fn wait_for_phase_c(sink: &CollectingSubtitleSink, count: usize) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let done = sink
+                .entries()
+                .await
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.stage,
+                        SubtitleStage::Translated | SubtitleStage::TranslationFailed
+                    )
+                })
+                .count();
+            if done >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("phase C entries");
+}
+
+fn pipeline_with_config(
+    stt: Arc<dyn kotoha_core::domain::SttEngine>,
+    translator: Arc<dyn kotoha_core::domain::Translator>,
+    sink: Arc<dyn kotoha_core::domain::SubtitleSink>,
+    configure: impl FnOnce(&mut PipelineConfig),
+) -> PipelineService {
+    let mut config = PipelineConfig::new(
+        LanguageCode::new("en").unwrap(),
+        LanguageCode::new("ja").unwrap(),
+    );
+    configure(&mut config);
+    PipelineService::new(
+        config,
+        stt,
+        Arc::new(TranslatorManager::new(
+            translator,
+            TranslationProviderConfig::Mock {
+                prefix: String::new(),
+            },
+        )),
+        sink,
+        Arc::new(AudioPreprocessor::process_chunk),
+    )
+}
+
+/// 20 ms of 440 Hz sine at 48 kHz mono for `user_id`.
+fn speech_frame(conn_id: u64, user_id: u32, seq: u32) -> AudioInputEvent {
+    let AudioInputEvent::AudioFrame { chunk, .. } = sine_frame(conn_id, seq) else {
+        unreachable!("sine_frame builds an AudioFrame");
+    };
+    AudioInputEvent::AudioFrame {
+        conn_id,
+        chunk: AudioChunk {
+            speaker_key: SpeakerKey::new("mumble", user_id),
+            ..chunk
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn three_simultaneous_speakers_decode_in_parallel() {
+    // Structural check instead of wall-clock latency: every speaker's first `accept_audio` waits
+    // until all three speakers are inside `accept_audio` at the same time. Only per-speaker
+    // workers can get there; a serial pipeline times out the rendezvous and fails the test.
+    const SPEAKERS: u32 = 3;
+    const FRAMES: u32 = 5;
+    let stt = Arc::new(RendezvousSttEngine::new(
+        // Never finalize: every chunk yields exactly one Interim card.
+        MockSttEngine::new(0.005, 1_000_000),
+        SPEAKERS as usize,
+        Duration::from_secs(10),
+    ));
+    let timed_out = Arc::clone(&stt.rendezvous_timed_out);
+    let peak_in_flight = Arc::clone(&stt.peak_in_flight);
+    let sink = Arc::new(CollectingSubtitleSink::new());
+    let mut pipeline = pipeline_with(
+        stt,
+        Arc::new(MockTranslator::new("mock", "[ja] ")),
+        sink.clone(),
+    );
+    let (tx, rx) = mpsc::channel(64);
+    let task = tokio::spawn(async move { pipeline.run(rx).await });
+    tx.send(connected(1)).await.unwrap();
+    for seq in 0..FRAMES {
+        for user in 1..=SPEAKERS {
+            tx.send(speech_frame(1, user, seq)).await.unwrap();
+        }
+    }
+    drop(tx);
+    task.await.expect("join").expect("run");
+
+    assert!(
+        !timed_out.load(AtomicOrdering::SeqCst),
+        "the speakers' STT calls never overlapped (decoding is serial)"
+    );
+    let peak = peak_in_flight.load(AtomicOrdering::SeqCst);
+    assert!(
+        peak >= 2,
+        "peak concurrent accept_audio calls across speakers: {peak}"
+    );
+    let entries = sink.entries().await;
+    for user in 1..=SPEAKERS {
+        let interims = entries
+            .iter()
+            .filter(|e| e.speaker_key.user_id == user && e.stage == SubtitleStage::Interim)
+            .count();
+        assert_eq!(
+            interims, FRAMES as usize,
+            "speaker {user}: one card per chunk"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_translator_keeps_pending_bounded_and_skips_late_finals() {
+    let translator = Arc::new(DelayByUtteranceTranslator::new(|_| Duration::from_secs(5)));
+    let peak_in_flight = Arc::clone(&translator.peak_in_flight);
+    let sink = Arc::new(CollectingSubtitleSink::new());
+    let pipeline = pipeline_with_config(
+        Arc::new(MockSttEngine::new(0.005, 1)),
+        translator,
+        sink.clone(),
+        |c| {
+            c.max_concurrent_translations = 2;
+            c.max_pending_translations = 4;
+            c.translation_deadline = Duration::from_secs(6);
+        },
+    );
+    let stats = pipeline.stats_handle();
+    let started = tokio::time::Instant::now();
+
+    let mut events = vec![connected(1)];
+    events.extend((0..20).map(|seq| sine_frame(1, seq)));
+    let (_pipeline, result) = run_with_events(pipeline, events).await;
+    result.expect("run");
+    let elapsed = started.elapsed();
+
+    let entries = sink.entries().await;
+    let finals: Vec<u64> = entries
+        .iter()
+        .filter(|e| e.stage == SubtitleStage::FinalPendingTranslation)
+        .map(|e| e.utterance_id.0)
+        .collect();
+    assert_eq!(finals.len(), 20);
+    let mut translated: Vec<u64> = entries
+        .iter()
+        .filter(|e| e.stage == SubtitleStage::Translated)
+        .map(|e| e.utterance_id.0)
+        .collect();
+    translated.sort_unstable();
+    assert_eq!(
+        translated,
+        vec![1, 2],
+        "only the first two fit in the deadline"
+    );
+    for id in &finals {
+        let phase_c: Vec<_> = entries
+            .iter()
+            .filter(|e| {
+                e.utterance_id.0 == *id
+                    && matches!(
+                        e.stage,
+                        SubtitleStage::Translated | SubtitleStage::TranslationFailed
+                    )
+            })
+            .collect();
+        assert_eq!(phase_c.len(), 1, "utterance {id} resolves exactly once");
+        if phase_c[0].stage == SubtitleStage::TranslationFailed {
+            assert_eq!(
+                phase_c[0].failure_reason.as_deref(),
+                Some(TRANSLATION_SKIPPED_REASON)
+            );
+        }
+    }
+
+    let snapshot = stats.snapshot();
+    println!(
+        "slow translator: peak_pending={} peak_in_flight={} skipped={} elapsed={elapsed:?}",
+        snapshot.peak_pending_translations,
+        peak_in_flight.load(AtomicOrdering::SeqCst),
+        snapshot.translations_skipped
+    );
+    assert!(snapshot.peak_pending_translations <= 4 + 2);
+    assert!(peak_in_flight.load(AtomicOrdering::SeqCst) <= 2);
+    assert_eq!(snapshot.translations_skipped, 18);
+    assert_eq!(snapshot.translation_failures, 0);
+    assert_eq!(snapshot.pending_translations, 0);
+    assert!(
+        elapsed <= Duration::from_millis(6_500),
+        "every final resolves within the deadline, took {elapsed:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_speaker_mid_utterance_gets_final_card() {
+    // `ForgetOnFlush` models an engine that loses the open hypothesis on flush; the pipeline must
+    // still finalize the card from the last interim text.
+    let stt = Arc::new(ScriptedSttEngine::new(
+        MockSttEngine::new(0.005, 4),
+        SttScript::ForgetOnFlush,
+    ));
+    let streams_created = Arc::clone(&stt.streams_created);
+    let sink = Arc::new(CollectingSubtitleSink::new());
+    let mut pipeline = pipeline_with_config(
+        stt,
+        Arc::new(MockTranslator::new("mock", "[ja] ")),
+        sink.clone(),
+        |c| c.speaker_idle_timeout = Duration::from_secs(2),
+    );
+    let stats = pipeline.stats_handle();
+    let (tx, rx) = mpsc::channel(16);
+    let task = tokio::spawn(async move { pipeline.run(rx).await });
+
+    tx.send(connected(1)).await.unwrap();
+    tx.send(sine_frame(1, 0)).await.unwrap();
+    // No TalkingState / UserRemoved: the speaker just goes silent mid-utterance.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_phase_c(&sink, 1).await;
+
+    let entries = sink.entries().await;
+    let stages: Vec<_> = entries
+        .iter()
+        .map(|e| (e.utterance_id.0, e.stage))
+        .collect();
+    assert_eq!(
+        stages,
+        vec![
+            (1, SubtitleStage::Interim),
+            (1, SubtitleStage::FinalPendingTranslation),
+            (1, SubtitleStage::Translated),
+        ]
+    );
+    assert_eq!(entries[1].src_text, entries[0].src_text);
+    let snapshot = stats.snapshot();
+    assert_eq!(snapshot.idle_flushes, 1);
+    assert_eq!(snapshot.synthesized_finals, 1);
+    assert_eq!(snapshot.active_speaker_workers, 0, "the idle worker exited");
+
+    // The speaker comes back: a fresh worker and stream take over.
+    tx.send(sine_frame(1, 1)).await.unwrap();
+    drop(tx);
+    task.await.expect("join").expect("run");
+    assert_eq!(streams_created.load(AtomicOrdering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn panicking_stt_stream_does_not_end_run() {
+    // Call 4 is frame 3, which would finalize utterance 2 (opened by frame 2).
+    let stt = Arc::new(ScriptedSttEngine::new(
+        MockSttEngine::new(0.005, 2),
+        SttScript::PanicOnCall(4),
+    ));
+    let streams_created = Arc::clone(&stt.streams_created);
+    let sink = Arc::new(CollectingSubtitleSink::new());
+    let pipeline = pipeline_with(
+        stt,
+        Arc::new(MockTranslator::new("mock", "[ja] ")),
+        sink.clone(),
+    );
+
+    let mut events = vec![connected(1)];
+    events.extend((0..10).map(|seq| sine_frame(1, seq)));
+    let (pipeline, result) = run_with_events(pipeline, events).await;
+    result.expect("an STT panic must not end run()");
+
+    let entries = sink.entries().await;
+    let mut interim_ids: Vec<u64> = entries
+        .iter()
+        .filter(|e| e.stage == SubtitleStage::Interim)
+        .map(|e| e.utterance_id.0)
+        .collect();
+    interim_ids.dedup();
+    let final_ids: Vec<u64> = entries
+        .iter()
+        .filter(|e| e.stage == SubtitleStage::FinalPendingTranslation)
+        .map(|e| e.utterance_id.0)
+        .collect();
+    assert_eq!(final_ids, vec![1, 2, 3, 4, 5]);
+    assert_eq!(
+        interim_ids, final_ids,
+        "no Interim card is left without a final"
+    );
+    let translated = entries
+        .iter()
+        .filter(|e| e.stage == SubtitleStage::Translated)
+        .count();
+    assert_eq!(translated, 5);
+
+    let stats = pipeline.stats();
+    assert_eq!(stats.task_panics, 1);
+    assert_eq!(stats.stt_stream_resets, 1);
+    assert_eq!(stats.synthesized_finals, 1);
+    assert_eq!(streams_created.load(AtomicOrdering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn context_window_follows_finalization_order_and_request_utterance_ids() {
+    // Utterances 1, 3 and 5 are slow, so translations complete out of order.
+    let translator = Arc::new(DelayByUtteranceTranslator::new(|id| match id {
+        1 => Duration::from_millis(300),
+        3 => Duration::from_millis(200),
+        5 => Duration::from_millis(100),
+        _ => Duration::from_millis(10),
+    }));
+    let captured = Arc::clone(&translator.captured_requests);
+    let sink = Arc::new(CollectingSubtitleSink::new());
+    let mut pipeline = pipeline_with_config(
+        Arc::new(MockSttEngine::new(0.005, 1)),
+        translator,
+        sink.clone(),
+        |c| c.max_concurrent_translations = 4,
+    );
+    let (tx, rx) = mpsc::channel(16);
+    let task = tokio::spawn(async move { pipeline.run(rx).await });
+    tx.send(connected(1)).await.unwrap();
+    for seq in 0..6 {
+        // One speaker per utterance so that every turn has a distinct text and speaker name.
+        tx.send(speech_frame(1, seq + 1, seq)).await.unwrap();
+    }
+    wait_for_phase_c(&sink, 6).await;
+    tx.send(speech_frame(1, 7, 6)).await.unwrap();
+    drop(tx);
+    task.await.expect("join").expect("run");
+
+    let entries = sink.entries().await;
+    let completion_order: Vec<u64> = entries
+        .iter()
+        .filter(|e| e.stage == SubtitleStage::Translated)
+        .map(|e| e.utterance_id.0)
+        .collect();
+    assert_ne!(
+        completion_order[..6],
+        [1, 2, 3, 4, 5, 6],
+        "the scenario must complete translations out of order"
+    );
+    let mut sorted = completion_order;
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        vec![1, 2, 3, 4, 5, 6, 7],
+        "Translated uses the request's utterance id, not the adapter's"
+    );
+
+    let final_texts: Vec<String> = entries
+        .iter()
+        .filter(|e| e.stage == SubtitleStage::FinalPendingTranslation)
+        .take(6)
+        .map(|e| e.src_text.clone())
+        .collect();
+    let distinct: std::collections::HashSet<_> = final_texts.iter().collect();
+    assert_eq!(distinct.len(), 6, "turns must be distinguishable");
+    let requests = captured.lock().unwrap().clone();
+    let last = requests
+        .iter()
+        .find(|r| r.utterance_id == UtteranceId(7))
+        .expect("request for utterance 7");
+    let history: Vec<String> = last
+        .context
+        .recent_history
+        .iter()
+        .map(|turn| turn.original_text.clone())
+        .collect();
+    assert_eq!(
+        history, final_texts,
+        "context order equals finalization order"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn failing_create_stream_backs_off() {
+    let stt = Arc::new(UnavailableSttEngine::default());
+    let attempts = Arc::clone(&stt.attempts);
+    let sink = Arc::new(CollectingSubtitleSink::new());
+    let mut pipeline = pipeline_with(
+        stt,
+        Arc::new(MockTranslator::new("mock", "[ja] ")),
+        sink.clone(),
+    );
+    let stats = pipeline.stats_handle();
+    let (tx, rx) = mpsc::channel(16);
+    let task = tokio::spawn(async move { pipeline.run(rx).await });
+    tx.send(connected(1)).await.unwrap();
+    // 1 s of audio at 20 ms per frame.
+    for seq in 0..50 {
+        tx.send(sine_frame(1, seq)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(tx);
+    task.await.expect("join").expect("run");
+
+    // Back-off 100 + 200 + 400 ms allows at most ~4 attempts within 1 s instead of 50.
+    let attempts = attempts.load(AtomicOrdering::SeqCst);
+    assert!(
+        (2..=5).contains(&attempts),
+        "create_stream attempts: {attempts}"
+    );
+    let snapshot = stats.snapshot();
+    assert_eq!(snapshot.dropped_chunks, 50);
+    assert_eq!(snapshot.stt_errors, u64::try_from(attempts).unwrap());
+    assert!(sink.entries().await.is_empty());
 }

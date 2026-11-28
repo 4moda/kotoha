@@ -104,3 +104,21 @@ fn domain_error_secret_variants_map_to_fixed_reasons() {
         assert_eq!(err.translation_failure_reason(), "secret store error");
     }
 }
+
+#[test]
+fn domain_error_kind_is_a_fixed_name_without_the_message() {
+    let secret = "sk-very-secret provider body";
+    for err in [
+        CoreError::Translation(secret.into()),
+        CoreError::Stt(secret.into()),
+        CoreError::Sink(secret.into()),
+        CoreError::NotConfigured(secret.into()),
+        CoreError::SecretMissing(secret.into()),
+    ] {
+        let kind = err.kind();
+        assert!(!kind.is_empty());
+        assert!(!kind.contains("sk-very"), "{kind}");
+    }
+    assert_eq!(CoreError::Translation(secret.into()).kind(), "translation");
+    assert_eq!(CoreError::ChannelClosed("x").kind(), "channel_closed");
+}
