@@ -57,7 +57,7 @@
 //!
 //! | Call site | Scope ceiling | Recovery |
 //! |---|---|---|
-//! | `ResampleFn` (error or panic) | [`ErrorScope::Chunk`] | drop the chunk |
+//! | `Resampler` (error or panic) | [`ErrorScope::Chunk`] | drop the chunk |
 //! | `SttEngine::create_stream` (error or panic) | [`ErrorScope::Speaker`] | drop the chunk and back off before the next attempt |
 //! | `SttStream::accept_audio` | [`ErrorScope::Speaker`] | `Chunk`: drop the chunk; otherwise (or on panic) drop the speaker's stream |
 //! | `SttStream::flush` (error or panic) | [`ErrorScope::Speaker`] | drop the speaker's stream |
@@ -94,15 +94,17 @@ use crate::application::session::{SessionAction, SourceSessionManager};
 use crate::application::translator_manager::TranslatorManager;
 use crate::domain::{
     AudioChunk, AudioInputEvent, ContextWindow, CoreError, ErrorScope, HistoryEntry, LanguageCode,
-    MergedGlossary, PreFilter, SpeakerKey, SttEngine, SttStream, SubtitleEntry, SubtitleSink,
-    SubtitleStage, TranscriptEvent, TranslationRequest, DEFAULT_HOTWORDS_SCORE,
+    MergedGlossary, PreFilter, Resampler, SpeakerKey, SttEngine, SttStream, SubtitleEntry,
+    SubtitleSink, SubtitleStage, TranscriptEvent, TranslationRequest, DEFAULT_HOTWORDS_SCORE,
 };
 
-/// Audio normalization callback converting raw interleaved [`AudioChunk`] into 16 kHz mono `f32`.
+/// Factory creating one stateful [`Resampler`] per speaker worker.
 ///
-/// Defined as a pure function/closure boundary so `application` does not depend on concrete
-/// DSP or infrastructure adapters directly. It runs on the speaker worker's blocking thread.
-pub type ResampleFn = Arc<dyn Fn(&AudioChunk) -> Result<Vec<f32>, CoreError> + Send + Sync>;
+/// Defined as a closure boundary so `application` does not depend on concrete DSP adapters.
+/// Each worker calls it once when it starts (and again to replace a resampler that panicked);
+/// the instance then runs on that worker's blocking thread with its filter state kept across
+/// chunks.
+pub type ResamplerFactory = Arc<dyn Fn() -> Box<dyn Resampler> + Send + Sync>;
 
 /// User-safe reason attached to [`SubtitleStage::TranslationFailed`] when the translator panicked.
 pub const TRANSLATOR_CRASHED_REASON: &str = "translation engine crashed";
@@ -400,7 +402,7 @@ struct WorkerDeps {
     tgt_lang: LanguageCode,
     stt_engine: Arc<dyn SttEngine>,
     sink: Arc<dyn SubtitleSink>,
-    resample_fn: ResampleFn,
+    resampler_factory: ResamplerFactory,
     pre_filter: PreFilter,
     stats: PipelineStatsHandle,
     clock: Clock,
@@ -440,7 +442,7 @@ pub struct PipelineService {
     stt_engine: Arc<dyn SttEngine>,
     translator_manager: Arc<TranslatorManager>,
     subtitle_sink: Arc<dyn SubtitleSink>,
-    resample_fn: ResampleFn,
+    resampler_factory: ResamplerFactory,
     pre_filter: PreFilter,
     active_glossary: MergedGlossary,
     session_manager: SourceSessionManager,
@@ -458,14 +460,14 @@ impl PipelineService {
         stt_engine: Arc<dyn SttEngine>,
         translator_manager: Arc<TranslatorManager>,
         subtitle_sink: Arc<dyn SubtitleSink>,
-        resample_fn: ResampleFn,
+        resampler_factory: ResamplerFactory,
     ) -> Self {
         Self {
             config,
             stt_engine,
             translator_manager,
             subtitle_sink,
-            resample_fn,
+            resampler_factory,
             pre_filter: PreFilter::default(),
             active_glossary: MergedGlossary::default(),
             session_manager: SourceSessionManager::new(),
@@ -575,7 +577,7 @@ impl PipelineService {
                 tgt_lang: self.config.tgt_lang.clone(),
                 stt_engine: Arc::clone(&self.stt_engine),
                 sink: Arc::clone(&self.subtitle_sink),
-                resample_fn: Arc::clone(&self.resample_fn),
+                resampler_factory: Arc::clone(&self.resampler_factory),
                 pre_filter: self.pre_filter.clone(),
                 stats: self.stats.clone(),
                 clock: self.clock.clone(),
@@ -840,7 +842,8 @@ struct SpeakerRecognizer {
     speaker_key: SpeakerKey,
     src_lang: LanguageCode,
     engine: Arc<dyn SttEngine>,
-    resample_fn: ResampleFn,
+    resampler: Box<dyn Resampler>,
+    resampler_factory: ResamplerFactory,
     stats: PipelineStatsHandle,
     discarded: Arc<AtomicBool>,
     stream: Option<Box<dyn SttStream>>,
@@ -856,7 +859,8 @@ impl SpeakerRecognizer {
             speaker_key,
             src_lang: deps.src_lang.clone(),
             engine: Arc::clone(&deps.stt_engine),
-            resample_fn: Arc::clone(&deps.resample_fn),
+            resampler: (deps.resampler_factory)(),
+            resampler_factory: Arc::clone(&deps.resampler_factory),
             stats: deps.stats.clone(),
             discarded,
             stream: None,
@@ -906,8 +910,8 @@ impl SpeakerRecognizer {
         now: Instant,
         out: &mut Vec<TranscriptEvent>,
     ) {
-        let resample_fn = Arc::clone(&self.resample_fn);
-        let samples = match catch_unwind(AssertUnwindSafe(|| resample_fn(chunk))) {
+        let resampler = &mut self.resampler;
+        let samples = match catch_unwind(AssertUnwindSafe(|| resampler.process(chunk))) {
             Ok(Ok(samples)) => samples,
             Ok(Err(err)) => {
                 // Resample failures are bounded to the chunk.
@@ -921,6 +925,8 @@ impl SpeakerRecognizer {
             Err(_) => {
                 self.stats.task_panic();
                 self.stats.dropped_chunk();
+                // The filter state may be inconsistent after a panic: start afresh.
+                self.resampler = (self.resampler_factory)();
                 tracing::error!("resampler panicked; audio chunk dropped");
                 return;
             }

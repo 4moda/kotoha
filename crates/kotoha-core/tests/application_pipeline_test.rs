@@ -19,12 +19,12 @@ use kotoha_core::application::{
     PipelineConfig, PipelineService, TranslatorManager, TRANSLATION_SKIPPED_REASON,
 };
 use kotoha_core::domain::{
-    AudioChunk, AudioInputEvent, CoreError, LanguageCode, MergedGlossary, SpeakerKey,
+    AudioChunk, AudioInputEvent, CoreError, LanguageCode, MergedGlossary, Resampler, SpeakerKey,
     SttDecodingMethod, SubtitleStage, TranslationProviderConfig, UtteranceId,
 };
 use kotoha_core::infrastructure::{
     connect_local_socket, AudioPreprocessor, CollectingSubtitleSink, IpcServerAdapter,
-    MockSttEngine, MockTranslator,
+    MockSttEngine, MockTranslator, StreamResampler,
 };
 use kotoha_protocol::{encode_frame, Message, TalkingStateKind};
 use tokio::io::AsyncWriteExt;
@@ -61,7 +61,7 @@ async fn end_to_end_ipc_server_to_pipeline_and_three_stage_subtitles() {
     ));
     let stt_engine = Arc::new(MockSttEngine::new(0.01, 2));
     let sink = Arc::new(CollectingSubtitleSink::new());
-    let resample_fn = Arc::new(AudioPreprocessor::process_chunk);
+    let resampler_factory = AudioPreprocessor::resampler_factory();
 
     let mut pipeline = PipelineService::new(
         PipelineConfig::new(
@@ -71,7 +71,7 @@ async fn end_to_end_ipc_server_to_pipeline_and_three_stage_subtitles() {
         stt_engine,
         translator_mgr,
         sink.clone(),
-        resample_fn,
+        resampler_factory,
     );
 
     let pipeline_task = tokio::spawn(async move { pipeline.run(event_rx).await });
@@ -244,7 +244,7 @@ async fn pipeline_passes_active_glossary_to_translation_context_and_stt_hotwords
         },
     ));
     let sink = Arc::new(CollectingSubtitleSink::new());
-    let resample_fn = Arc::new(AudioPreprocessor::process_chunk);
+    let resampler_factory = AudioPreprocessor::resampler_factory();
 
     let mut pipeline = PipelineService::new(
         PipelineConfig::new(
@@ -254,7 +254,7 @@ async fn pipeline_passes_active_glossary_to_translation_context_and_stt_hotwords
         stt.clone(),
         translator_mgr,
         sink,
-        resample_fn,
+        resampler_factory,
     );
 
     let merged = MergedGlossary::new(BTreeMap::from([
@@ -331,7 +331,7 @@ async fn pipeline_suppresses_stale_translations_after_source_reset_and_reports_t
         stt,
         translator_mgr,
         sink.clone(),
-        Arc::new(AudioPreprocessor::process_chunk),
+        AudioPreprocessor::resampler_factory(),
     );
 
     let (tx, rx) = mpsc::channel(16);
@@ -394,7 +394,7 @@ async fn pipeline_suppresses_stale_translations_after_source_reset_and_reports_t
         stt_err,
         failing_mgr,
         sink_err.clone(),
-        Arc::new(AudioPreprocessor::process_chunk),
+        AudioPreprocessor::resampler_factory(),
     );
 
     let (tx2, rx2) = mpsc::channel(16);
@@ -494,7 +494,7 @@ fn pipeline_with(
             },
         )),
         sink,
-        Arc::new(AudioPreprocessor::process_chunk),
+        AudioPreprocessor::resampler_factory(),
     )
 }
 
@@ -749,6 +749,19 @@ async fn pipeline_keeps_running_when_translator_panics() {
     assert_eq!(stats.translation_failures, 5);
 }
 
+/// Fails every even-numbered chunk, otherwise delegates to the real resampler.
+struct FlakyResampler(StreamResampler);
+
+impl Resampler for FlakyResampler {
+    fn process(&mut self, chunk: &AudioChunk) -> Result<Vec<f32>, CoreError> {
+        if chunk.seq.is_multiple_of(2) {
+            Err(CoreError::InvalidAudio("simulated bad chunk".to_owned()))
+        } else {
+            self.0.process_chunk(chunk)
+        }
+    }
+}
+
 #[tokio::test]
 async fn pipeline_drops_chunk_when_resample_fails() {
     let sink = Arc::new(CollectingSubtitleSink::new());
@@ -765,13 +778,7 @@ async fn pipeline_drops_chunk_when_resample_fails() {
             },
         )),
         sink.clone(),
-        Arc::new(|chunk: &AudioChunk| {
-            if chunk.seq.is_multiple_of(2) {
-                Err(CoreError::InvalidAudio("simulated bad chunk".to_owned()))
-            } else {
-                AudioPreprocessor::process_chunk(chunk)
-            }
-        }),
+        Arc::new(|| Box::new(FlakyResampler(StreamResampler::new()))),
     );
     let stats = pipeline.stats_handle();
 
@@ -844,7 +851,7 @@ fn pipeline_with_config(
             },
         )),
         sink,
-        Arc::new(AudioPreprocessor::process_chunk),
+        AudioPreprocessor::resampler_factory(),
     )
 }
 

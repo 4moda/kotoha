@@ -67,7 +67,7 @@
 |  [Infrastructure Layer (Adapters)]                                                |
 |   - IpcServerAdapter (tokio + interprocess + kotoha-protocol) -> AudioInputSource |
 |       * 並列 Accept / conn_id 所有権管理 / Hello 厳格検証 / seq 回帰ガード        |
-|   - AudioPreprocessor (任意 ch -> モノラル平均, 8k..192kHz -> 16kHz f32)          |
+|   - StreamResampler (任意 ch -> モノラル平均, 8k..192kHz -> 16kHz f32, FIR LPF)   |
 |   - STT Adapters: MockSttAdapter (P1) / kotoha-stt-sherpa (P2)                    |
 |   - Translator Adapters: MockTranslator (P1) / kotoha-translate-local (ct2rs)     |
 |                          / kotoha-translate-http (OpenAI互換, DeepL, Google, GAS) |
@@ -373,9 +373,9 @@ Rust コアは **Clean / Hexagonal (Onion) Architecture** に基づき、依存�
 
 | レイヤー | パス / クレート | 依存許可範囲 | 主な責務・構成要素 |
 | :--- | :--- | :--- | :--- |
-| **Domain (最内層)** | `kotoha-core/src/domain/` | 純粋 Rust (`serde`, `thiserror` 等のみ。`tokio`/`reqwest`/`interprocess`/`tauri` 禁止) | **Entities / Value Objects**: `SpeakerKey`, `LanguageCode`, `AudioChunk`, `UtteranceId`, `TranscriptEvent`, `TranslationRequest`, `TranslationResult`, `TranslateContext`, `SubtitleEntry`, `GlossaryProfile`, `HotwordsConfig`, `ModelProfile`, `ComputeDevice`, `TranslationProviderConfig`, `Secret`, `SecretRef`<br>**Ports (Traits)**: `SttEngine`, `SttStream`, `Translator`, `AudioInputSource`, `SubtitleSink`, `SettingsRepository`, `GlossaryRepository`, `SecretStore`<br>**Pure Logic**: Pre-filter 判定、話者カラーハッシュ、Context Window 管理、用語辞書最長一致プレースホルダ保護/復元 |
+| **Domain (最内層)** | `kotoha-core/src/domain/` | 純粋 Rust (`serde`, `thiserror` 等のみ。`tokio`/`reqwest`/`interprocess`/`tauri` 禁止) | **Entities / Value Objects**: `SpeakerKey`, `LanguageCode`, `AudioChunk`, `UtteranceId`, `TranscriptEvent`, `TranslationRequest`, `TranslationResult`, `TranslateContext`, `SubtitleEntry`, `GlossaryProfile`, `HotwordsConfig`, `ModelProfile`, `ComputeDevice`, `TranslationProviderConfig`, `Secret`, `SecretRef`<br>**Ports (Traits)**: `SttEngine`, `SttStream`, `Resampler`, `Translator`, `AudioInputSource`, `SubtitleSink`, `SettingsRepository`, `GlossaryRepository`, `SecretStore`<br>**Pure Logic**: Pre-filter 判定、話者カラーハッシュ、Context Window 管理、用語辞書最長一致プレースホルダ保護/復元 |
 | **Application** | `kotoha-core/src/application/` | `domain` のみ | `PipelineService`（イベント振り分けと話者別 STT ワーカーのライフサイクル管理・前処理・Pre-filter・文脈/用語辞書注入・上限付き/締め切り付き翻訳キュー・`utterance_id` 順序保証・`SubtitleSink` 通知）<br>`SourceSessionManager`（`conn_id` 所有権管理と切断クリーンアップ）<br>`TranslatorManager`（設定変更時の翻訳プロバイダ／モデルプロファイル実行時ホットスワップ）<br>`GlossaryManager`（複数 TOML 用語辞書の読込・優先マージ・STT Hotwords / 翻訳辞書同期） |
-| **Infrastructure** | `kotoha-core/src/infrastructure/`<br>`kotoha-protocol`<br>`kotoha-stt-sherpa` (P2)<br>`kotoha-translate-local` (P2)<br>`kotoha-translate-http` (P2) | `domain`, `application`, 外部 I/O クレート | `IpcServerAdapter`（`tokio` + `interprocess` + `kotoha-protocol`、`AudioInputSource` 実装）<br>`AudioPreprocessor`（任意 ch → モノラル平均ダウンミックス、8k..192kHz → 16 kHz `f32` リサンプラ）<br>`MockSttAdapter` / `MockTranslatorAdapter`（Phase 1 検証用）<br>`TomlGlossaryRepository`（`glossaries/*.toml` 読込）<br>Phase 2 外部アダプタ群（`sherpa-onnx`, `ct2rs` + モデルダウンローダ, HTTP API 群）<br>`JsonSettingsRepository` / `InMemorySecretStore`・`EnvSecretStore`（OS キーチェーン連携は後続） |
+| **Infrastructure** | `kotoha-core/src/infrastructure/`<br>`kotoha-protocol`<br>`kotoha-stt-sherpa` (P2)<br>`kotoha-translate-local` (P2)<br>`kotoha-translate-http` (P2) | `domain`, `application`, 外部 I/O クレート | `IpcServerAdapter`（`tokio` + `interprocess` + `kotoha-protocol`、`AudioInputSource` 実装）<br>`StreamResampler`（`Resampler` 実装。任意 ch → モノラル平均ダウンミックス、8k..192kHz → 16 kHz `f32`。話者ごとに状態を持つアンチエイリアス付き FIR リサンプラ。`AudioPreprocessor` は RMS 計算とファクトリを提供）<br>`MockSttAdapter` / `MockTranslatorAdapter`（Phase 1 検証用）<br>`TomlGlossaryRepository`（`glossaries/*.toml` 読込）<br>Phase 2 外部アダプタ群（`sherpa-onnx`, `ct2rs` + モデルダウンローダ, HTTP API 群）<br>`JsonSettingsRepository` / `InMemorySecretStore`・`EnvSecretStore`（OS キーチェーン連携は後続） |
 | **Presentation (最外層)** | `kotoha-core/src/bin/kotoha_ipc_monitor.rs` (P1)<br>`app/src-tauri` (P3) + `app/ui` | 全内側レイヤー（DI 組み立て担当） | `kotoha-ipc-monitor` CLI（受信統計・RMS・ドロップ数・パイプライン出力）<br>Tauri v2 Commands / Event Bridge (`SubtitleSink` 実装) / System Tray / Overlay UI |
 
 #### Workspace クレート構成
@@ -534,7 +534,7 @@ pub trait GlossaryRepository: Send + Sync {
      ```
 
      - **ルーター**（`PipelineService::run`）は `SourceSessionManager` で所有権を判定し、音声を話者ワーカーへ**ノンブロッキング**（`try_send`）で振り分け、ワーカーのライフサイクル（初回音声で生成、`UserRemoved` で停止、`SourceReset` / 切断で破棄）だけを管理する。STT を実行せず、ワーカーを待たないため、`TalkingState` / `UserRemoved` などの制御イベントは STT 処理中でも即座に処理される。
-     - **話者ワーカー**は話者ごとの async タスクで、その話者の `SttStream` を所有する（`std::sync::Mutex` によるラップは不要）。CPU 処理（リサンプルとデコード）は `spawn_blocking` で blocking プール上で実行し、同一話者内では逐次、話者間では並列に進む。キューに溜まった入力は最大 32 件ずつまとめて 1 回の blocking 呼び出しで処理する。
+     - **話者ワーカー**は話者ごとの async タスクで、その話者の `SttStream` を所有する（`std::sync::Mutex` によるラップは不要）。話者ワーカーは自身専用の `Resampler`（`ResamplerFactory` が話者ごとに生成）も所有し、CPU 処理（リサンプルとデコード）は `spawn_blocking` で blocking プール上で実行し、同一話者内では逐次、話者間では並列に進む。キューに溜まった入力は最大 32 件ずつまとめて 1 回の blocking 呼び出しで処理する。
      - **翻訳ディスパッチャ**は確定字幕を FIFO の待ち行列に保持し、同時に最大 `max_concurrent_translations` 件の翻訳を実行する。実行中タスク数・待ち件数ともに上限があり、`JoinSet` が際限なく伸びることはない。
      - 将来の音声→LLM 直接パス（#46）では、話者ワーカーが `SttStream` + ディスパッチャの組の代わりに `SpeechTranslator` を保持する形に差し替えられるよう、ルーター・キュー・ゲート・エラー方針は共通とする。
    - **バックプレッシャー方針**（リアルタイム性を優先し、溢れたら古いものから捨てる）:
@@ -556,7 +556,7 @@ pub trait GlossaryRepository: Send + Sync {
 
      | 発生箇所 | 上限スコープ | 回復動作 |
      |---|---|---|
-     | `ResampleFn`（不正チャンク・panic） | `Chunk` | 当該チャンクを破棄 |
+     | `Resampler`（不正チャンク・panic） | `Chunk` | 当該チャンクを破棄（panic 時はリサンプラも作り直す） |
      | `SttEngine::create_stream`（エラー・panic） | `Speaker` | チャンクを破棄し、バックオフ後に再試行 |
      | `SttStream::accept_audio` | `Speaker` | `Chunk` ならチャンクのみ破棄、それ以外（panic を含む）は当該話者ストリームを破棄し次チャンクで再生成 |
      | `SttStream::flush`（エラー・panic） | `Speaker` | 当該話者ストリームを破棄 |
@@ -573,6 +573,14 @@ pub trait GlossaryRepository: Send + Sync {
 4. **実行時ホットスワップ (`TranslatorManager` / `GlossaryManager`)**:
    - `TranslatorManager` は現在の `Arc<dyn Translator>` を `tokio::sync::RwLock`（または `arc_swap`）で保持し、ユーザーが設定画面でプロバイダや `ModelProfile` を切り替えても、進行中の IPC 接続や話者 STT ストリームを切断せずに即座に後続発話から新エンジンへ切り替えられる。
    - 用語辞書プロファイルや `hotwords_score` が更新された場合は、`GlossaryManager` がマージ済み `[terms]` を再計算し、以後の翻訳リクエストおよび STT ストリームへ即時反映する。
+
+#### 音声前処理（アンチエイリアス付きステートフル・リサンプラ）
+
+- **目的**: STT へ渡す 16 kHz モノラルを、8 kHz（出力ナイキスト）超の成分が折り返さない形で生成する（旧実装はローパスなしの線形補間で、12 kHz の正弦波が 4 kHz にそのまま折り返していた）。
+- **境界**: ドメインの `Resampler` ポート（`process(&mut self, &AudioChunk) -> Result<Vec<f32>, CoreError>`）。`PipelineService` は `ResamplerFactory`（`Fn() -> Box<dyn Resampler>`）を受け取り、**話者ワーカーごとに 1 インスタンス**を生成して所有させる。フィルタ履歴がチャンク間で引き継がれるため、チャンク境界で不連続が生じず、20 ms ごとの処理と一括処理の出力が一致する。panic 後は状態が不定になるため作り直す。
+- **実装**（`infrastructure/audio.rs` の `StreamResampler`）: 16 kHz モノラルは素通し（ファストパス）。多チャンネルは平均でダウンミックス（平均値は `[-1, 1]` に収まるため `clamp` は行わない）。それ以外は Kaiser 窓付き sinc の多相 FIR（通過端 = 出力レートの 0.46 倍 = 7.36 kHz、阻止帯域減衰目標 80 dB）を、出力サンプル位置でのみ評価してダウンサンプルする（ローパスと間引きを一度に行う）。位相は `src/dst` の既約分数による整数演算で追跡するため、44.1 kHz など非整数比でも長時間でドリフトしない。出力は FIR の群遅延（48 kHz で約 2 ms）だけ遅れる。
+- **フォーマット変更**: ストリーム途中でサンプルレートまたはチャンネル数が変わった場合は、フィルタを作り直す（履歴は破棄）。
+- **採用理由**: `rubato` は固定サイズ入力（`FixedIn`）が前提で、可変長のチャンクには入力の再バッファリングが必要になる。また依存が増える。多相 FIR は約 150 行で、チャンク長・レートの制約がなく、出力長を厳密に制御できる。
 
 #### 汎用カスタム用語辞書 (Generic TOML Glossary) — STT Hotwords & 翻訳の単一ソース設計
 
@@ -908,7 +916,7 @@ kotoha/
      - `ring_buffer` の SPSC 並行プロデューサ/コンシューマ検証、満杯時ドロップ数および `seq` ギャップの一致検証。
    - **Rust (`cargo test --workspace`, `crates/*/tests/<module>_test.rs`)**:
      - `kotoha-protocol` の往復・不正フレーム（magic 不一致、version 不一致、64KB 超過、切り詰め、`flags` 予約ビット、NaN PCM、UTF-8 不正）検証、およびエンドポイント解決（`KOTOHA_IPC_ENDPOINT` 上書き・OS デフォルト）検証。
-     - `kotoha-core` のモノラルダウンミックス、16 kHz リサンプリング、TOML 用語辞書読込・優先マージ、最長一致＆単語境界プレースホルダ保護/復元、Mock STT / Mock Translator によるパイプライン結合テスト。
+     - `kotoha-core` のモノラルダウンミックス、アンチエイリアス付きステートフル 16 kHz リサンプリング（折り返し減衰・チャンク分割一致・長時間の出力長）、TOML 用語辞書読込・優先マージ、最長一致＆単語境界プレースホルダ保護/復元、Mock STT / Mock Translator によるパイプライン結合テスト。
    - **UI (`Vitest`, `app/ui/src/<path>/<Module>.test.{ts,tsx}`)**:
      - カタログ・FNV-1a 話者カラー・設定スキーマバリデーション（`modelCatalog.test.ts`）、字幕カード 3 段階状態遷移・行数制限・ロック状態（`SubtitleOverlay.test.tsx`）、プロバイダ/モデルプロファイル/ライセンス注意表示切替（`TranslationSettings.test.tsx`）、アプリ全体結合（`App.test.tsx`）。
 2. **Tier 2: バイナリ ABI & 疎通結合テスト**

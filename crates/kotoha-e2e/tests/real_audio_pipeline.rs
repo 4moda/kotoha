@@ -384,7 +384,7 @@ async fn real_english_wav_through_cpp_ipc_sherpa_stt_and_http_translation() {
         stt_engine.clone(),
         translator_mgr,
         sink.clone(),
-        Arc::new(AudioPreprocessor::process_chunk),
+        AudioPreprocessor::resampler_factory(),
     );
     if has_bpe_vocab {
         glossary_mgr

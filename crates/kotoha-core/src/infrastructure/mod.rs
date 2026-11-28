@@ -6,7 +6,7 @@ pub mod ipc_server;
 pub mod mock_adapters;
 pub mod secret_store;
 
-pub use audio::{AudioPreprocessor, TARGET_SAMPLE_RATE};
+pub use audio::{AudioPreprocessor, StreamResampler, TARGET_SAMPLE_RATE};
 pub use glossary_toml::TomlGlossaryRepository;
 pub use ipc_server::{
     connect_local_socket, parse_config_number, IpcDiagnostic, IpcServerAdapter, IpcServerConfig,

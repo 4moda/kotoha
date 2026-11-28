@@ -6,11 +6,22 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::domain::entities::{
-    GlossaryProfile, LanguageCode, SpeakerKey, SttHotwordsConfig, SubtitleEntry, TranscriptEvent,
-    TranslationProviderConfig, TranslationRequest, TranslationResult,
+    AudioChunk, GlossaryProfile, LanguageCode, SpeakerKey, SttHotwordsConfig, SubtitleEntry,
+    TranscriptEvent, TranslationProviderConfig, TranslationRequest, TranslationResult,
 };
 use crate::domain::error::CoreError;
 use crate::domain::secret::{Secret, SecretRef};
+
+/// Per-speaker stateful audio normalizer: raw interleaved [`AudioChunk`] to 16 kHz mono `f32`.
+///
+/// One instance belongs to exactly one speaker worker, so implementations may keep filter
+/// history across chunks. It runs on the worker's blocking thread. A change of sample rate or
+/// channel count between chunks is handled by the implementation (history is reset).
+pub trait Resampler: Send {
+    /// Converts one chunk; the result may be shorter than the nominal length while the filter
+    /// fills, but never repeats or drops samples over a long run.
+    fn process(&mut self, chunk: &AudioChunk) -> Result<Vec<f32>, CoreError>;
+}
 
 /// Per-speaker stateful streaming speech-to-text recognizer.
 pub trait SttStream: Send {
