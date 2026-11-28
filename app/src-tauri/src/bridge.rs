@@ -251,10 +251,7 @@ async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
     let _ = shutdown_rx.wait_for(|v| *v).await;
 }
 
-async fn run_pipeline_with_rx(
-    pipeline: &mut PipelineService,
-    rx: mpsc::Receiver<AudioInputEvent>,
-) {
+async fn run_pipeline_with_rx(pipeline: &mut PipelineService, rx: mpsc::Receiver<AudioInputEvent>) {
     // `run` owns the per-speaker STT workers and the bounded translation queue, and recovers
     // from every non-fatal error itself.
     let _ = pipeline.run(rx).await;
