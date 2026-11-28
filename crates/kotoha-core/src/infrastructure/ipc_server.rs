@@ -60,6 +60,173 @@ impl Default for IpcServerConfig {
     }
 }
 
+/// Environment variable overriding [`IpcServerConfig::hello_timeout`] (milliseconds).
+pub const ENV_IPC_HELLO_TIMEOUT_MS: &str = "KOTOHA_IPC_HELLO_TIMEOUT_MS";
+/// Environment variable overriding [`IpcServerConfig::idle_timeout`] (milliseconds).
+pub const ENV_IPC_IDLE_TIMEOUT_MS: &str = "KOTOHA_IPC_IDLE_TIMEOUT_MS";
+/// Environment variable overriding [`IpcServerConfig::max_connections`].
+pub const ENV_IPC_MAX_CONNECTIONS: &str = "KOTOHA_IPC_MAX_CONNECTIONS";
+
+/// Largest accepted timeout (one hour), in milliseconds.
+pub const MAX_TIMEOUT_MS: u64 = 3_600_000;
+/// Largest accepted `max_connections`.
+pub const MAX_CONNECTIONS_LIMIT: usize = 4096;
+
+impl IpcServerConfig {
+    /// Checks that every limit is inside its accepted range: both timeouts must be between 1 ms
+    /// and [`MAX_TIMEOUT_MS`], and `max_connections` between 1 and [`MAX_CONNECTIONS_LIMIT`].
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Ipc`] (`invalid IPC server config: ...`) naming the first offending field.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        for (name, value) in [
+            ("hello_timeout", self.hello_timeout),
+            ("idle_timeout", self.idle_timeout),
+        ] {
+            if value.is_zero() || value > Duration::from_millis(MAX_TIMEOUT_MS) {
+                return Err(invalid_config(&format!(
+                    "{name} must be between 1 and {MAX_TIMEOUT_MS} ms (got {} ms)",
+                    value.as_millis()
+                )));
+            }
+        }
+        if !(1..=MAX_CONNECTIONS_LIMIT).contains(&self.max_connections) {
+            return Err(invalid_config(&format!(
+                "max_connections must be between 1 and {MAX_CONNECTIONS_LIMIT} (got {})",
+                self.max_connections
+            )));
+        }
+        Ok(())
+    }
+
+    /// Builds a validated configuration from the process environment
+    /// ([`ENV_IPC_HELLO_TIMEOUT_MS`], [`ENV_IPC_IDLE_TIMEOUT_MS`], [`ENV_IPC_MAX_CONNECTIONS`]);
+    /// unset or empty variables keep their defaults.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Ipc`] (`invalid IPC server config: ...`) for a value that is not valid UTF-8, not a number, or
+    /// out of range.
+    pub fn from_env() -> Result<Self, CoreError> {
+        Self::from_lookup(|name| {
+            std::env::var_os(name).map_or(Ok(None), |value| {
+                value
+                    .into_string()
+                    .map(Some)
+                    .map_err(|_| invalid_config(&format!("{name} is not valid UTF-8")))
+            })
+        })
+    }
+
+    /// Like [`IpcServerConfig::from_env`], but reads variables through `lookup` (testable without
+    /// touching the process environment). An empty value counts as unset.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::Ipc`] (`invalid IPC server config: ...`) for a non-numeric or out-of-range value, or whatever
+    /// `lookup` fails with.
+    pub fn from_lookup(
+        lookup: impl Fn(&str) -> Result<Option<String>, CoreError>,
+    ) -> Result<Self, CoreError> {
+        let mut config = Self::default();
+        let read = |name: &str| -> Result<Option<u64>, CoreError> {
+            match lookup(name)? {
+                Some(raw) if !raw.trim().is_empty() => parse_config_number(name, &raw).map(Some),
+                _ => Ok(None),
+            }
+        };
+        if let Some(ms) = read(ENV_IPC_HELLO_TIMEOUT_MS)? {
+            config.hello_timeout = Duration::from_millis(ms);
+        }
+        if let Some(ms) = read(ENV_IPC_IDLE_TIMEOUT_MS)? {
+            config.idle_timeout = Duration::from_millis(ms);
+        }
+        if let Some(n) = read(ENV_IPC_MAX_CONNECTIONS)? {
+            config.max_connections = usize::try_from(n).unwrap_or(usize::MAX);
+        }
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+fn invalid_config(msg: &str) -> CoreError {
+    CoreError::Ipc(format!("invalid IPC server config: {msg}"))
+}
+
+/// Parses a non-negative decimal integer for the setting `name`.
+///
+/// # Errors
+/// Returns [`CoreError::Ipc`] (`invalid IPC server config: ...`) if `raw` is not a decimal `u64`.
+pub fn parse_config_number(name: &str, raw: &str) -> Result<u64, CoreError> {
+    raw.trim().parse::<u64>().map_err(|_| {
+        invalid_config(&format!(
+            "{name} must be a non-negative integer (got '{raw}')"
+        ))
+    })
+}
+
+/// Connection-level event for operators (logs, diagnostics UI); see
+/// [`IpcServerAdapter::with_diagnostics`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcDiagnostic {
+    /// A connection ended. `source` is `None` when it never completed the `Hello` handshake
+    /// (such connections produce no `SourceDisconnected` event).
+    ConnectionClosed {
+        /// Connection ID assigned at accept time.
+        conn_id: u64,
+        /// Source name from `Hello`, if the handshake completed.
+        source: Option<String>,
+        /// Why the connection was closed.
+        reason: DisconnectReason,
+    },
+    /// A new connection was dropped immediately because the connection limit was reached.
+    ConnectionRefused {
+        /// Number of connections being served when the new one arrived.
+        active: usize,
+        /// Configured `max_connections`.
+        max_connections: usize,
+    },
+}
+
+impl std::fmt::Display for IpcDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectionClosed {
+                conn_id,
+                source,
+                reason,
+            } => match source {
+                Some(source) => write!(
+                    f,
+                    "connection {conn_id} (source '{source}') closed: {reason:?}"
+                ),
+                None => write!(f, "connection {conn_id} (no Hello) closed: {reason:?}"),
+            },
+            Self::ConnectionRefused {
+                active,
+                max_connections,
+            } => write!(
+                f,
+                "connection refused: {active} active connections reached the limit of {max_connections}"
+            ),
+        }
+    }
+}
+
+/// Callback receiving [`IpcDiagnostic`]s. It runs on the server tasks, so it must not block.
+#[derive(Clone)]
+struct DiagnosticsHook(Arc<dyn Fn(&IpcDiagnostic) + Send + Sync>);
+
+impl std::fmt::Debug for DiagnosticsHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DiagnosticsHook(..)")
+    }
+}
+
+fn report(hook: Option<&DiagnosticsHook>, diagnostic: &IpcDiagnostic) {
+    if let Some(hook) = hook {
+        (hook.0)(diagnostic);
+    }
+}
+
 /// `source -> (conn_id, cancel)` for the connection that currently owns each source.
 type OwnerRegistry = Arc<Mutex<HashMap<String, (u64, oneshot::Sender<()>)>>>;
 
@@ -76,6 +243,7 @@ pub struct IpcServerAdapter {
     next_conn_id: Arc<AtomicU64>,
     config: IpcServerConfig,
     owners: OwnerRegistry,
+    diagnostics: Option<DiagnosticsHook>,
 }
 
 impl IpcServerAdapter {
@@ -94,7 +262,24 @@ impl IpcServerAdapter {
             next_conn_id: Arc::new(AtomicU64::new(1)),
             config,
             owners: Arc::default(),
+            diagnostics: None,
         }
+    }
+
+    /// Installs a callback that receives an [`IpcDiagnostic`] for every closed connection
+    /// (with its [`DisconnectReason`]) and every connection refused for exceeding
+    /// `max_connections`.
+    ///
+    /// The workspace has no logging framework, so reasons are reported through this hook instead
+    /// of a hard dependency on one (a `tracing` subscriber can be bridged here). The callback
+    /// runs on the server tasks and must not block.
+    #[must_use]
+    pub fn with_diagnostics(
+        mut self,
+        hook: impl Fn(&IpcDiagnostic) + Send + Sync + 'static,
+    ) -> Self {
+        self.diagnostics = Some(DiagnosticsHook(Arc::new(hook)));
+        self
     }
 
     /// Creates an [`IpcServerAdapter`] using [`kotoha_protocol::resolve_endpoint_details`].
@@ -185,12 +370,20 @@ impl IpcServerAdapter {
                             if client_tasks.len() >= self.config.max_connections {
                                 // Over capacity: drop the new connection immediately.
                                 drop(stream);
+                                report(
+                                    self.diagnostics.as_ref(),
+                                    &IpcDiagnostic::ConnectionRefused {
+                                        active: client_tasks.len(),
+                                        max_connections: self.config.max_connections,
+                                    },
+                                );
                                 continue;
                             }
                             let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
                             let client_tx = tx.clone();
                             let config = self.config;
                             let owners = Arc::clone(&self.owners);
+                            let diagnostics = self.diagnostics.clone();
                             client_tasks.spawn(async move {
                                 handle_connection(
                                     conn_id,
@@ -199,6 +392,7 @@ impl IpcServerAdapter {
                                     client_shutdown,
                                     config,
                                     owners,
+                                    diagnostics,
                                 )
                                 .await;
                             });
@@ -250,6 +444,12 @@ impl SocketIdentity {
     }
 }
 
+/// Appended to every private-directory refusal: the user's way out when another user (or a
+/// stale directory) got there first.
+#[cfg(unix)]
+const PRIVATE_DIR_HINT: &str = "set KOTOHA_IPC_ENDPOINT to a socket path you own, or \
+     XDG_RUNTIME_DIR to a private directory, to use a different location";
+
 /// Creates (mode `0700`) and validates the per-user private directory that holds the endpoint.
 #[cfg(unix)]
 fn ensure_private_dir(dir: &Path) -> Result<(), CoreError> {
@@ -275,14 +475,15 @@ fn ensure_private_dir(dir: &Path) -> Result<(), CoreError> {
     if !meta.file_type().is_dir() {
         return Err(CoreError::Ipc(format!(
             "refusing to use private IPC directory '{}': it is not a directory (symlinks are not \
-             allowed)",
+             allowed); {PRIVATE_DIR_HINT}",
             dir.display()
         )));
     }
     let euid = current_euid();
     if meta.uid() != euid {
         return Err(CoreError::Ipc(format!(
-            "refusing to use private IPC directory '{}': owned by uid {} instead of uid {euid}",
+            "refusing to use private IPC directory '{}': owned by uid {} instead of uid {euid}; \
+             {PRIVATE_DIR_HINT}",
             dir.display(),
             meta.uid()
         )));
@@ -291,7 +492,7 @@ fn ensure_private_dir(dir: &Path) -> Result<(), CoreError> {
     if mode & 0o077 != 0 {
         return Err(CoreError::Ipc(format!(
             "refusing to use private IPC directory '{}': permissions {mode:04o} grant group/other \
-             access (expected 0700)",
+             access (expected 0700); {PRIVATE_DIR_HINT}",
             dir.display()
         )));
     }
@@ -506,6 +707,7 @@ async fn handle_connection(
     mut shutdown_rx: watch::Receiver<bool>,
     config: IpcServerConfig,
     owners: OwnerRegistry,
+    diagnostics: Option<DiagnosticsHook>,
 ) {
     let mut source_name: Option<String> = None;
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
@@ -574,28 +776,31 @@ async fn handle_connection(
             let Ok(permit) = tx.reserve().await else {
                 break DisconnectReason::Shutdown;
             };
+            // The cancel handle is consumed exactly once, by the first `Hello`. If it were ever
+            // missing, fail the connection loudly instead of silently skipping registration and
+            // `SourceConnected` (which would leave an unowned, half-initialised connection).
+            let Some(cancel) = cancel_tx.take() else {
+                break DisconnectReason::Protocol(
+                    "internal error: handshake state lost".to_owned(),
+                );
+            };
             source_name = Some(app_name.clone());
-            if let Some(cancel) = cancel_tx.take() {
-                let mut map = owners
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let previous = map.insert(app_name.clone(), (conn_id, cancel));
-                if let Some((_, old_cancel)) = previous {
-                    let _ = old_cancel.send(());
-                }
-                permit.send(AudioInputEvent::SourceConnected {
-                    conn_id,
-                    source: app_name,
-                    plugin_version,
-                });
-                drop(map);
-            }
+            register_owner(&owners, conn_id, app_name, plugin_version, cancel, permit);
             deadline = Instant::now() + config.idle_timeout;
         } else {
             // Any non-Hello frame before handshake is a protocol violation -> immediate disconnect.
             break DisconnectReason::Protocol("frame received before Hello".to_owned());
         }
     };
+
+    report(
+        diagnostics.as_ref(),
+        &IpcDiagnostic::ConnectionClosed {
+            conn_id,
+            source: source_name.clone(),
+            reason: reason.clone(),
+        },
+    );
 
     if let Some(source) = source_name {
         {
@@ -614,6 +819,32 @@ async fn handle_connection(
             })
             .await;
     }
+}
+
+/// Makes `conn_id` the owner of `source`, cancels the previous owner and enqueues
+/// `SourceConnected` through the already reserved `permit`, all under the registry lock (see the
+/// ordering note in `handle_connection`).
+fn register_owner(
+    owners: &OwnerRegistry,
+    conn_id: u64,
+    source: String,
+    plugin_version: String,
+    cancel: oneshot::Sender<()>,
+    permit: mpsc::Permit<'_, AudioInputEvent>,
+) {
+    let mut map = owners
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = map.insert(source.clone(), (conn_id, cancel));
+    if let Some((_, old_cancel)) = previous {
+        let _ = old_cancel.send(());
+    }
+    permit.send(AudioInputEvent::SourceConnected {
+        conn_id,
+        source,
+        plugin_version,
+    });
+    drop(map);
 }
 
 fn message_to_event(conn_id: u64, source: &str, msg: Message) -> Option<AudioInputEvent> {

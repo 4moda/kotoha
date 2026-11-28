@@ -1,10 +1,13 @@
 //! Phase 1 Presentation CLI (`kotoha-ipc-monitor`) for cross-language IPC diagnostics and E2E.
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use kotoha_core::application::{SeqStatus, SessionAction, SourceSessionManager};
 use kotoha_core::domain::AudioInputEvent;
-use kotoha_core::infrastructure::{AudioPreprocessor, IpcServerAdapter};
+use kotoha_core::infrastructure::{
+    parse_config_number, AudioPreprocessor, IpcServerAdapter, IpcServerConfig,
+};
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -12,7 +15,18 @@ struct CliArgs {
     endpoint: Option<String>,
     max_events: Option<usize>,
     json: bool,
+    hello_timeout_ms: Option<u64>,
+    idle_timeout_ms: Option<u64>,
+    max_connections: Option<u64>,
 }
+
+const USAGE: &str = "Usage: kotoha-ipc-monitor [--endpoint <path>] [--max-events <n>] [--json]\n\
+    \x20                          [--hello-timeout-ms <ms>] [--idle-timeout-ms <ms>]\n\
+    \x20                          [--max-connections <n>]\n\
+    \n\
+    Server limits default to 2000 ms / 5000 ms / 16 connections and can also be set with the\n\
+    environment variables KOTOHA_IPC_HELLO_TIMEOUT_MS, KOTOHA_IPC_IDLE_TIMEOUT_MS and\n\
+    KOTOHA_IPC_MAX_CONNECTIONS (command-line flags win over environment variables).";
 
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -72,6 +86,9 @@ fn parse_args() -> Result<CliArgs, String> {
     let mut endpoint: Option<String> = None;
     let mut max_events: Option<usize> = None;
     let mut json = false;
+    let mut hello_timeout_ms: Option<u64> = None;
+    let mut idle_timeout_ms: Option<u64> = None;
+    let mut max_connections: Option<u64> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -92,12 +109,16 @@ fn parse_args() -> Result<CliArgs, String> {
                 max_events = Some(parsed);
             }
             "--json" => json = true,
-            "-h" | "--help" => {
-                return Err(
-                    "Usage: kotoha-ipc-monitor [--endpoint <path>] [--max-events <n>] [--json]"
-                        .to_owned(),
-                );
+            "--hello-timeout-ms" => {
+                hello_timeout_ms = Some(numeric_flag(&mut args, "--hello-timeout-ms")?);
             }
+            "--idle-timeout-ms" => {
+                idle_timeout_ms = Some(numeric_flag(&mut args, "--idle-timeout-ms")?);
+            }
+            "--max-connections" => {
+                max_connections = Some(numeric_flag(&mut args, "--max-connections")?);
+            }
+            "-h" | "--help" => return Err(USAGE.to_owned()),
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -106,7 +127,33 @@ fn parse_args() -> Result<CliArgs, String> {
         endpoint,
         max_events,
         json,
+        hello_timeout_ms,
+        idle_timeout_ms,
+        max_connections,
     })
+}
+
+fn numeric_flag(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<u64, String> {
+    let raw = args
+        .next()
+        .ok_or_else(|| format!("{flag} requires a positive integer"))?;
+    parse_config_number(flag, &raw).map_err(|err| err.to_string())
+}
+
+/// Environment variables first, then command-line flags on top, then validated.
+fn build_config(cli: &CliArgs) -> Result<IpcServerConfig, String> {
+    let mut config = IpcServerConfig::from_env().map_err(|err| err.to_string())?;
+    if let Some(ms) = cli.hello_timeout_ms {
+        config.hello_timeout = Duration::from_millis(ms);
+    }
+    if let Some(ms) = cli.idle_timeout_ms {
+        config.idle_timeout = Duration::from_millis(ms);
+    }
+    if let Some(n) = cli.max_connections {
+        config.max_connections = usize::try_from(n).unwrap_or(usize::MAX);
+    }
+    config.validate().map_err(|err| err.to_string())?;
+    Ok(config)
 }
 
 #[tokio::main]
@@ -123,10 +170,22 @@ async fn main() -> ExitCode {
         }
     };
 
+    let config = match build_config(&cli) {
+        Ok(config) => config,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::from(2);
+        }
+    };
     let server = cli
         .endpoint
         .clone()
-        .map_or_else(IpcServerAdapter::from_env, IpcServerAdapter::new);
+        .map_or_else(
+            || IpcServerAdapter::from_env_with_config(config),
+            |endpoint| IpcServerAdapter::with_config(endpoint, config),
+        )
+        // Disconnect reasons and over-limit refusals go to stderr so stdout stays machine-readable.
+        .with_diagnostics(|diagnostic| eprintln!("kotoha-ipc-monitor: {diagnostic}"));
     let listening_on = server.endpoint().to_owned();
     let (event_tx, mut event_rx) = mpsc::channel::<AudioInputEvent>(256);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

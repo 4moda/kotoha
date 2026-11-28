@@ -115,7 +115,8 @@ C++ クライアント（`resolve_ipc_endpoint` / `resolve_posix_ipc_endpoint`�
 | 3 (Linux / macOS) | `$XDG_RUNTIME_DIR` 未設定または空 | `${TMPDIR}/kotoha-<euid>/kotoha_v1.sock` | ユーザー専用ディレクトリ（下記）。`$TMPDIR` が未設定・空・相対パス・`/` のみ、または結果が **90 バイト超**の場合は `/tmp/kotoha-<euid>/kotoha_v1.sock` を使う。`<euid>` は実効 UID の 10 進表記。`$TMPDIR` 末尾のスラッシュは正規化する |
 
 - `/tmp/kotoha_v1.sock` のような **誰でも書き込める共有ディレクトリ直下へのフォールバックは行わない**（別ユーザーが先に同じパスで listen すると、プラグインが全参加者の音声と表示名をそのサーバーへ送ってしまうため）。macOS の GUI 起動アプリには通常 `XDG_RUNTIME_DIR` が無いが、`$TMPDIR`（`/var/folders/.../T/`）はユーザーごとのディレクトリなので優先度 3 の第一候補になる。
-- **ユーザー専用ディレクトリ（優先度 3）の扱い**: サーバーは bind 前に当該ディレクトリが無ければ **mode `0700`** で作成する（親ディレクトリは作成しない）。既存の場合を含め、`lstat` 結果が (a) 実ディレクトリである（シンボリックリンク不可）、(b) 所有者が実効 UID、(c) group/other のパーミッションビットが無い（`mode & 0o077 == 0`）、のすべてを満たさなければ**使用を拒否してエラー終了**する（パーミッションの自動修正もしない）。`KOTOHA_IPC_ENDPOINT` と `$XDG_RUNTIME_DIR` の場合はこの検査を行わない（`$XDG_RUNTIME_DIR` は仕様上 `0700` かつ本人所有）。
+- **ユーザー専用ディレクトリ（優先度 3）の扱い**: サーバーは bind 前に当該ディレクトリが無ければ **mode `0700`** で作成する（親ディレクトリは作成しない）。既存の場合を含め、`lstat` 結果が (a) 実ディレクトリである（シンボリックリンク不可）、(b) 所有者が実効 UID、(c) group/other のパーミッションビットが無い（`mode & 0o077 == 0`）、のすべてを満たさなければ**使用を拒否してエラー終了**する（パーミッションの自動修正もしない）。`KOTOHA_IPC_ENDPOINT` と `$XDG_RUNTIME_DIR` の場合はこの検査を行わない（`$XDG_RUNTIME_DIR` は仕様上 `0700` かつ本人所有）。この拒否（他ユーザーが先に `/tmp/kotoha-<euid>` を作成していた場合など）のエラーメッセージには、回避策として `KOTOHA_IPC_ENDPOINT`（自分所有のソケットパス）または `XDG_RUNTIME_DIR`（自分専用ディレクトリ）の設定を案内する文言を含める。
+- **UTF-8 でない環境変数**: Rust のエンドポイントは `String` のため、`KOTOHA_IPC_ENDPOINT` / `XDG_RUNTIME_DIR` / `TMPDIR` の値が有効な UTF-8 でない場合、**Rust・C++ 双方とも未設定として扱う**（Rust は `env::var_os` で読み、UTF-8 に変換できなければ未設定。C++ は同じ厳密な UTF-8 検証に失敗した値を未設定とする。Windows の C++ は対象外）。生バイト列をそのまま使うと両者の解決結果が食い違い接続できなくなるための規則で、Rust・C++ 双方の単体テストで検証する（共有 TSV はテキスト形式のためこのケースは含められない）。
 
 #### Unix Domain Socket (Linux / macOS) 固有要件
 - **パーミッション**: サーバーは `bind` 完了直後（または `umask` 制御により作成時）にソケットファイルのパーミッションを **`0600`**（所有者のみ読み書き可）に設定し、他ユーザーからの盗聴・注入を防止する。
@@ -129,7 +130,8 @@ C++ クライアント（`resolve_ipc_endpoint` / `resolve_posix_ipc_endpoint`�
   - **Rust (`interprocess`) 命名規約**: Rust `interprocess` クレート（v2 `local_socket::Name` / `GenericNamespaced` + `ToNsName`）で名前付きパイプを生成・接続する場合、`ToNsName` はプレフィックス無しのパイプ名（例: `"kotoha_v1"`）から内部的に `\\.\pipe\kotoha_v1` を構築する。一方、`KOTOHA_IPC_ENDPOINT` には Windows 標準形式 `\\.\pipe\<name>` と裸の `<name>` の双方が渡され得るため、Rust 側の Windows エンドポイント解決関数は先頭の `\\.\pipe\`（大文字小文字非区別）を正規化して `ToNsName` に渡す（C++ 側は `\\.\pipe\<name>` をそのまま `CreateFileW` へ渡し、裸名が渡された場合のみ `\\.\pipe\` を補完する）。
   - **アクセス制御・セキュリティ記述子**: パイプは `PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT` 互換のバイトストリームモードで作成し、現行ユーザー SID にアクセスを限定する DACL（Local System / 現行ユーザーのみ許可し、他ユーザー・ネットワークアクセスを拒否するセキュリティ記述子）を適用する。
   - **先行作成（squatting）防止**: サーバーは最初のパイプインスタンスを `FILE_FLAG_FIRST_PIPE_INSTANCE` 付きで作成し、同名パイプが既に存在する場合は起動に失敗する（`interprocess` v2 の `PipeListener` は最初のインスタンス作成時にこのフラグを常に付与する）。
-  - **クライアントによるサーバー検証**: C++ クライアントは `CreateFileW` 成功直後、データ送信前に `GetNamedPipeServerProcessId` でサーバープロセス ID を取得し、`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` → `OpenProcessToken(TOKEN_QUERY)` → `GetTokenInformation(TokenUser)` で得たユーザー SID が自プロセスのトークンユーザー SID と `EqualSid` で一致することを確認する。いずれかの API が失敗した場合や不一致の場合はハンドルを閉じて接続失敗として扱う（fail closed）。
+  - **クライアントによるサーバー検証**: C++ クライアントは `CreateFileW` 成功直後、データ送信前に `GetNamedPipeServerProcessId` でサーバープロセス ID を取得し、`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` → `OpenProcessToken(TOKEN_QUERY)` → `GetTokenInformation(TokenUser)` で得たユーザー SID が自プロセスのトークンユーザー SID と `EqualSid` で一致することを確認する。いずれかの API が失敗した場合や不一致の場合はハンドルを閉じて接続失敗として扱う（fail closed）。トークンハンドルは RAII ガードで確実に閉じる（バッファ確保で例外が発生した場合も含む）。
+  - **既知の制約（未検証・本 Phase の対象外）**: Kotoha を管理者権限（昇格済み）、Mumble を通常権限で起動した場合、`OpenProcess` / `OpenProcessToken` が拒否されて fail closed となり接続できない可能性がある。実機での確認は未実施。また Rust 側の診断用プローブクライアント `connect_local_socket`（テスト・診断専用）はサーバー身元検証を行わない。
   - **C++ 非同期 I/O とシャットダウン非ブロッキング**: C++ クライアントは `CreateFileW` 時に `FILE_FLAG_OVERLAPPED` を指定し、`WriteFile` も `OVERLAPPED` + イベント待機で行うことで、`mumble_shutdown()` 時に `CancelIoEx(handle, nullptr)` により進行中のパイプ I/O を即座にキャンセルしてブロックせずに終了できるようにする。また、接続時に `ERROR_PIPE_BUSY` が返った場合は短い待機（例: `WaitNamedPipeW(endpoint, 50)`）の後に再試行する。
 
 ### 3.2 トポロジと接続ライフサイクル
@@ -154,6 +156,8 @@ C++ クライアント（`resolve_ipc_endpoint` / `resolve_posix_ipc_endpoint`�
   - **`hello_timeout`（既定 2 秒）**: 接続受理から有効な `Hello` が届くまでの上限。超過した接続は切断する（`HelloTimeout`、`Hello` 未完了のため `SourceDisconnected` は発行しない）。
   - **`idle_timeout`（既定 5 秒）**: `Hello` 後、**任意の種別のフレーム**（`Heartbeat` 含む）が届かない時間の上限。超過した接続は切断し `SourceDisconnected { reason: IdleTimeout }` を発行する。
   - **`max_connections`（既定 16）**: 同時接続数の上限。超過分の新規接続は即座に破棄する。
+  - 3 つの上限は環境変数 `KOTOHA_IPC_HELLO_TIMEOUT_MS` / `KOTOHA_IPC_IDLE_TIMEOUT_MS`（ミリ秒）/ `KOTOHA_IPC_MAX_CONNECTIONS` と `kotoha-ipc-monitor` の `--hello-timeout-ms` / `--idle-timeout-ms` / `--max-connections` で変更できる（優先順位: フラグ > 環境変数 > 既定値。空文字列は未設定扱い）。検証範囲はタイムアウト 1〜3,600,000 ms、接続数 1〜4096 で、範囲外・数値以外はエラー終了（終了コード 2）する。
+  - 切断理由と接続数超過による拒否は、`IpcServerAdapter::with_diagnostics` で登録するコールバック（`IpcDiagnostic`）で通知する。ワークスペースにはログフレームワーク（`tracing` 等）が無く、このためだけに依存を追加しないための設計で、`kotoha-ipc-monitor` は stderr に出力する（将来 `tracing` を導入する場合はこのコールバックから橋渡しする）。
   - 切断理由は `AudioInputEvent::SourceDisconnected.reason`（`DisconnectReason`: `Eof` / `IoError` / `Protocol` / `HelloTimeout` / `IdleTimeout` / `Superseded` / `Shutdown`）で通知され、`kotoha-ipc-monitor` が表示する。
 - **切断クリーンアップ (`SourceReset` / EOF)**:
   - クライアントはプラグイン停止時やボイスチャットサーバー切断時（`mumble_onServerDisconnected`）に `SourceReset` (`0x06`) を送信する。
