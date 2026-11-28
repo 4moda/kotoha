@@ -9,9 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use kotoha_app_lib::bridge::ConnectionStatusMonitor;
 use kotoha_app_lib::state::{
-    embedded_mumble_plugin_bytes, map_plugin_install_outcome, AppState, ConnectionState,
-    DownloadProgressEventDto, HostOsPlatform, ModelDownloadStatus, OverlayStyleUpdateInput,
-    PluginInstallStatus, EVENT_CONNECTION_STATUS, EVENT_DOWNLOAD_PROGRESS,
+    embedded_mumble_plugin_bytes, map_plugin_install_outcome, validate_custom_plugin_dir, AppState,
+    ConnectionState, DownloadProgressEventDto, HostOsPlatform, ModelDownloadStatus,
+    OverlayStyleUpdateInput, PluginInstallStatus, EVENT_CONNECTION_STATUS, EVENT_DOWNLOAD_PROGRESS,
     EVENT_OVERLAY_LOCK_CHANGED, EVENT_OVERLAY_STYLE_CHANGED, EVENT_SUBTITLE,
 };
 use kotoha_core::domain::{
@@ -741,4 +741,64 @@ async fn language_pair_changes_are_published_to_the_pipeline_bridge() {
     assert!(!rx.has_changed().unwrap());
 
     let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[tokio::test]
+async fn unreadable_settings_file_blocks_saving_instead_of_overwriting() {
+    let data_dir = unique_temp_dir("kotoha_tauri_unreadable");
+    fs::create_dir_all(&data_dir).unwrap();
+    // A directory at the settings path: reading fails with a non-NotFound I/O error.
+    let settings_path = data_dir.join("kotoha-settings.json");
+    fs::create_dir_all(&settings_path).unwrap();
+
+    let state = AppState::new(&data_dir).expect("startup must still succeed");
+    let json = serde_json::to_value(state.snapshot().await).unwrap();
+    assert!(json["settings_notice"].as_str().is_some());
+
+    let err = state
+        .update_overlay_style(OverlayStyleUpdateInput {
+            locked: Some(false),
+            ..Default::default()
+        })
+        .await
+        .expect_err("saving must be refused");
+    assert!(err.contains("cannot be saved"), "{err}");
+    assert!(settings_path.is_dir());
+
+    let _ = fs::remove_dir_all(&data_dir);
+}
+
+#[test]
+fn custom_plugin_dir_must_be_an_existing_absolute_directory_and_is_canonicalized() {
+    let root = unique_temp_dir("kotoha_tauri_plugin_dir");
+    let real = root.join("real");
+    fs::create_dir_all(&real).unwrap();
+    let file = root.join("a_file");
+    fs::write(&file, b"x").unwrap();
+
+    assert!(validate_custom_plugin_dir("relative/dir").is_err());
+    assert!(validate_custom_plugin_dir(root.join("missing").to_str().unwrap()).is_err());
+    assert!(validate_custom_plugin_dir(file.to_str().unwrap()).is_err());
+
+    let canonical = validate_custom_plugin_dir(real.to_str().unwrap()).unwrap();
+    assert_eq!(canonical, fs::canonicalize(&real).unwrap());
+
+    // `..` segments collapse to the canonical form.
+    let dotted = real.join("..").join("real");
+    assert_eq!(
+        validate_custom_plugin_dir(dotted.to_str().unwrap()).unwrap(),
+        canonical
+    );
+
+    #[cfg(unix)]
+    {
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            validate_custom_plugin_dir(link.to_str().unwrap()).unwrap(),
+            canonical
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
 }

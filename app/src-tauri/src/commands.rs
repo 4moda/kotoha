@@ -9,10 +9,11 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::bridge::emit_overlay_style_changed;
 use crate::state::{
-    map_plugin_install_outcome, resolve_mumble_plugin_bytes, AppRuntimeStateDto, AppState,
-    DownloadProgressEventDto, GlossarySettingsStateDto, HostOsPlatform, ModelDownloadStatus,
-    OverlayDisplayOptionsDto, OverlayStyleUpdateInput, PluginInstallResultDto, PluginInstallStatus,
-    SecretStatusDto, EVENT_DOWNLOAD_PROGRESS, EVENT_OVERLAY_LOCK_CHANGED,
+    map_plugin_install_outcome, resolve_mumble_plugin_bytes, validate_custom_plugin_dir,
+    AppRuntimeStateDto, AppState, DownloadProgressEventDto, GlossarySettingsStateDto,
+    HostOsPlatform, ModelDownloadStatus, OverlayDisplayOptionsDto, OverlayStyleUpdateInput,
+    PluginInstallResultDto, PluginInstallStatus, SecretStatusDto, EVENT_DOWNLOAD_PROGRESS,
+    EVENT_OVERLAY_LOCK_CHANGED,
 };
 
 /// Returns the complete runtime snapshot for the React UI.
@@ -44,41 +45,52 @@ pub async fn toggle_overlay_visible(
 
 /// Installs the Mumble plugin binary into the auto-detected or `customDir` directory.
 #[tauri::command]
+#[allow(clippy::too_many_lines)]
 pub async fn install_mumble_plugin(
     state: State<'_, Arc<AppState>>,
     custom_dir: Option<String>,
 ) -> Result<PluginInstallResultDto, String> {
-    let (detected_paths, is_flatpak) = state.detected_mumble_info().await;
     let platform = HostOsPlatform::current();
 
     let trimmed_custom = custom_dir
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
 
-    // A user-supplied directory must already exist and be a directory: the installer must not
-    // create arbitrary paths, and a bad path must never be persisted.
-    if let Some(dir) = trimmed_custom {
-        let candidate = PathBuf::from(dir);
-        let is_dir = tokio::task::spawn_blocking(move || candidate.is_dir())
-            .await
-            .map_err(|err| format!("failed to check custom plugin directory: {err}"))?;
-        if !is_dir {
-            return Ok(PluginInstallResultDto {
-                status: PluginInstallStatus::Error,
-                platform,
-                target_path: dir.to_owned(),
-                detected_paths,
-                is_flatpak,
-                flatpak_hint: None,
-                message: "The specified plugin directory does not exist or is not a directory."
-                    .to_owned(),
-            });
-        }
+    // Without an override, refresh detection as before (nothing is persisted for `None`).
+    if trimmed_custom.is_none() {
+        state.record_custom_mumble_dir(None).await?;
     }
+    let (detected_paths, is_flatpak) = state.detected_mumble_info().await;
 
-    let Some(target_dir_str) = trimmed_custom
-        .map(str::to_owned)
+    // A user-supplied directory must be absolute, already exist and be a directory; it is
+    // canonicalized (symlinks resolved) and the canonical path is what gets installed into and
+    // persisted. A bad path is never persisted.
+    let custom_canonical = if let Some(raw) = trimmed_custom.clone() {
+        match tokio::task::spawn_blocking(move || validate_custom_plugin_dir(&raw))
+            .await
+            .map_err(|err| format!("failed to check custom plugin directory: {err}"))?
+        {
+            Ok(path) => Some(path.display().to_string()),
+            Err(message) => {
+                return Ok(PluginInstallResultDto {
+                    status: PluginInstallStatus::Error,
+                    platform,
+                    target_path: trimmed_custom.unwrap_or_default(),
+                    detected_paths,
+                    is_flatpak,
+                    flatpak_hint: None,
+                    message,
+                });
+            }
+        }
+    } else {
+        None
+    };
+
+    let Some(target_dir_str) = custom_canonical
+        .clone()
         .or_else(|| detected_paths.first().cloned())
     else {
         return Ok(PluginInstallResultDto {
@@ -119,15 +131,14 @@ pub async fn install_mumble_plugin(
                 PluginInstallOutcome::Installed { .. }
                     | PluginInstallOutcome::AlreadyUpToDate { .. }
             );
-            let (detected_paths, is_flatpak) = if succeeded && trimmed_custom.is_some() {
-                // Persist the override only now that the install worked.
-                state
-                    .record_custom_mumble_dir(custom_dir.as_deref())
-                    .await?;
-                state.detected_mumble_info().await
-            } else {
-                (detected_paths, is_flatpak)
-            };
+            let (detected_paths, is_flatpak) =
+                if let (true, Some(canonical)) = (succeeded, custom_canonical.as_deref()) {
+                    // Persist the (canonical) override only now that the install worked.
+                    state.record_custom_mumble_dir(Some(canonical)).await?;
+                    state.detected_mumble_info().await
+                } else {
+                    (detected_paths, is_flatpak)
+                };
             Ok(map_plugin_install_outcome(
                 &result,
                 platform,

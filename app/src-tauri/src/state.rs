@@ -412,6 +412,9 @@ pub struct AppState {
     translator_manager: Arc<TranslatorManager>,
     translator_status: RwLock<TranslatorStatusDto>,
     settings_notice: Option<String>,
+    /// `true` when the existing settings file could not be used or set aside; saving is refused
+    /// so the file is never overwritten (see [`kotoha_setup::SettingsLoadOutcome::save_blocked`]).
+    settings_save_blocked: bool,
     language_pair_tx: watch::Sender<(LanguageCode, LanguageCode)>,
     glossary_manager: Arc<RwLock<GlossaryManager>>,
     glossary_file_paths: RwLock<HashMap<String, String>>,
@@ -470,6 +473,7 @@ impl AppState {
         Self::finish_init(
             settings,
             loaded.notice,
+            loaded.save_blocked,
             status,
             settings_store,
             secret_store,
@@ -483,6 +487,7 @@ impl AppState {
     fn finish_init(
         settings: AppSettings,
         settings_notice: Option<String>,
+        settings_save_blocked: bool,
         translator_status: TranslatorStatusDto,
         settings_store: FileSettingsStore,
         secret_store: Arc<InMemorySecretStore>,
@@ -505,6 +510,7 @@ impl AppState {
             translator_manager,
             translator_status: RwLock::new(translator_status),
             settings_notice,
+            settings_save_blocked,
             language_pair_tx,
             glossary_manager: Arc::new(RwLock::new(glossary_manager)),
             glossary_file_paths: RwLock::new(file_paths),
@@ -1093,6 +1099,13 @@ impl AppState {
     }
 
     async fn persist_settings_async(&self, settings: AppSettings) -> Result<(), String> {
+        if self.settings_save_blocked {
+            return Err(
+                "settings cannot be saved because the existing settings file could not \
+                        be read or backed up; fix the file and restart Kotoha"
+                    .to_owned(),
+            );
+        }
         let store = self.settings_store.clone();
         spawn_blocking(move || {
             store
@@ -1102,6 +1115,25 @@ impl AppState {
         .await
         .map_err(|err| format!("settings persistence task failed: {err}"))?
     }
+}
+
+/// Validates a user-supplied Mumble plugin directory (absolute, existing, a directory).
+///
+/// Returns the canonical path (symlinks resolved). Symlinked directories are accepted
+/// deliberately, since Mumble setups commonly symlink the plugin folder; the resolved target is
+/// what gets written to and persisted, so a later change of the link cannot redirect the install.
+pub fn validate_custom_plugin_dir(raw: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(raw.trim());
+    if !path.is_absolute() {
+        return Err("The plugin directory must be an absolute path.".to_owned());
+    }
+    let canonical = fs::canonicalize(&path).map_err(|_| {
+        "The specified plugin directory does not exist or is not accessible.".to_owned()
+    })?;
+    if !canonical.is_dir() {
+        return Err("The specified plugin path is not a directory.".to_owned());
+    }
+    Ok(canonical)
 }
 
 /// Returns a user-safe reason (never secret values) why `config` could not be activated.

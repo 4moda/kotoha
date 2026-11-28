@@ -355,6 +355,18 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
     await inflightProviderCommitRef.current;
   }, [commitTranslationProvider]);
 
+  /** Re-reads the backend translator status (it changes when a secret rebuilds the provider). */
+  const refreshTranslatorStatus = useCallback(async () => {
+    try {
+      const state = await bridge.getAppState();
+      if (isMountedRef.current) {
+        setTranslatorStatus(state.translator_status ?? { state: 'ok' });
+      }
+    } catch {
+      // Best effort: the previous status stays until the next successful refresh.
+    }
+  }, [bridge]);
+
   const handleSetSecret = useCallback(
     async (kind: ProviderSecretKind, value: string) => {
       try {
@@ -365,12 +377,13 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
           setSecrets(status);
           setStatusError(null);
         }
+        await refreshTranslatorStatus();
       } catch (error) {
         reportIpcError(error, 'シークレットの保存に失敗しました。');
         throw error;
       }
     },
-    [bridge, flushProviderSync, reportIpcError],
+    [bridge, flushProviderSync, refreshTranslatorStatus, reportIpcError],
   );
 
   const handleClearSecret = useCallback(
@@ -382,12 +395,13 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
           setSecrets(status);
           setStatusError(null);
         }
+        await refreshTranslatorStatus();
       } catch (error) {
         reportIpcError(error, 'シークレットの削除に失敗しました。');
         throw error;
       }
     },
-    [bridge, flushProviderSync, reportIpcError],
+    [bridge, flushProviderSync, refreshTranslatorStatus, reportIpcError],
   );
 
   const commitOverlayStyle = useCallback(
@@ -557,7 +571,12 @@ export function App({ bridge: providedBridge }: AppProps = {}) {
         model_id: modelId,
       };
       setProvider(nextConfig);
-      await bridge.switchTranslationProvider(nextConfig, srcLang, tgtLang);
+      const switched = await bridge.switchTranslationProvider(nextConfig, srcLang, tgtLang);
+      if (isMountedRef.current) {
+        // The downloaded model may now be loadable: drop a stale "not active" banner.
+        setSecrets(switched.secrets);
+        setTranslatorStatus(switched.translator_status ?? { state: 'ok' });
+      }
     }
     return result;
   };

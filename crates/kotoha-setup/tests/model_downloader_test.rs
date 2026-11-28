@@ -382,3 +382,50 @@ fn cleanup_stale_part_files_removes_only_part_files() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[tokio::test]
+async fn aborts_mid_stream_when_body_exceeds_limit_without_a_content_length() {
+    // Chunked transfer: no Content-Length, so only the in-stream check can stop this.
+    let chunks = vec![vec![1u8; 700], vec![2u8; 700], vec![3u8; 700]];
+    let full: Vec<u8> = chunks.iter().flatten().copied().collect();
+    let sha = sha256_hex(&full);
+    let chunks_for_server = chunks.clone();
+    let server = LocalDownloadServer::start(move |_| {
+        ScriptedResponse::ok_chunked(chunks_for_server.clone())
+    })
+    .await;
+
+    let root = unique_temp_dir("kotoha_dl_midstream");
+    let _ = fs::remove_dir_all(&root);
+    let dest = root.join("m/model.bin");
+    let url = format!("{}/m.bin", server.base_url);
+
+    // Limit is 1000 + 25% = 1250 bytes; the 2nd chunk already crosses 1400.
+    let mut max_seen = 0;
+    let err = ModelDownloader::new()
+        .download_file_with_expected_size("m", &url, &dest, &sha, Some(1000), |p| {
+            max_seen = max_seen.max(p.bytes_downloaded);
+        })
+        .await
+        .expect_err("body larger than the limit must abort mid-stream");
+    assert!(matches!(err, SetupError::Network(_)), "{err:?}");
+    assert!(
+        max_seen <= 1250,
+        "stopped before exceeding the limit: {max_seen}"
+    );
+    assert!(!dest.exists());
+    assert!(!has_leftover_part_files(dest.parent().unwrap_or(&root)));
+
+    // The hard cap is enforced mid-stream as well.
+    let capped = ModelDownloader::with_config(ModelDownloaderConfig {
+        max_download_bytes: 1000,
+        ..ModelDownloaderConfig::default()
+    });
+    let err = capped
+        .download_file_for_model("m", &url, &root.join("c/model.bin"), &sha, |_| {})
+        .await
+        .expect_err("hard cap must apply mid-stream");
+    assert!(matches!(err, SetupError::Network(_)), "{err:?}");
+
+    let _ = fs::remove_dir_all(&root);
+}
