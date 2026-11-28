@@ -1,10 +1,11 @@
 //! Phase 1 Presentation CLI (`kotoha-ipc-monitor`) for cross-language IPC diagnostics and E2E.
 
+use std::collections::HashMap;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use kotoha_core::application::{SeqStatus, SessionAction, SourceSessionManager};
-use kotoha_core::domain::AudioInputEvent;
+use kotoha_core::domain::{AudioInputEvent, SpeakerKey};
 use kotoha_core::infrastructure::{
     parse_config_number, AudioPreprocessor, IpcServerAdapter, IpcServerConfig, StreamResampler,
 };
@@ -219,10 +220,12 @@ async fn main() -> ExitCode {
 
     let mut session = SourceSessionManager::new();
     let mut processed = 0usize;
+    // One resampler per speaker, as in the pipeline, so filter history carries across frames.
+    let mut resamplers: HashMap<SpeakerKey, StreamResampler> = HashMap::new();
 
     while let Some(event) = event_rx.recv().await {
         let action = session.handle_event(&event);
-        emit_event(&event, &action, &session, cli.json);
+        emit_event(&event, &action, &session, &mut resamplers, cli.json);
         processed += 1;
 
         if let Some(limit) = cli.max_events {
@@ -251,6 +254,7 @@ fn emit_event(
     event: &AudioInputEvent,
     action: &SessionAction,
     session: &SourceSessionManager,
+    resamplers: &mut HashMap<SpeakerKey, StreamResampler>,
     json: bool,
 ) {
     match event {
@@ -264,9 +268,11 @@ fn emit_event(
             source,
             reason,
         } => {
+            resamplers.retain(|k, _| k.source != *source);
             emit_cleared("DISCONNECT", *conn_id, source, action, json, Some(reason));
         }
         AudioInputEvent::SourceReset { conn_id, source } => {
+            resamplers.retain(|k, _| k.source != *source);
             emit_cleared("SOURCE_RESET", *conn_id, source, action, json, None);
         }
         AudioInputEvent::UserInfoUpdated {
@@ -291,6 +297,7 @@ fn emit_event(
             conn_id: _,
             speaker_key,
         } => {
+            resamplers.remove(speaker_key);
             if json {
                 print_json(&MonitorEvent::UserRemoved {
                     source: &speaker_key.source,
@@ -329,7 +336,7 @@ fn emit_event(
             }
         }
         AudioInputEvent::AudioFrame { conn_id: _, chunk } => {
-            emit_audio_frame(chunk, action, session, json);
+            emit_audio_frame(chunk, action, session, resamplers, json);
         }
         AudioInputEvent::Heartbeat { conn_id, source } => {
             if json {
@@ -411,10 +418,13 @@ fn emit_audio_frame(
     chunk: &kotoha_core::domain::AudioChunk,
     action: &SessionAction,
     session: &SourceSessionManager,
+    resamplers: &mut HashMap<SpeakerKey, StreamResampler>,
     json: bool,
 ) {
     let rms = AudioPreprocessor::compute_rms(&chunk.samples);
-    let samples_16k_mono = StreamResampler::new()
+    let samples_16k_mono = resamplers
+        .entry(chunk.speaker_key.clone())
+        .or_default()
         .process_chunk(chunk)
         .map_or(0, |resampled| resampled.len());
     let (seq_status, dropped_frames) = match action {

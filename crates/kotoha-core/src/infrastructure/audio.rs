@@ -15,15 +15,19 @@ use crate::domain::{AudioChunk, CoreError, Resampler};
 /// Target sample rate expected by downstream STT engines (`16000` Hz).
 pub const TARGET_SAMPLE_RATE: u32 = 16_000;
 
-/// Passband edge of the low-pass, as a fraction of the lower sample rate (7.36 kHz at 16 kHz).
-/// The stopband starts at `1 - PASSBAND_EDGE` of that rate (8.64 kHz), where it aliases back to
-/// the passband edge.
-const PASSBAND_EDGE: f64 = 0.46;
+/// Centre frequency of the sinc low-pass, as a fraction of the lower sample rate (7.36 kHz at
+/// 16 kHz). This is the -6 dB point, not the passband edge: measured response is flat up to about
+/// 6.7 kHz and at least 80 dB down from 8 kHz.
+const CUTOFF: f64 = 0.46;
 /// Stopband attenuation targeted by the Kaiser window, in dB.
 const STOPBAND_DB: f64 = 80.0;
 /// Largest polyphase table (in `f32` coefficients) built with exact phases; beyond this the
 /// fractional position is rounded to [`QUANTIZED_PHASES`] sub-sample phases.
-const MAX_EXACT_TABLE: usize = 1 << 21;
+///
+/// The worst case among common rates (44.1 kHz and 22.05 kHz, about 28k coefficients) fits with
+/// room to spare; rarer rates such as 32001 Hz (denominator 16000) take the quantized path
+/// instead of building a multi-megabyte table per speaker.
+const MAX_EXACT_TABLE: usize = 1 << 17;
 const QUANTIZED_PHASES: u64 = 1024;
 
 /// Namespace for audio helpers and the resampler factory used by the pipeline.
@@ -72,9 +76,14 @@ struct Stage {
 /// - 16 kHz mono input is passed through unchanged (fast path).
 /// - Multi-channel frames are averaged (`sum / channels`).
 /// - Other rates go through a Kaiser-windowed-sinc polyphase FIR low-pass evaluated only at
-///   output instants (anti-aliasing and decimation in one step). The output lags the input by
-///   the filter's group delay (about 2 ms at 48 kHz); samples are neither repeated nor lost
-///   over a long run, so the output length tracks `input_frames * 16000 / sample_rate`.
+///   output instants (anti-aliasing and decimation in one step). The output has zero phase
+///   offset; the resampler only holds back about `half` input samples (about 2 ms at 48 kHz)
+///   while it waits for future input. Samples are neither repeated nor lost over a long run, so
+///   the output length tracks `input_frames * 16000 / sample_rate` minus that held-back tail.
+///   On flush or close the held-back tail is not emitted: it carries over to the start of the
+///   next utterance (negligible for STT).
+/// - The `[-1, 1]` range holds for the downmix stage only. The FIR output is not clamped and can
+///   overshoot on full-scale input (up to about 1.32).
 /// - A change of sample rate or channel count recreates the filter (its history is discarded).
 #[derive(Debug, Default)]
 pub struct StreamResampler {
@@ -138,15 +147,12 @@ impl StreamResampler {
             return Ok(Vec::new());
         }
 
-        let mono = if channels == 1 {
-            samples.to_vec()
-        } else {
-            downmix_to_mono(samples, ch)
-        };
-
-        match self.stage.as_mut().and_then(|s| s.fir.as_mut()) {
-            Some(fir) => Ok(fir.process(&mono)),
-            None => Ok(mono),
+        let fir = self.stage.as_mut().and_then(|s| s.fir.as_mut());
+        match (fir, channels) {
+            (Some(fir), 1) => Ok(fir.process(samples)),
+            (Some(fir), _) => Ok(fir.process(&downmix_to_mono(samples, ch))),
+            (None, 1) => Ok(samples.to_vec()),
+            (None, _) => Ok(downmix_to_mono(samples, ch)),
         }
     }
 }
@@ -203,7 +209,7 @@ fn sinc(x: f64) -> f64 {
 /// Rational-ratio polyphase FIR resampler (`src_rate` -> `dst_rate`) over a mono stream.
 ///
 /// Output `n` sits at input position `n * src / dst`; the kernel is a Kaiser-windowed sinc
-/// low-pass whose cutoff is [`PASSBAND_EDGE`] of the lower of the two Nyquist rates.
+/// low-pass whose cutoff is [`CUTOFF`] of the lower of the two Nyquist rates.
 #[derive(Debug)]
 struct FirResampler {
     /// Taps per output sample.
@@ -229,8 +235,8 @@ impl FirResampler {
 
         let narrow = (f64::from(dst_rate) / f64::from(src_rate)).min(1.0);
         // Cutoff and transition width in cycles per input sample.
-        let fc = PASSBAND_EDGE * narrow;
-        let transition = 2.0_f64.mul_add(-PASSBAND_EDGE, 1.0) * narrow;
+        let fc = CUTOFF * narrow;
+        let transition = 2.0_f64.mul_add(-CUTOFF, 1.0) * narrow;
         let n_est = (STOPBAND_DB - 7.95) / (2.285 * 2.0 * PI * transition);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let half = ((n_est / 2.0).ceil() as usize).max(4);
@@ -280,7 +286,10 @@ impl FirResampler {
 
     fn process(&mut self, input: &[f32]) -> Vec<f32> {
         self.buf.extend_from_slice(input);
-        let mut out = Vec::new();
+        // Upper bound on the outputs reachable from the current buffer.
+        let reach = (self.buf.len() as u64 + 1).saturating_sub(self.taps as u64) * self.den;
+        let est = reach.saturating_sub(self.pos).div_ceil(self.num);
+        let mut out = Vec::with_capacity(usize::try_from(est).unwrap_or(0));
         loop {
             #[allow(clippy::cast_possible_truncation)]
             let idx = (self.pos / self.den) as usize;
