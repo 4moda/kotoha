@@ -303,8 +303,6 @@ impl SubtitleSink for FailingSubtitleSink {
 /// How a [`ScriptedSttEngine`] stream misbehaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SttScript {
-    /// Every `accept_audio` blocks the calling thread for the given time (CPU-bound decoder).
-    Slow(Duration),
     /// The `n`-th `accept_audio` call across all streams panics (once).
     PanicOnCall(usize),
     /// `flush` forgets the open utterance and returns nothing (like a reaped backend stream).
@@ -363,7 +361,6 @@ impl SttStream for ScriptedSttStream {
     ) -> Result<Vec<TranscriptEvent>, CoreError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         match self.script {
-            SttScript::Slow(delay) => std::thread::sleep(delay),
             SttScript::PanicOnCall(n) if n == call => panic!("scripted STT panic"),
             SttScript::PanicOnCall(_) | SttScript::ForgetOnFlush => {}
         }
@@ -453,19 +450,108 @@ impl Translator for DelayByUtteranceTranslator {
     }
 }
 
-/// Sink recording every entry with the (real) instant it was emitted.
-#[derive(Default)]
-pub struct TimestampingSink {
-    pub entries: StdMutex<Vec<(std::time::Instant, SubtitleEntry)>>,
+/// STT engine whose streams prove that decoding for different speakers overlaps.
+///
+/// Each stream's first `accept_audio` waits at a rendezvous until `parties` streams are inside
+/// `accept_audio` at the same time. A serial pipeline can never get there, so the wait gives up
+/// after `timeout` and records the failure instead of deadlocking. Every call also updates the
+/// current / peak number of `accept_audio` calls in flight across all streams.
+pub struct RendezvousSttEngine {
+    pub inner: MockSttEngine,
+    pub parties: usize,
+    pub timeout: Duration,
+    arrived: Arc<(StdMutex<usize>, std::sync::Condvar)>,
+    pub rendezvous_timed_out: Arc<std::sync::atomic::AtomicBool>,
+    pub in_flight: Arc<AtomicUsize>,
+    pub peak_in_flight: Arc<AtomicUsize>,
 }
 
-#[async_trait]
-impl SubtitleSink for TimestampingSink {
-    async fn emit(&self, entry: SubtitleEntry) -> Result<(), CoreError> {
-        self.entries
-            .lock()
-            .expect("lock")
-            .push((std::time::Instant::now(), entry));
-        Ok(())
+impl RendezvousSttEngine {
+    pub fn new(inner: MockSttEngine, parties: usize, timeout: Duration) -> Self {
+        Self {
+            inner,
+            parties,
+            timeout,
+            arrived: Arc::new((StdMutex::new(0), std::sync::Condvar::new())),
+            rendezvous_timed_out: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak_in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl SttEngine for RendezvousSttEngine {
+    fn name(&self) -> &'static str {
+        "rendezvous-stt"
+    }
+
+    fn create_stream(
+        &self,
+        speaker_key: SpeakerKey,
+        src_lang: &LanguageCode,
+    ) -> Result<Box<dyn SttStream>, CoreError> {
+        Ok(Box::new(RendezvousSttStream {
+            inner: self.inner.create_stream(speaker_key, src_lang)?,
+            first_call: true,
+            parties: self.parties,
+            timeout: self.timeout,
+            arrived: Arc::clone(&self.arrived),
+            timed_out: Arc::clone(&self.rendezvous_timed_out),
+            in_flight: Arc::clone(&self.in_flight),
+            peak_in_flight: Arc::clone(&self.peak_in_flight),
+        }))
+    }
+}
+
+struct RendezvousSttStream {
+    inner: Box<dyn SttStream>,
+    first_call: bool,
+    parties: usize,
+    timeout: Duration,
+    arrived: Arc<(StdMutex<usize>, std::sync::Condvar)>,
+    timed_out: Arc<std::sync::atomic::AtomicBool>,
+    in_flight: Arc<AtomicUsize>,
+    peak_in_flight: Arc<AtomicUsize>,
+}
+
+impl RendezvousSttStream {
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "false positive: the guard is moved into `Condvar::wait_timeout_while`"
+    )]
+    fn rendezvous(&self) {
+        let (count, all_arrived) = &*self.arrived;
+        let mut arrived = count.lock().expect("lock");
+        *arrived += 1;
+        all_arrived.notify_all();
+        let (arrived, result) = all_arrived
+            .wait_timeout_while(arrived, self.timeout, |n| *n < self.parties)
+            .expect("lock");
+        drop(arrived);
+        let timed_out = result.timed_out();
+        if timed_out {
+            self.timed_out.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+impl SttStream for RendezvousSttStream {
+    fn accept_audio(
+        &mut self,
+        samples_16k_mono: &[f32],
+        timestamp_ms: u64,
+    ) -> Result<Vec<TranscriptEvent>, CoreError> {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_in_flight.fetch_max(now, Ordering::SeqCst);
+        if std::mem::take(&mut self.first_call) {
+            self.rendezvous();
+        }
+        let result = self.inner.accept_audio(samples_16k_mono, timestamp_ms);
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+
+    fn flush(&mut self, timestamp_ms: u64) -> Result<Vec<TranscriptEvent>, CoreError> {
+        self.inner.flush(timestamp_ms)
     }
 }

@@ -12,8 +12,8 @@ use std::time::Duration;
 use common::{
     test_endpoint, CapturingTranslator, DelayByUtteranceTranslator,
     DelayedFailingOrTaggedTranslator, FailingSubtitleSink, FlakySttEngine,
-    HotwordTrackingSttEngine, ScriptedSttEngine, ScriptedTranslator, SttScript, TimestampingSink,
-    TranslatorScript, UnavailableSttEngine,
+    HotwordTrackingSttEngine, RendezvousSttEngine, ScriptedSttEngine, ScriptedTranslator,
+    SttScript, TranslatorScript, UnavailableSttEngine,
 };
 use kotoha_core::application::{
     PipelineConfig, PipelineService, TranslatorManager, TRANSLATION_SKIPPED_REASON,
@@ -862,15 +862,22 @@ fn speech_frame(conn_id: u64, user_id: u32, seq: u32) -> AudioInputEvent {
     }
 }
 
-/// Feeds `frames` chunks per speaker at a 30 ms pace into a pipeline whose STT costs 20 ms per
-/// chunk, and returns every chunk's latency (chunk sent -> its Interim card emitted).
-async fn per_chunk_latencies(speakers: u32, frames: u32) -> Vec<Duration> {
-    let sink = Arc::new(TimestampingSink::default());
-    let stt = Arc::new(ScriptedSttEngine::new(
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn three_simultaneous_speakers_decode_in_parallel() {
+    // Structural check instead of wall-clock latency: every speaker's first `accept_audio` waits
+    // until all three speakers are inside `accept_audio` at the same time. Only per-speaker
+    // workers can get there; a serial pipeline times out the rendezvous and fails the test.
+    const SPEAKERS: u32 = 3;
+    const FRAMES: u32 = 5;
+    let stt = Arc::new(RendezvousSttEngine::new(
         // Never finalize: every chunk yields exactly one Interim card.
         MockSttEngine::new(0.005, 1_000_000),
-        SttScript::Slow(Duration::from_millis(20)),
+        SPEAKERS as usize,
+        Duration::from_secs(10),
     ));
+    let timed_out = Arc::clone(&stt.rendezvous_timed_out);
+    let peak_in_flight = Arc::clone(&stt.peak_in_flight);
+    let sink = Arc::new(CollectingSubtitleSink::new());
     let mut pipeline = pipeline_with(
         stt,
         Arc::new(MockTranslator::new("mock", "[ja] ")),
@@ -879,63 +886,34 @@ async fn per_chunk_latencies(speakers: u32, frames: u32) -> Vec<Duration> {
     let (tx, rx) = mpsc::channel(64);
     let task = tokio::spawn(async move { pipeline.run(rx).await });
     tx.send(connected(1)).await.unwrap();
-
-    let mut sent_at: Vec<Vec<std::time::Instant>> = vec![Vec::new(); speakers as usize];
-    for seq in 0..frames {
-        for user in 0..speakers {
-            sent_at[user as usize].push(std::time::Instant::now());
-            tx.send(speech_frame(1, user + 1, seq)).await.unwrap();
+    for seq in 0..FRAMES {
+        for user in 1..=SPEAKERS {
+            tx.send(speech_frame(1, user, seq)).await.unwrap();
         }
-        tokio::time::sleep(Duration::from_millis(30)).await;
     }
     drop(tx);
     task.await.expect("join").expect("run");
 
-    let entries = sink.entries.lock().unwrap().clone();
-    let mut latencies = Vec::new();
-    for user in 0..speakers {
-        let emitted: Vec<_> = entries
+    assert!(
+        !timed_out.load(AtomicOrdering::SeqCst),
+        "the speakers' STT calls never overlapped (decoding is serial)"
+    );
+    let peak = peak_in_flight.load(AtomicOrdering::SeqCst);
+    assert!(
+        peak >= 2,
+        "peak concurrent accept_audio calls across speakers: {peak}"
+    );
+    let entries = sink.entries().await;
+    for user in 1..=SPEAKERS {
+        let interims = entries
             .iter()
-            .filter(|(_, e)| e.speaker_key.user_id == user + 1 && e.stage == SubtitleStage::Interim)
-            .map(|(at, _)| *at)
-            .collect();
+            .filter(|e| e.speaker_key.user_id == user && e.stage == SubtitleStage::Interim)
+            .count();
         assert_eq!(
-            emitted.len(),
-            frames as usize,
+            interims, FRAMES as usize,
             "speaker {user}: one card per chunk"
         );
-        for (sent, emitted) in sent_at[user as usize].iter().zip(emitted) {
-            latencies.push(emitted.duration_since(*sent));
-        }
     }
-    latencies
-}
-
-fn summarize(latencies: &[Duration]) -> (Duration, Duration) {
-    let mean = latencies.iter().sum::<Duration>() / u32::try_from(latencies.len()).unwrap();
-    let max = latencies.iter().copied().max().unwrap_or_default();
-    (mean, max)
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn three_simultaneous_speakers_have_single_speaker_latency() {
-    const FRAMES: u32 = 20;
-    let (single_mean, single_max) = summarize(&per_chunk_latencies(1, FRAMES).await);
-    let (multi_mean, multi_max) = summarize(&per_chunk_latencies(3, FRAMES).await);
-    println!(
-        "per-chunk STT latency (20 ms/chunk mock, 30 ms pacing, {FRAMES} chunks/speaker): \
-         1 speaker mean={single_mean:?} max={single_max:?}; \
-         3 speakers mean={multi_mean:?} max={multi_max:?}"
-    );
-    // Serial decoding would need 60 ms per 30 ms round, so latency would grow to ~FRAMES * 30 ms.
-    assert!(
-        multi_mean < single_mean * 2 + Duration::from_millis(20),
-        "3-speaker mean latency {multi_mean:?} vs 1-speaker {single_mean:?}"
-    );
-    assert!(
-        multi_max < Duration::from_millis(200),
-        "3-speaker max latency {multi_max:?} must not accumulate"
-    );
 }
 
 #[tokio::test(start_paused = true)]
